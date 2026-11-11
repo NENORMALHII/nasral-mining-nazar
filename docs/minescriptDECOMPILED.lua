@@ -1,0 +1,543 @@
+-- Script Path: game:GetService("Workspace").Currentare.Pick.MineScript
+-- Took 0.03s to decompile.
+-- Executor: Lynx (0.747)
+
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local Assets_m = require(game.ReplicatedFirst.Assets)
+local _ = require(game.ReplicatedStorage.Modules.Mining.BlockStates)
+local ClientSettings_m = require(game.ReplicatedStorage.Modules.ClientSettings)
+local ColorScript_m = require(game.ReplicatedStorage.Colors.ColorScript)
+local v1 = require(game.ReplicatedStorage.Modules.PlayerScriptLoader):WaitForPlayerScripts()
+local Constants_m = require(game.ReplicatedStorage.Modules.Constants)
+local PlatformService_m = require(v1.Modules.PlatformService)
+local EffectsClient_m = require(v1.Modules.EffectsClient)
+local BlockBreakingEffect_m = require(game.ReplicatedStorage.Modules.Effects.BlockBreakingEffect)
+local GuiEnabledState_m = require(v1.Modules.GuiEnabledState)
+local ToolStatusGui_m = require(game.ReplicatedStorage.Modules.ToolStatusGui)
+local TextUtils_m = require(game.ReplicatedStorage.Modules.TextUtils)
+local CommonUtils_m = require(game.ReplicatedStorage.Modules.CommonUtils)
+local Maid_m = require(game.ReplicatedStorage.Lib.Maid)
+local CollisionGroups_m = require(game.ReplicatedStorage.Modules.CollisionGroups)
+local Resources_m = require(game.ReplicatedStorage.Modules.Resources)
+local Util_m = require(game.ReplicatedFirst.Util)
+local v2 = require(game.ReplicatedStorage.Modules.Logger).new()
+local Parent = script.Parent
+local BlockEvent = game.ReplicatedStorage.BlockEvent
+local t = { Oil = true, Lava = true, Grass = true, Void = true }
+local BlockMinedEvent = game.ReplicatedStorage.BlockMinedEvent
+local LocalPlayer = game:GetService("Players").LocalPlayer
+local v3 = false
+local CurrentCamera = workspace.CurrentCamera
+local v4 = false
+local v5 = nil
+local v6 = nil
+local v7 = false
+local v8 = nil
+local v9 = nil
+local SelectionBox = nil
+local Value = Parent:WaitForChild("MaxDistance").Value
+local v11 = Maid_m.new()
+local v12 = 10
+local v13 = nil
+script.Parent.UpdatePickaxe.OnClientEvent:connect(function(arguments) -- line: 48
+    -- upvalues:
+    --  [1] v2 (copy)
+    --  [2] v12 (ref)
+
+    v2:debug("Updated pickaxe, mineTime = %s", (tostring(arguments.BaseMineTime)))
+    v12 = arguments.BaseMineTime
+end)
+
+local _ = function(n1: number) --[[ LoadAnimation ]] -- line: 53
+    -- upvalues:
+    --  [1] Parent (copy)
+    --  [2] LocalPlayer (copy)
+    --  [3] v2 (copy)
+
+    local Mining_Animation = Instance.new("Animation")
+    Mining_Animation.AnimationId = "rbxassetid://" .. n1
+    Mining_Animation.Name = "Mining"
+    Mining_Animation.Parent = Parent
+    local animationTrack = LocalPlayer.Character.Humanoid.Animator:LoadAnimation(Mining_Animation)
+    animationTrack.Looped = true
+    v2:debug("Loaded animation %d", n1)
+
+    return animationTrack
+end
+
+local _ = function(s1: string) --[[ GetBlockMineTimeModifier ]] -- line: 69
+    -- upvalues:
+    --  [1] Resources_m (copy)
+
+    if Resources_m[s1].MineTimeModifier then
+        return Resources_m[s1].MineTimeModifier
+    end
+
+    return 1
+end
+
+local _ = function() --[[ CalculateToolSpeed ]] -- line: 77
+    -- upvalues:
+    --  [1] LocalPlayer (copy)
+    --  [2] v12 (ref)
+
+    return v12 * ((100 - (LocalPlayer:GetAttribute("ToolSpeedModifier") or 0)) / 100)
+end
+
+local _ = function(s2: string) --[[ CalculateMineTime ]] -- line: 83
+    -- upvalues:
+    --  [1] LocalPlayer (copy)
+    --  [2] v12 (ref)
+    --  [3] Resources_m (copy)
+
+    return v12 * ((100 - (LocalPlayer:GetAttribute("ToolSpeedModifier") or 0)) / 100) * (if Resources_m[s2].MineTimeModifier then Resources_m[s2].MineTimeModifier else 1)
+end
+
+local _ = function() --[[ CalculateAnimationSpeed ]] -- line: 87
+    -- upvalues:
+    --  [1] LocalPlayer (copy)
+    --  [2] v12 (ref)
+
+    local v17 = 1 - math.max(
+        v12 * ((100 - (LocalPlayer:GetAttribute("ToolSpeedModifier") or 0)) / 100) - 0.3,
+        0
+    ) / 3.5 + 1
+
+    return v17
+end
+
+function IsMining() -- line: 96
+    -- upvalues:
+    --  [1] v9 (ref)
+
+    return v9 ~= nil
+end
+
+function IsBlockBesideLiquid(arg2) -- line: 100
+    -- upvalues:
+    --  [1] Util_m (copy)
+    --  [2] Resources_m (copy)
+
+    for _, val in pairs(Util_m.POSITIONS) do
+        if val.y ~= 1 then
+            local v20 = game.Workspace.Mine:FindFirstChild(Util_m:vec3_tostring(arg2 + val))
+
+            if v20 and v20:FindFirstChild("Type") and Resources_m[v20.Type.Value].LiquidResource then
+                return true, v20.Type.Value
+            end
+        end
+    end
+
+    return false, ""
+end
+
+function ShowError(s3: string) -- line: 112
+    -- upvalues:
+    --  [1] v8 (ref)
+    --  [2] v9 (ref)
+
+    v8:SetText(s3)
+    v8:StopProgressBar()
+    v9 = nil
+end
+
+local _ = nil
+
+function StartMining() -- line: 118
+    -- upvalues:
+    --  [1] PlatformService_m (copy)
+    --  [2] GuiEnabledState_m (copy)
+    --  [3] v9 (ref)
+    --  [4] v8 (ref)
+    --  [5] TextUtils_m (copy)
+    --  [6] Constants_m (copy)
+    --  [7] LocalPlayer (copy)
+    --  [8] v3 (ref)
+    --  [9] SelectionBox (ref)
+    --  [10] v13 (ref)
+    --  [11] v12 (ref)
+    --  [12] Resources_m (copy)
+    --  [13] _ (ref)
+    --  [14] ColorScript_m (copy)
+    --  [15] BlockEvent (copy)
+    --  [16] EffectsClient_m (copy)
+    --  [17] BlockBreakingEffect_m (copy)
+    --  [18] ClientSettings_m (copy)
+
+    if PlatformService_m:IsMobile() and not GuiEnabledState_m:IsGuiEnabled() then
+        return
+    end
+
+    local v22 = GetTargetMineableBlock()
+
+    if not v22 then
+        return
+    end
+
+    v9 = v22:GetAttribute("MinePosition")
+    v8:SetVisible(true)
+
+    if v22.Type.Value == "Bedrock" or v22:GetAttribute("IsBedrock") == true then
+        ShowError(
+            TextUtils_m:Color(("You cannot mine %s!"):format(v22.Type.Value), TextUtils_m.ERROR)
+        )
+
+        return
+    end
+
+    if v22:GetAttribute(Constants_m.ATTR_WORLD_ID) ~= LocalPlayer:GetAttribute(
+        Constants_m.ATTR_WORLD_ID
+    ) then
+        ShowError(TextUtils_m:Color("You're not allowed to mine this", TextUtils_m.ERROR))
+
+        return
+    end
+
+    if v3 then
+        SelectionBox.Adornee = v22
+    end
+
+    if v22.Dug.Value ~= LocalPlayer.Name and v22.Dug.Value ~= "" then
+        ShowError(TextUtils_m:Color("Someone else is mining that!", TextUtils_m.ERROR))
+        v13:Stop(0.3)
+
+        return
+    end
+
+    local v28, v29 = IsBlockBesideLiquid(v9)
+
+    if v28 then
+        ShowError(TextUtils_m:Color(("You can't let the %s spill!"):format(v29), TextUtils_m.ERROR))
+
+        return
+    end
+
+    local Value_1 = v22.Type.Value
+    local v36 = v12 * ((100 - (LocalPlayer:GetAttribute("ToolSpeedModifier") or 0)) / 100) * (if Resources_m[Value_1].MineTimeModifier then Resources_m[Value_1].MineTimeModifier else 1)
+    _ = v36
+    local v37 = ColorScript_m:GetResourceColor(v22.Type.Value)
+    BlockEvent:FireServer(v22.Name, { dug = true })
+    EffectsClient_m:StartEffect(BlockBreakingEffect_m.Id, v9, v36)
+    v8:SetText(TextUtils_m:Color(("Mining %s"):format(v22.Type.Value), v37))
+    v8:StartProgressBar(v36, v37)
+
+    if not v13.IsPlaying and ClientSettings_m:Get("ToolAnimations") then
+        v13:Play()
+        local v41 = v13
+        local v42 = 1 - math.max(
+            v12 * ((100 - (LocalPlayer:GetAttribute("ToolSpeedModifier") or 0)) / 100) - 0.3,
+            0
+        ) / 3.5 + 1
+        v41:AdjustSpeed(v42)
+    end
+end
+
+function OnActivated(vec1: Vector3) -- line: 169
+    -- upvalues:
+    --  [1] v4 (ref)
+    --  [2] v5 (ref)
+
+    v4 = true
+    v5 = vec1
+    StartMining()
+end
+
+function OnDeactivated() -- line: 175
+    -- upvalues:
+    --  [1] v4 (ref)
+    --  [2] v9 (ref)
+    --  [3] BlockEvent (copy)
+    --  [4] Util_m (copy)
+    --  [5] EffectsClient_m (copy)
+    --  [6] BlockBreakingEffect_m (copy)
+    --  [7] v3 (ref)
+    --  [8] SelectionBox (ref)
+    --  [9] v8 (ref)
+    --  [10] v13 (ref)
+
+    v4 = false
+
+    if v9 then
+        BlockEvent:FireServer(Util_m:vec3_tostring(v9), { dug = false })
+        EffectsClient_m:StopEffect(BlockBreakingEffect_m.Id, v9)
+        v9 = nil
+    end
+
+    if v3 then
+        SelectionBox.Adornee = nil
+    end
+
+    v8:StopProgressBar()
+    v8:SetVisible(false)
+    v13:Stop(0.3)
+end
+
+function OnFinishMining() -- line: 194
+    -- upvalues:
+    --  [1] BlockMinedEvent (copy)
+    --  [2] Util_m (copy)
+    --  [3] v9 (ref)
+
+    BlockMinedEvent:FireServer({ blockName = Util_m:vec3_tostring(v9) })
+end
+
+function GetTargetMineableBlock() -- line: 208
+    -- upvalues:
+    --  [1] v5 (ref)
+    --  [2] CommonUtils_m (copy)
+    --  [3] LocalPlayer (copy)
+    --  [4] Value (copy)
+    --  [5] t (copy)
+
+    if v5 == nil then
+        return nil
+    end
+
+    local v46 = CommonUtils_m:RaycastFromScreenPoint(v5, 100)
+
+    if
+        v46 ~= nil
+        and v46.Parent == workspace.Mine
+        and CommonUtils_m:IsPlayerWithinRange(LocalPlayer, v46, Value)
+        and v46:GetAttribute("MinePosition")
+    then
+        local Type = v46:FindFirstChild("Type")
+
+        if not Type or t[Type.Value] then
+            return nil
+        end
+
+        return v46
+    end
+
+    return nil
+end
+
+function OptimimisticallyDestroyBlock(vec2: Vector3) -- line: 228
+    -- upvalues:
+    --  [1] Util_m (copy)
+    --  [2] v2 (copy)
+
+    local v47 = workspace.Mine:FindFirstChild(Util_m:vec3_tostring(vec2))
+
+    if v47 == nil then
+        return
+    end
+
+    for _, val_1 in pairs(Util_m.POSITIONS) do
+        if workspace.Mine:FindFirstChild(Util_m:vec3_tostring(vec2 + val_1)) == nil then
+            return
+        end
+    end
+
+    v2:debug("Optimistically destroying block at %s", (tostring(vec2)))
+    v47:Destroy()
+end
+
+function OnTick() -- line: 249
+    -- upvalues:
+    --  [1] v7 (ref)
+    --  [2] v3 (ref)
+    --  [3] SelectionBox (ref)
+    --  [4] v6 (ref)
+    --  [5] Constants_m (copy)
+    --  [6] v9 (ref)
+    --  [7] EffectsClient_m (copy)
+    --  [8] BlockBreakingEffect_m (copy)
+    --  [9] BlockEvent (copy)
+    --  [10] Util_m (copy)
+    --  [11] v8 (ref)
+    --  [12] v13 (ref)
+    --  [13] v4 (ref)
+
+    if not v7 then
+        return
+    end
+
+    local v50 = GetTargetMineableBlock()
+
+    if not v3 then
+        SelectionBox.Adornee = v50
+        local v51 = v6
+        v51.Icon = v50 and Constants_m.MouseIcon.HAND or Constants_m.MouseIcon.DEFAULT
+    end
+
+    if IsMining() and (not v50 or v9 ~= v50:GetAttribute("MinePosition")) then
+        EffectsClient_m:StopEffect(BlockBreakingEffect_m.Id, v9)
+        BlockEvent:FireServer(Util_m:vec3_tostring(v9), { dug = false })
+        v9 = nil
+        v8:StopProgressBar()
+        v8:SetVisible(false)
+        task.delay(0.75, function() -- line: 267
+            -- upvalues:
+            --  [1] v13 (ref)
+
+            if not IsMining() then
+                v13:Stop(0.3)
+            end
+        end)
+    end
+
+    if not v50 and v3 then
+        v4 = false
+        SelectionBox.Adornee = nil
+    end
+
+    if not IsMining() and v4 then
+        if v50 then
+            StartMining()
+
+            return
+        end
+
+        v8:StopProgressBar()
+        v8:SetVisible(false)
+    end
+end
+
+Parent.Equipped:Connect(function(mouse: Mouse) -- line: 291
+    -- upvalues:
+    --  [1] v3 (ref)
+    --  [2] PlatformService_m (copy)
+    --  [3] CommonUtils_m (copy)
+    --  [4] Parent (copy)
+    --  [5] CollisionGroups_m (copy)
+    --  [6] v7 (ref)
+    --  [7] v6 (ref)
+    --  [8] v13 (ref)
+    --  [9] Assets_m (copy)
+    --  [10] LocalPlayer (copy)
+    --  [11] v2 (copy)
+    --  [12] v11 (copy)
+    --  [13] v8 (ref)
+    --  [14] ToolStatusGui_m (copy)
+    --  [15] SelectionBox (ref)
+    --  [16] CurrentCamera (copy)
+    --  [17] UserInputService (copy)
+    --  [18] v5 (ref)
+    --  [19] Constants_m (copy)
+    --  [20] v4 (ref)
+    --  [21] RunService (copy)
+
+    v3 = PlatformService_m:IsMobile()
+    CommonUtils_m:SetModelCollisionGroup(Parent, CollisionGroups_m.CHARACTERS)
+    v7 = true
+    v6 = mouse
+
+    if v13 == nil then
+        local MINING = Assets_m.Animations.MINING
+        local Animation_1 = Instance.new("Animation")
+        Animation_1.AnimationId = "rbxassetid://" .. MINING
+        Animation_1.Name = "Mining"
+        Animation_1.Parent = Parent
+        local animationTrack_1 = LocalPlayer.Character.Humanoid.Animator:LoadAnimation(Animation_1)
+        animationTrack_1.Looped = true
+        v2:debug("Loaded animation %d", MINING)
+        v13 = animationTrack_1
+    end
+
+    v11:GiveTask(v13:GetMarkerReachedSignal("Hit"):Connect(function() -- line: 302
+        -- upvalues:
+        --  [1] Parent (ref)
+
+        Parent.Hit.PlaybackSpeed = 0.95 + math.random() * 0.1
+        Parent.Hit:Play()
+    end))
+    v8 = ToolStatusGui_m.new("PickaxeStatusGui", false)
+    v8.Completed:Connect(OnFinishMining)
+    v11:GiveTask(v8)
+    SelectionBox = Instance.new("SelectionBox")
+    SelectionBox.Parent = CurrentCamera
+    SelectionBox.Name = "PickaxeSelectionBox"
+    SelectionBox.Color3 = Color3.fromRGB(60, 60, 60)
+    SelectionBox.LineThickness = 0.1
+    v11:GiveTask(SelectionBox)
+
+    if not v3 then
+        local mouseLocation = UserInputService:GetMouseLocation()
+        v5 = Vector3.new(mouseLocation.X, mouseLocation.Y)
+        v6.Icon = Constants_m.MouseIcon.DEFAULT
+    end
+
+    v11:GiveTask(UserInputService.InputBegan:Connect(function(
+        input: userdata,
+        gameProcessedEvent: boolean
+    ) -- line: 324
+        if gameProcessedEvent then
+            return
+        end
+
+        if
+            input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch
+        then
+            OnActivated(input.Position)
+        end
+    end))
+    v11:GiveTask(UserInputService.InputChanged:Connect(function(
+        input_1: userdata,
+        gameProcessedEvent_1: boolean
+    ) -- line: 331
+        -- upvalues:
+        --  [1] v4 (ref)
+        --  [2] v5 (ref)
+
+        if gameProcessedEvent_1 then
+            OnDeactivated()
+
+            return
+        end
+
+        if
+            input_1.UserInputType == Enum.UserInputType.MouseMovement
+            or v4 and input_1.UserInputType == Enum.UserInputType.Touch
+        then
+            v5 = input_1.Position
+        end
+    end))
+    v11:GiveTask(UserInputService.InputEnded:Connect(function(u3: userdata, _: boolean) -- line: 342
+        if
+            u3.UserInputType == Enum.UserInputType.MouseButton1
+            or u3.UserInputType == Enum.UserInputType.Touch
+        then
+            OnDeactivated()
+        end
+    end))
+    v11:GiveTask(UserInputService.TouchPinch:Connect(function(
+        _: any,
+        _: number,
+        _: number,
+        _: any,
+        _: boolean
+    ) -- line: 348
+        OnDeactivated()
+    end))
+    v11:GiveTask(game:GetService("GuiService").MenuOpened:Connect(function() -- line: 352
+        print("MenuOpened")
+    end))
+    v11:GiveTask(UserInputService.WindowFocusReleased:Connect(function() -- line: 358
+        print("WindowFocusReleased")
+    end))
+    v11:GiveTask(RunService.Stepped:Connect(function() -- line: 364
+        -- upvalues:
+        --  [1] v7 (ref)
+
+        if not v7 then
+            return
+        end
+
+        OnTick()
+    end))
+end)
+Parent.Unequipped:Connect(function() -- line: 370
+    -- upvalues:
+    --  [1] v7 (ref)
+    --  [2] v6 (ref)
+    --  [3] v11 (copy)
+
+    OnDeactivated()
+    v7 = false
+    v6 = nil
+    v11:DoCleaning()
+end)
