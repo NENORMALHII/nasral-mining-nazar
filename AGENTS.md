@@ -6,3 +6,4 @@ wiki - https://epicmining2.fandom.com/wiki/Epic_Mining_2_Wiki
 game structure described in /docs/TZ-admin-panel.md
 write simple minimal and reliable code on luau
 use uilib/ for the ui
+use docs/dumptree.txt for game structure

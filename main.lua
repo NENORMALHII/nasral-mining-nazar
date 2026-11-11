@@ -1,5 +1,4 @@
 local Players = game:GetService("Players")
-local UserInputService = game:GetService("UserInputService")
 
 ---------------------------------------------------------------------------
 -- Config
@@ -9,8 +8,8 @@ local Config = {
     mushroomDelay = 0.5,
     digDelay = 1.3,
     searchDistance = 12,
-    mushroomHotkey = Enum.KeyCode.F1,
-    digHotkey = Enum.KeyCode.F2,
+    digRemote = "UpdatePickaxe",
+    digArg = "instance",
 }
 
 ---------------------------------------------------------------------------
@@ -69,7 +68,14 @@ end
 local Character = {}
 
 local function isPickaxe(tool)
-    return tool:IsA("Tool") and tool.Name:lower():find("pickaxe") ~= nil
+    if not tool:IsA("Tool") then
+        return false
+    end
+    if tool:FindFirstChild(Config.digRemote) then
+        return true
+    end
+    local name = tool.Name:lower()
+    return name:find("pick") ~= nil and name:find("axe") == nil
 end
 
 function Character.get()
@@ -209,9 +215,28 @@ Digger = Manager.new(function()
         return
     end
 
+    local remote = pickaxe:FindFirstChild(Config.digRemote)
+    if not remote then
+        warn("[autodig] no " .. Config.digRemote)
+        task.wait(0.5)
+        return
+    end
+
+    local maxDistance = pickaxe:FindFirstChild("MaxDistance")
+    if maxDistance and (hit.Position - character.PrimaryPart.Position).Magnitude > maxDistance.Value then
+        task.wait(0.3)
+        return
+    end
+
     Character.face(character, hit.Position)
     task.wait(0.1)
-    pickaxe:Activate()
+
+    if Config.digArg == "position" then
+        remote:FireServer(hit.Position)
+    else
+        remote:FireServer(hit.Instance)
+    end
+
     task.wait(Config.digDelay)
 end)
 
@@ -221,103 +246,56 @@ end)
 
 local Ui = {}
 
-local ON_COLOR = Color3.fromRGB(120, 220, 120)
-local OFF_COLOR = Color3.fromRGB(220, 220, 220)
-local ON_BUTTON = Color3.fromRGB(150, 50, 50)
-local OFF_BUTTON = Color3.fromRGB(60, 60, 60)
-
-local function refreshRow(row)
-    if row.manager.enabled then
-        row.status.Text = row.name .. ": ON"
-        row.status.TextColor3 = ON_COLOR
-        row.button.Text = "Stop"
-        row.button.BackgroundColor3 = ON_BUTTON
-    else
-        row.status.Text = row.name .. ": OFF"
-        row.status.TextColor3 = OFF_COLOR
-        row.button.Text = "Start"
-        row.button.BackgroundColor3 = OFF_BUTTON
-    end
-end
-
-function Ui.create(rows)
-    local playerGui = Players.LocalPlayer:WaitForChild("PlayerGui")
-
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "MainGui"
-    gui.ResetOnSpawn = false
-    gui.Parent = playerGui
-
-    local frame = Instance.new("Frame")
-    frame.Size = UDim2.fromOffset(190, 12 + #rows * 52)
-    frame.Position = UDim2.new(0, 20, 0.5, -frame.Size.Y.Offset // 2)
-    frame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
-    frame.BorderSizePixel = 0
-    frame.Parent = gui
-
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 6)
-    corner.Parent = frame
-
-    for index, row in ipairs(rows) do
-        local top = 6 + (index - 1) * 52
-
-        local status = Instance.new("TextLabel")
-        status.Size = UDim2.new(1, -16, 0, 18)
-        status.Position = UDim2.fromOffset(8, top)
-        status.BackgroundTransparency = 1
-        status.Font = Enum.Font.GothamMedium
-        status.TextSize = 13
-        status.TextXAlignment = Enum.TextXAlignment.Left
-        status.Parent = frame
-        row.status = status
-
-        local button = Instance.new("TextButton")
-        button.Size = UDim2.new(1, -16, 0, 26)
-        button.Position = UDim2.fromOffset(8, top + 20)
-        button.BorderSizePixel = 0
-        button.Font = Enum.Font.GothamBold
-        button.TextSize = 14
-        button.TextColor3 = Color3.fromRGB(240, 240, 240)
-        button.Parent = frame
-        row.button = button
-
-        local buttonCorner = Instance.new("UICorner")
-        buttonCorner.CornerRadius = UDim.new(0, 4)
-        buttonCorner.Parent = button
-
-        button.Activated:Connect(function()
-            row.manager.toggle()
-            refreshRow(row)
-        end)
-
-        refreshRow(row)
-    end
-
-    UserInputService.InputBegan:Connect(function(input, processed)
-        if processed then
-            return
-        end
-        for _, row in ipairs(rows) do
-            if input.KeyCode == row.hotkey then
-                row.manager.toggle()
-                refreshRow(row)
+function Ui.load()
+    if type(readfile) == "function" and type(isfile) == "function" then
+        for _, path in ipairs({ "uilib/source.lua", "uilib\\source.lua" }) do
+            if isfile(path) then
+                local ok, library = pcall(function()
+                    return loadstring(readfile(path))()
+                end)
+                if ok and type(library) == "table" then
+                    return library
+                end
             end
         end
-    end)
+    end
+    return loadstring(game:HttpGet("https://raw.githubusercontent.com/cueshut/saves/main/compact"))()
+end
 
-    return gui
+function Ui.create(managers)
+    local library = Ui.load()
+    local window = library.init("Epic Mining 2", "v1.0.0", "EM2_MAIN")
+
+    local main, _ = window:AddTab("Managers", "white-hat tests")
+    local section = main:AddSeperator("Teleport / Dig")
+
+    for _, manager in ipairs(managers) do
+        section:AddToggle({
+            title = manager.title,
+            desc = manager.desc,
+            checked = manager.instance.enabled,
+            callback = function(state)
+                if state then
+                    manager.instance.start()
+                else
+                    manager.instance.stop()
+                end
+            end,
+        })
+    end
+
+    return window
 end
 
 Ui.create({
     {
-        name = "Mushrooms",
-        manager = Mushrooms,
-        hotkey = Config.mushroomHotkey,
+        title = "Mushrooms",
+        desc = "teleport to HarvestableNode and fire Interact",
+        instance = Mushrooms,
     },
     {
-        name = "Auto-dig",
-        manager = Digger,
-        hotkey = Config.digHotkey,
+        title = "Auto-dig",
+        desc = "dig block below through the pickaxe remote",
+        instance = Digger,
     },
 })
