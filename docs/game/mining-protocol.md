@@ -169,9 +169,10 @@ Drops live in `workspace.TargetFilter`, one model per broken block, named `{Bloc
 Inside there is a part (block name or any `BasePart`), a `DropScript`, and under it a
 `StringValue` named `Player` — the player who broke the block.
 
-`Loot.collectAll` only picks drops where `DropScript.Player.Value == LocalPlayer`. It walks
-through every own drop without a distance limit, two passes per call, teleports to the drop part
-and retries once. Runs after `lootSpawnWait` (0.35 s) so the drop has time to spawn; the character
+`Loot.collectAll` only picks drops where `DropScript.Player.Value` matches `LocalPlayer`
+(instance, name, user id or string). Drops are cached in `Loot.pending` by `Loot.sync` and stay
+there until picked, even if they move or end up above the mine. Each drop gets three attempts,
+the part position is re-read every attempt, and there is no distance limit. Runs after `lootSpawnWait` (0.35 s) so the drop has time to spawn; the character
 is not teleported into the block instantly.
 
 ## Surface (first layer)
@@ -212,7 +213,7 @@ Loot order:
 
 Farm does not mine while any own selected drop exists:
 
-1. `Loot.hasLoot()` checks `workspace.TargetFilter` for own `{BlockName}_Drop` whose resource is selected.
-2. `collectLoot` runs up to 3 rounds of `Loot.collectAll` (4 passes each), waiting 0.05 s between rounds.
-3. If loot remains, the tick ends and mining waits; the next tick retries.
-4. Mining resumes only when `Loot.hasLoot()` is false.
+1. `Loot.sync()` fills `Loot.pending` with own selected drops from `workspace.TargetFilter`.
+2. `collectLoot` runs up to 6 rounds of `Loot.collectAll`, 0.1 s apart.
+3. If `Loot.count()` is still above zero, the tick ends and mining waits; the next tick retries.
+4. Mining resumes only when `Loot.count() == 0`.

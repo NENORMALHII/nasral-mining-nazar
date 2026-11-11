@@ -1016,7 +1016,10 @@ end
 -- Loot (workspace.TargetFilter/{BlockName}_Drop)
 ---------------------------------------------------------------------------
 
-local Loot = {}
+local Loot = {
+    pending = {},
+    pendingSet = {},
+}
 
 function Loot.container()
     return workspace:FindFirstChild("TargetFilter") or workspace:FindFirstChild("Drops")
@@ -1036,31 +1039,86 @@ function Loot.part(drop)
     return drop:FindFirstChildWhichIsA("BasePart", true)
 end
 
-function Loot.owner(drop)
+function Loot.playerValue(drop)
     local dropScript = drop:FindFirstChild("DropScript", true)
     local playerValue = dropScript and dropScript:FindFirstChild("Player")
     return playerValue and playerValue.Value
 end
 
 function Loot.mine(drop)
-    return Loot.owner(drop) == Players.LocalPlayer
-end
-
-local function tryPickup(character, drop)
-    local part = Loot.part(drop)
-    if not part then
+    local value = Loot.playerValue(drop)
+    if value == nil then
         return false
     end
 
-    local cell = Position.nearestSafe(part.Position, Config.safeSearchRadius)
-    local targetPosition = cell and Predictor.worldOf(cell) or part.Position
+    local player = Players.LocalPlayer
+    return value == player
+        or value == player.Name
+        or value == player.UserId
+        or tostring(value) == tostring(player)
+end
 
-    for _ = 1, Config.lootAttempts do
-        if not drop.Parent or not part.Parent then
+function Loot.name(drop)
+    return (tostring(drop.Name):gsub("_Drop$", ""))
+end
+
+function Loot.count()
+    return #Loot.pending
+end
+
+function Loot.sync()
+    local container = Loot.container()
+    if not container then
+        Loot.pending = {}
+        Loot.pendingSet = {}
+        return
+    end
+
+    local seen = {}
+
+    for _, drop in ipairs(container:GetChildren()) do
+        if (drop:IsA("Model") or drop:IsA("BasePart")) and Loot.part(drop) and Loot.mine(drop) then
+            if Ores.isSelected(Loot.name(drop)) then
+                seen[drop] = true
+                if not Loot.pendingSet[drop] then
+                    Loot.pendingSet[drop] = true
+                    table.insert(Loot.pending, drop)
+                end
+            end
+        end
+    end
+
+    for index = #Loot.pending, 1, -1 do
+        local drop = Loot.pending[index]
+        if not drop.Parent or not seen[drop] then
+            Loot.pendingSet[drop] = nil
+            table.remove(Loot.pending, index)
+        end
+    end
+end
+
+function Loot.remove(drop)
+    if Loot.pendingSet[drop] then
+        Loot.pendingSet[drop] = nil
+        local index = table.find(Loot.pending, drop)
+        if index then
+            table.remove(Loot.pending, index)
+        end
+    end
+end
+
+local function tryPickup(character, drop)
+    for _ = 1, 3 do
+        if not drop.Parent then
             return true
         end
 
-        Movement.to(character, targetPosition)
+        local part = Loot.part(drop)
+        if not part or not part.Parent then
+            return not drop.Parent
+        end
+
+        Movement.to(character, part.Position)
         RunService.Heartbeat:Wait()
         RunService.Heartbeat:Wait()
         task.wait(Config.lootDwell)
@@ -1068,79 +1126,37 @@ local function tryPickup(character, drop)
         if not drop.Parent then
             return true
         end
+
+        task.wait(0.1)
     end
 
     return not drop.Parent
 end
 
-function Loot.hasLoot()
-    local container = Loot.container()
-    if not container then
-        return false
-    end
-
-    for _, drop in ipairs(container:GetChildren()) do
-        if (drop:IsA("Model") or drop:IsA("BasePart")) and Loot.part(drop) and Loot.mine(drop) then
-            local name = tostring(drop.Name):gsub("_Drop$", "")
-            if Ores.isSelected(name) then
-                return true
-            end
-        end
-    end
-
-    return false
-end
-
 function Loot.collectAll(character)
-    local container = Loot.container()
-    if not container then
+    Loot.sync()
+
+    if #Loot.pending == 0 then
         return 0
     end
 
+    table.sort(Loot.pending, function(a, b)
+        return Ores.price(Loot.name(a)) > Ores.price(Loot.name(b))
+    end)
+
     local picked = 0
 
-    for _ = 1, 4 do
-        local candidates = {}
-
-        for _, drop in ipairs(container:GetChildren()) do
-            if (drop:IsA("Model") or drop:IsA("BasePart")) and Loot.part(drop) and Loot.mine(drop) then
-                local name = tostring(drop.Name):gsub("_Drop$", "")
-                local part = Loot.part(drop)
-
-                if Ores.isSelected(name) then
-                    table.insert(candidates, {
-                        drop = drop,
-                        price = Ores.price(name),
-                        distance = character.PrimaryPart
-                            and (part.Position - character.PrimaryPart.Position).Magnitude
-                            or 0,
-                    })
-                end
-            end
-        end
-
-        if #candidates == 0 then
-            break
-        end
-
-        table.sort(candidates, function(a, b)
-            if a.price ~= b.price then
-                return a.price > b.price
-            end
-            return a.distance < b.distance
-        end)
-
-        for _, candidate in ipairs(candidates) do
-            local drop = candidate.drop
-            if drop.Parent and Loot.mine(drop) then
-                if tryPickup(character, drop) then
-                    picked += 1
-                else
-                    logPrint("loot not picked " .. drop.Name)
-                end
-            end
+    for index = #Loot.pending, 1, -1 do
+        local drop = Loot.pending[index]
+        if not drop.Parent then
+            Loot.remove(drop)
+        elseif tryPickup(character, drop) then
+            Loot.remove(drop)
+            picked += 1
         end
     end
+
+    Loot.sync()
 
     if picked > 0 then
         logPrint("loot picked " .. picked)
@@ -1199,21 +1215,26 @@ local FarmMode = Mode.new("Farm", function(self)
         return
     end
 
+    Loot.sync()
+
     local function collectLoot()
-        for _ = 1, 3 do
-            if not Loot.hasLoot() then
+        for _ = 1, 6 do
+            if Loot.count() == 0 then
                 return true
             end
             Loot.collectAll(character)
-            task.wait(0.05)
+            if Loot.count() == 0 then
+                return true
+            end
+            task.wait(0.1)
         end
-        return not Loot.hasLoot()
+        return Loot.count() == 0
     end
 
-    if Loot.hasLoot() then
+    if Loot.count() > 0 then
         collectLoot()
-        if Loot.hasLoot() then
-            logPrint("waiting for loot")
+        if Loot.count() > 0 then
+            logPrint("waiting for loot " .. Loot.count())
             task.wait(0.1)
             return
         end
@@ -1228,6 +1249,7 @@ local FarmMode = Mode.new("Farm", function(self)
             Movement.releaseHold()
             if ok then
                 task.wait(Config.lootSpawnWait)
+                Loot.sync()
                 Loot.collectAll(character)
             end
         else
@@ -1305,6 +1327,7 @@ local FarmMode = Mode.new("Farm", function(self)
     elseif result then
         Ores.invalidate()
         task.wait(Config.lootSpawnWait)
+        Loot.sync()
         Loot.collectAll(character)
     else
         Ores.ignore(ore)
