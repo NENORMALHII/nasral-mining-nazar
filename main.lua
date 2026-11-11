@@ -1,4 +1,5 @@
 local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 ---------------------------------------------------------------------------
 -- Config
@@ -6,16 +7,18 @@ local Players = game:GetService("Players")
 
 local Config = {
     mushroomDelay = 0.5,
-    digDelay = 1.3,
-    searchDistance = 12,
-    digRemote = "UpdatePickaxe",
-    digArg = "instance",
+
+    blockEvent = "BlockEvent",
+    minedEvent = "BlockMinedEvent",
+    pickaxeRemote = "UpdatePickaxe",
+    defaultMineTime = 4,
+    mineTimeSafety = 1.3,
 
     mineName = "Mine",
     minOreValue = 100,
     oreRange = 500,
-    oreSpeed = 40,
-    oreStopDistance = 4,
+    oreTeleportRange = 18,
+    oreTeleportOffset = 5,
     oreCacheTime = 1,
 
     orePrices = {
@@ -110,7 +113,7 @@ local function isPickaxe(tool)
     if not tool:IsA("Tool") then
         return false
     end
-    if tool:FindFirstChild(Config.digRemote) then
+    if tool:FindFirstChild(Config.pickaxeRemote) then
         return true
     end
     local name = tool.Name:lower()
@@ -159,49 +162,67 @@ function Character.equipPickaxe(character)
     return pickaxe
 end
 
-function Character.face(character, position)
-    local root = character.PrimaryPart
-    if root then
-        character:PivotTo(CFrame.lookAt(root.Position, position))
-    end
-end
-
-function Character.platformStand(character, state)
-    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-    if humanoid then
-        humanoid.PlatformStand = state
-    end
-end
-
 ---------------------------------------------------------------------------
--- Physics
+-- Mining (BlockEvent / BlockMinedEvent protocol)
 ---------------------------------------------------------------------------
 
-local Physics = {}
+local Mining = {}
 
-function Physics.attach(root)
-    local attachment = Instance.new("Attachment")
-    attachment.Name = "OreRunnerAttachment"
-    attachment.Parent = root
+local baseMineTime = Config.defaultMineTime
+local watchedPickaxe
 
-    local velocity = Instance.new("LinearVelocity")
-    velocity.Name = "OreRunnerVelocity"
-    velocity.Attachment0 = attachment
-    velocity.RelativeTo = Enum.ActuatorRelativeTo.World
-    velocity.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-    velocity.VectorVelocity = Vector3.zero
-    velocity.Parent = attachment
-
-    return velocity, attachment
+local function vec3ToString(position)
+    return ("%d,%d,%d"):format(position.X, position.Y, position.Z)
 end
 
-function Physics.release(velocity, attachment)
-    if velocity then
-        velocity:Destroy()
+function Mining.observe(character)
+    local pickaxe = Character.getPickaxe(character)
+    if not pickaxe or pickaxe == watchedPickaxe then
+        return
     end
-    if attachment then
-        attachment:Destroy()
+    watchedPickaxe = pickaxe
+
+    local remote = pickaxe:FindFirstChild(Config.pickaxeRemote)
+    if not remote then
+        return
     end
+
+    remote.OnClientEvent:Connect(function(data)
+        if typeof(data) == "table" and type(data.BaseMineTime) == "number" then
+            baseMineTime = data.BaseMineTime
+        end
+    end)
+end
+
+function Mining.mine(block)
+    local position = block:GetAttribute("MinePosition")
+    if not position or not block.Parent then
+        return false
+    end
+
+    local blockEvent = ReplicatedStorage:FindFirstChild(Config.blockEvent)
+    local minedEvent = ReplicatedStorage:FindFirstChild(Config.minedEvent)
+    if not blockEvent or not minedEvent then
+        warn("[mining] remotes not found")
+        return false
+    end
+
+    local name = block.Name
+    blockEvent:FireServer(name, { dug = true })
+    task.wait(baseMineTime * Config.mineTimeSafety + 0.25)
+
+    if not block.Parent then
+        return true
+    end
+
+    minedEvent:FireServer({ blockName = vec3ToString(position) })
+    task.wait(0.25)
+
+    if block.Parent then
+        blockEvent:FireServer(name, { dug = false })
+    end
+
+    return true
 end
 
 ---------------------------------------------------------------------------
@@ -230,7 +251,11 @@ function Target.blockBelow(character)
         return nil
     end
     rayParams.FilterDescendantsInstances = { character }
-    return workspace:Raycast(root.Position, Vector3.new(0, -Config.searchDistance, 0), rayParams)
+    local hit = workspace:Raycast(root.Position, Vector3.new(0, -12, 0), rayParams)
+    if hit and hit.Instance:GetAttribute("MinePosition") then
+        return hit.Instance
+    end
+    return nil
 end
 
 ---------------------------------------------------------------------------
@@ -243,27 +268,27 @@ local cache = {}
 local cacheTime = 0
 local ignored = {}
 
-local function isAlive(block)
-    if not block.Parent then
-        return false
-    end
-    local dug = block:FindFirstChild("Dug")
-    if dug and dug.Value ~= "" then
-        return false
-    end
-    return true
-end
-
 local function valueOf(block)
+    local typeValue = block:FindFirstChild("Type")
+    if typeValue then
+        return Config.orePrices[typeValue.Value] or 0
+    end
     local resource = block:GetAttribute("Resource")
     if resource then
         return Config.orePrices[resource] or 0
     end
-    local typeValue = block:FindFirstChild("Type")
-    if not typeValue then
-        return 0
+    return 0
+end
+
+local function claimable(block)
+    if not block.Parent or not block:GetAttribute("MinePosition") then
+        return false
     end
-    return Config.orePrices[typeValue.Value] or 0
+    local dug = block:FindFirstChild("Dug")
+    if dug and dug.Value ~= "" and dug.Value ~= Players.LocalPlayer.Name then
+        return false
+    end
+    return true
 end
 
 function Ores.refresh()
@@ -276,7 +301,7 @@ function Ores.refresh()
     end
 
     for _, block in ipairs(mine:GetChildren()) do
-        if valueOf(block) >= Config.minOreValue and isAlive(block) then
+        if valueOf(block) >= Config.minOreValue and claimable(block) then
             table.insert(cache, block)
         end
     end
@@ -292,13 +317,12 @@ function Ores.nearest(position)
 
     for _, block in ipairs(cache) do
         local untilIgnore = ignored[block]
-        if untilIgnore and untilIgnore > now then
-            continue
-        end
-        if isAlive(block) then
-            local distance = (block.Position - position).Magnitude
-            if distance <= Config.oreRange and (not bestDistance or distance < bestDistance) then
-                best, bestDistance = block, distance
+        if not untilIgnore or untilIgnore <= now then
+            if claimable(block) then
+                local distance = (block.Position - position).Magnitude
+                if distance <= Config.oreRange and (not bestDistance or distance < bestDistance) then
+                    best, bestDistance = block, distance
+                end
             end
         end
     end
@@ -356,42 +380,21 @@ Digger = Manager.new(function()
         return
     end
 
-    local hit = Target.blockBelow(character)
-    if not hit then
+    local block = Target.blockBelow(character)
+    if not block then
         task.wait(0.3)
         return
     end
 
     local pickaxe = Character.equipPickaxe(character)
     if not pickaxe then
-        warn("[autodig] no pickaxe")
+        warn("[digger] no pickaxe")
         task.wait(0.5)
         return
     end
 
-    local remote = pickaxe:FindFirstChild(Config.digRemote)
-    if not remote then
-        warn("[autodig] no " .. Config.digRemote)
-        task.wait(0.5)
-        return
-    end
-
-    local maxDistance = pickaxe:FindFirstChild("MaxDistance")
-    if maxDistance and (hit.Position - character.PrimaryPart.Position).Magnitude > maxDistance.Value then
-        task.wait(0.3)
-        return
-    end
-
-    Character.face(character, hit.Position)
-    task.wait(0.1)
-
-    if Config.digArg == "position" then
-        remote:FireServer(hit.Position)
-    else
-        remote:FireServer(hit.Instance)
-    end
-
-    task.wait(Config.digDelay)
+    Mining.observe(character)
+    Mining.mine(block)
 end)
 
 ---------------------------------------------------------------------------
@@ -399,26 +402,6 @@ end)
 ---------------------------------------------------------------------------
 
 local OreRunner
-
-local function releaseMover()
-    Physics.release(OreRunner.velocity, OreRunner.attachment)
-    OreRunner.velocity = nil
-    OreRunner.attachment = nil
-
-    local character = Players.LocalPlayer.Character
-    Character.platformStand(character, false)
-end
-
-local function ensureMover(character)
-    local root = character.PrimaryPart
-    if OreRunner.attachment and OreRunner.attachment.Parent == root and OreRunner.velocity then
-        return OreRunner.velocity
-    end
-
-    releaseMover()
-    OreRunner.velocity, OreRunner.attachment = Physics.attach(root)
-    return OreRunner.velocity
-end
 
 OreRunner = Manager.new(function()
     local character = Character.get()
@@ -431,27 +414,36 @@ OreRunner = Manager.new(function()
         return
     end
 
-    local velocity = ensureMover(character)
-    local target = Ores.nearest(root.Position)
-
+    local target, distance = Ores.nearest(root.Position)
     if not target then
-        velocity.VectorVelocity = Vector3.zero
         task.wait(0.5)
         return
     end
 
-    Character.platformStand(character, true)
-
-    local delta = target.Position - root.Position
-    if delta.Magnitude <= Config.oreStopDistance then
-        velocity.VectorVelocity = Vector3.zero
-        Ores.ignore(target)
-        task.wait(0.2)
+    local pickaxe = Character.equipPickaxe(character)
+    if not pickaxe then
+        warn("[ore-runner] no pickaxe")
+        task.wait(0.5)
         return
     end
 
-    velocity.VectorVelocity = delta.Unit * Config.oreSpeed
-end, releaseMover)
+    Mining.observe(character)
+
+    if distance > Config.oreTeleportRange then
+        character:PivotTo(CFrame.new(target.Position + Vector3.new(0, Config.oreTeleportOffset, 0)))
+        task.wait(0.2)
+    end
+
+    if not OreRunner.enabled then
+        return
+    end
+
+    Mining.mine(target)
+
+    if target.Parent then
+        Ores.ignore(target)
+    end
+end)
 
 ---------------------------------------------------------------------------
 -- UI
@@ -480,7 +472,7 @@ function Ui.create(managers)
     local window = library.init("Epic Mining 2", "v1.0.0", "EM2_MAIN")
 
     local main, _ = window:AddTab("Managers", "white-hat tests")
-    local section = main:AddSeperator("Teleport / Dig")
+    local section = main:AddSeperator("Teleport / Mine")
 
     for _, manager in ipairs(managers) do
         section:AddToggle({
@@ -508,12 +500,12 @@ Ui.create({
     },
     {
         title = "Auto-dig",
-        desc = "dig block below through the pickaxe remote",
+        desc = "mine the block below through BlockEvent",
         instance = Digger,
     },
     {
         title = "Ore-runner",
-        desc = "fly to the nearest valuable ore with LinearVelocity",
+        desc = "teleport to valuable ore and mine it",
         instance = OreRunner,
     },
 })
