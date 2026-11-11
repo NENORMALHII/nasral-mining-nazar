@@ -36,3 +36,38 @@ Server side is not in the place dump, so server checks below are inferred.
 - Mine time must elapse before `BlockMinedEvent`, otherwise the server may drop the request.
 - Teleporting into solid rock can eject the character. `PivotTo` is safe; `LinearVelocity`
   with `PlatformStand` makes the character tumble.
+
+## Supporting modules
+
+`ReplicatedStorage.Modules.CommonUtils` (client helpers only, no remotes):
+
+- `IsPlayerWithinRange(player, target, range)` — compares `HumanoidRootPart.Position` with target `Position` or `Vector3`, range is `Pick.MaxDistance`.
+- `RaycastFromScreenPoint(point, distance)` — `camera:ScreenPointToRay`, collision group `RAYCAST`.
+- Everything else (tables, formatting, storage cost) is unrelated to mining.
+
+`ReplicatedFirst.Util`:
+
+- `vec3_tostring(v)` = `x .. "," .. y .. "," .. z`; block names and `MinePosition` strings are built this way.
+- `POSITIONS` are unit offsets in block coordinates.
+- `BASEPLATE_ALTITUDE = 7998.5`; `GetWorldCoords(x, y, z) = (61.5 + 7x, 7998.5 - 7y, -56.5 + 7z)`.
+
+`ReplicatedStorage.Modules.Mining.Mine`:
+
+- `BLOCK_SIZE = 7`, `MAX_MINING_RANGE = 30`, `ATTRIBUTE_RESOURCE_ID = "Resource"`, `ATTRIBUTE_MINE_POSITION = "MinePosition"`.
+- `IsBlockBesideLiquid` checks 6 offsets, skipping the one with `offset.Y == 1` (below the block).
+- `ConvertWorldPosToBlock` uses `Mine.WorldspaceOffset = (-31, -16, -98.5)`, which differs from `Util.GetWorldCoords`; in the live game `block.Position` is authoritative.
+
+`ReplicatedStorage.Modules.Constants`:
+
+- `ATTR_WORLD_ID = "WorldId"`, `ATTR_MINE_POSITION = "MinePosition"`.
+- `PLACE_ID_STAGING` and `PLACE_ID_TESTING` are used by `CommonUtils.IsDevPlace`.
+
+## Bypass flags in `src/main.lua`
+
+`Config.bypass` switches server-side checks on one at a time:
+
+- `skipStart` — send only `BlockMinedEvent`, no `dug = true` claim.
+- `skipWait` — finish immediately, no mine time.
+- `ignoreLiquid` — allow ores with liquid neighbours.
+- `ignoreWorld` — allow blocks from another `WorldId`.
+- `anyType` — allow Bedrock, Oil, Lava, Grass, Void.
