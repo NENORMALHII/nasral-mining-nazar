@@ -1073,6 +1073,24 @@ local function tryPickup(character, drop)
     return not drop.Parent
 end
 
+function Loot.hasLoot()
+    local container = Loot.container()
+    if not container then
+        return false
+    end
+
+    for _, drop in ipairs(container:GetChildren()) do
+        if (drop:IsA("Model") or drop:IsA("BasePart")) and Loot.part(drop) and Loot.mine(drop) then
+            local name = tostring(drop.Name):gsub("_Drop$", "")
+            if Ores.isSelected(name) then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
 function Loot.collectAll(character)
     local container = Loot.container()
     if not container then
@@ -1081,7 +1099,7 @@ function Loot.collectAll(character)
 
     local picked = 0
 
-    for _ = 1, 2 do
+    for _ = 1, 4 do
         local candidates = {}
 
         for _, drop in ipairs(container:GetChildren()) do
@@ -1181,7 +1199,25 @@ local FarmMode = Mode.new("Farm", function(self)
         return
     end
 
-    Loot.collectAll(character)
+    local function collectLoot()
+        for _ = 1, 3 do
+            if not Loot.hasLoot() then
+                return true
+            end
+            Loot.collectAll(character)
+            task.wait(0.05)
+        end
+        return not Loot.hasLoot()
+    end
+
+    if Loot.hasLoot() then
+        collectLoot()
+        if Loot.hasLoot() then
+            logPrint("waiting for loot")
+            task.wait(0.1)
+            return
+        end
+    end
 
     if Config.surfaceDig and Mining.surface(character) then
         local target = Predictor.blockBelow(root.Position)

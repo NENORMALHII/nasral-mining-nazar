@@ -207,3 +207,12 @@ Loot order:
 - higher `BasePrice` first, ties by distance.
 
 `Loot.collectAll` sorts every pass with this key before teleporting.
+
+## Loot-first rule
+
+Farm does not mine while any own selected drop exists:
+
+1. `Loot.hasLoot()` checks `workspace.TargetFilter` for own `{BlockName}_Drop` whose resource is selected.
+2. `collectLoot` runs up to 3 rounds of `Loot.collectAll` (4 passes each), waiting 0.05 s between rounds.
+3. If loot remains, the tick ends and mining waits; the next tick retries.
+4. Mining resumes only when `Loot.hasLoot()` is false.
