@@ -26,13 +26,15 @@ local Config = {
     oreCacheTime = 1,
     depthWeight = 8,
     shaftDig = true,
-    lootRange = 150,
     lootDwell = 0.12,
     lootAttempts = 2,
     lootSpawnWait = 0.35,
 
-    surfaceY = 0,
+    surfaceY = -1,
     surfaceDig = true,
+    minCellY = 0,
+    minSolidNeighbors = 3,
+    safeSearchRadius = 3,
 
 
     blockEvent = "BlockEvent",
@@ -420,6 +422,94 @@ function Predictor.blockBelow(worldPosition)
 end
 
 ---------------------------------------------------------------------------
+-- Position (keep the character inside the mine cavity)
+---------------------------------------------------------------------------
+
+local Position = {}
+
+function Position.mine()
+    return workspace:FindFirstChild(Config.mineName)
+end
+
+function Position.empty(cell, mine)
+    return mine:FindFirstChild(vec3ToString(cell)) == nil
+end
+
+function Position.solidCount(cell, mine)
+    local count = 0
+
+    for _, key in ipairs(offsetOrder) do
+        local offset = blockOffsets[key]
+        if offset and mine:FindFirstChild(vec3ToString(cell + offset)) then
+            count += 1
+        end
+    end
+
+    return count
+end
+
+function Position.safe(cell, mine)
+    if cell.Y < Config.minCellY then
+        return false
+    end
+    if not Position.empty(cell, mine) then
+        return false
+    end
+    return Position.solidCount(cell, mine) >= Config.minSolidNeighbors
+end
+
+function Position.nearestSafe(worldPosition, radius)
+    local mine = Position.mine()
+    if not mine then
+        return nil
+    end
+
+    local origin = Predictor.toBlock(worldPosition)
+    local best, bestDistance
+
+    for dx = -radius, radius do
+        for dy = -radius, radius do
+            for dz = -radius, radius do
+                local cell = origin + Vector3.new(dx, dy, dz)
+                if Position.safe(cell, mine) then
+                    local distance = (cell - origin).Magnitude
+                    if not bestDistance or distance < bestDistance then
+                        best, bestDistance = cell, distance
+                    end
+                end
+            end
+        end
+    end
+
+    return best
+end
+
+function Position.enforce(character)
+    local root = character and character.PrimaryPart
+    local mine = Position.mine()
+    if not root or not mine then
+        return false
+    end
+
+    local cell = Predictor.toBlock(root.Position)
+    if cell.Y <= Config.surfaceY then
+        return true
+    end
+
+    if Position.safe(cell, mine) then
+        return true
+    end
+
+    local safe = Position.nearestSafe(root.Position, Config.safeSearchRadius)
+    if not safe then
+        return false
+    end
+
+    character:PivotTo(CFrame.new(Predictor.worldOf(safe)))
+    return true
+end
+
+---------------------------------------------------------------------------
 -- Mining
 ---------------------------------------------------------------------------
 
@@ -649,6 +739,10 @@ function Mining.mine(character, block, skipCell)
         return false
     end
 
+    if not skipCell then
+        Position.enforce(character)
+    end
+
     if not Mining.inRange(character, block) then
         logWarn("out of range " .. block.Name)
         return false
@@ -707,7 +801,7 @@ function Mining.inCell(character)
     end
 
     local cell = Predictor.toBlock(root.Position)
-    if mine:FindFirstChild(vec3ToString(cell)) then
+    if not Position.safe(cell, mine) then
         return false
     end
 
@@ -747,9 +841,9 @@ function Mining.approach(block)
         local offset = blockOffsets[key]
         local cell = offset and position + offset
 
-        if cell and cell.Y >= 1 and mine:FindFirstChild(vec3ToString(cell)) == nil then
+        if cell and Position.safe(cell, mine) then
             local count = Mining.solidNeighbors(cell, mine)
-            if count >= 3 and (not bestCount or count > bestCount) then
+            if not bestCount or count > bestCount then
                 best, bestCount = cell, count
             end
         end
@@ -838,6 +932,18 @@ function Ores.isSelected(name)
     return false
 end
 
+function Ores.priority(name)
+    local list = Ores.namesList or Ores.names()
+
+    for index, entry in ipairs(list) do
+        if entry == name then
+            return index
+        end
+    end
+
+    return math.huge
+end
+
 local function formatReasons(reasons)
     local parts = {}
     for reason, count in pairs(reasons) do
@@ -917,23 +1023,6 @@ function Ores.nearest(position)
     return best, bestDistance
 end
 
-function Ores.random(character)
-    local root = character and character.PrimaryPart
-    local mine = workspace:FindFirstChild(Config.mineName)
-    if not root or not mine then
-        return nil
-    end
-
-    local limit = Mining.maxDistance() - 1
-    for _, block in ipairs(mine:GetChildren()) do
-        if Mining.allowed(block) and (block.Position - root.Position).Magnitude <= limit then
-            return block
-        end
-    end
-
-    return nil
-end
-
 function Ores.ignore(block)
     ignored[block] = os.clock() + 5
 end
@@ -947,7 +1036,6 @@ end
 ---------------------------------------------------------------------------
 
 local Loot = {}
-local lootIgnored = {}
 
 function Loot.container()
     return workspace:FindFirstChild("TargetFilter") or workspace:FindFirstChild("Drops")
@@ -983,12 +1071,23 @@ local function tryPickup(character, drop)
         return false
     end
 
+    local cell = Position.nearestSafe(part.Position, Config.safeSearchRadius)
+    local targetPosition
+
+    if cell then
+        targetPosition = Predictor.worldOf(cell)
+    elseif Mining.surface(character) then
+        targetPosition = part.Position
+    else
+        return false
+    end
+
     for _ = 1, Config.lootAttempts do
         if not drop.Parent or not part.Parent then
             return true
         end
 
-        Movement.instant(character, part.Position)
+        Movement.instant(character, targetPosition)
         RunService.Heartbeat:Wait()
         RunService.Heartbeat:Wait()
         task.wait(Config.lootDwell)
@@ -1007,36 +1106,49 @@ function Loot.collectAll(character)
         return 0
     end
 
-    local origin = character.PrimaryPart and character.PrimaryPart.Position
-    if not origin then
-        return 0
-    end
+    local picked = 0
 
-    local candidates = {}
-    local now = os.clock()
+    for _ = 1, 2 do
+        local candidates = {}
 
-    for _, drop in ipairs(container:GetChildren()) do
-        local untilIgnore = lootIgnored[drop]
-        if (drop:IsA("Model") or drop:IsA("BasePart")) and (not untilIgnore or untilIgnore <= now) then
-            local part = Loot.part(drop)
-            if part and Loot.mine(drop) then
-                local distance = (part.Position - origin).Magnitude
-                if distance <= Config.lootRange then
-                    table.insert(candidates, { drop = drop, distance = distance })
+        for _, drop in ipairs(container:GetChildren()) do
+            if (drop:IsA("Model") or drop:IsA("BasePart")) and Loot.part(drop) and Loot.mine(drop) then
+                local name = tostring(drop.Name):gsub("_Drop$", "")
+                local priority = Ores.priority(name)
+                if not Ores.isSelected(name) then
+                    priority += 1000
                 end
+
+                table.insert(candidates, {
+                    drop = drop,
+                    priority = priority,
+                    distance = character.PrimaryPart
+                        and (Loot.part(drop).Position - character.PrimaryPart.Position).Magnitude
+                        or 0,
+                })
             end
         end
-    end
 
-    table.sort(candidates, function(a, b)
-        return a.distance < b.distance
-    end)
+        if #candidates == 0 then
+            break
+        end
 
-    local picked = 0
-    for _, candidate in ipairs(candidates) do
-        if tryPickup(character, candidate.drop) or candidate.drop.Parent then
-            Loot.ignore(candidate.drop)
-            picked += 1
+        table.sort(candidates, function(a, b)
+            if a.priority ~= b.priority then
+                return a.priority < b.priority
+            end
+            return a.distance < b.distance
+        end)
+
+        for _, candidate in ipairs(candidates) do
+            local drop = candidate.drop
+            if drop.Parent and Loot.mine(drop) then
+                if tryPickup(character, drop) then
+                    picked += 1
+                else
+                    logPrint("loot not picked " .. drop.Name)
+                end
+            end
         end
     end
 
@@ -1100,7 +1212,7 @@ local FarmMode = Mode.new("Farm", function(self)
     Loot.collectAll(character)
 
     if Config.surfaceDig and Mining.surface(character) then
-        local target = Predictor.blockBelow(root.Position) or Ores.random(character)
+        local target = Predictor.blockBelow(root.Position)
         if target and Mining.prepare(character) then
             logPrint("surface break " .. target.Name)
             Movement.hold(character)
@@ -1110,6 +1222,8 @@ local FarmMode = Mode.new("Farm", function(self)
                 task.wait(Config.lootSpawnWait)
                 Loot.collectAll(character)
             end
+        else
+            task.wait(0.2)
         end
         return
     end
@@ -1122,19 +1236,13 @@ local FarmMode = Mode.new("Farm", function(self)
         end
 
         local below = Predictor.blockBelow(root.Position)
-        local stand = below and (Mining.approach(below) or root.Position)
-        if not stand or not Mining.prepare(character) then
+        if not below or not Mining.prepare(character) then
             return false
         end
 
-        Movement.to(character, stand)
-        if not Mining.inCell(character) then
-            logWarn("shaft stand is not an empty cell")
-            return false
-        end
-
+        logPrint("dig down " .. below.Name)
         Movement.hold(character)
-        local dug = pcall(Mining.mine, character, below)
+        local dug = pcall(Mining.mine, character, below, true)
         Movement.releaseHold()
         return dug
     end

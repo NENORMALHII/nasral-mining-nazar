@@ -169,12 +169,42 @@ Drops live in `workspace.TargetFilter`, one model per broken block, named `{Bloc
 Inside there is a part (block name or any `BasePart`), a `DropScript`, and under it a
 `StringValue` named `Player` — the player who broke the block.
 
-`Loot.collectAll` only picks drops where `DropScript.Player.Value == LocalPlayer`, teleports to
-the drop part, waits two heartbeats plus `lootDwell` and retries once. It runs after `lootSpawnWait` (0.35 s) so the drop has time to spawn; the character
+`Loot.collectAll` only picks drops where `DropScript.Player.Value == LocalPlayer`. It walks
+through every own drop without a distance limit, two passes per call, teleports to the drop part
+and retries once. Runs after `lootSpawnWait` (0.35 s) so the drop has time to spawn; the character
 is not teleported into the block instantly.
 
 ## Surface (first layer)
 
-While the player's block Y is `<= surfaceY` (0), Farm skips the empty-cell calculation: it breaks
-the block below or any allowed block within `MaxDistance`. This avoids bad formula results at
-the surface, where the character could be pushed out of the map or fall into a random hole.
+While the player's block Y is `<= surfaceY` (-1, meaning the character stands on top of the
+first block layer), Farm skips the empty-cell calculation and breaks exactly the block below.
+Once the character drops into the first hole (Y >= 0), normal shaft logic takes over.
+
+`Dig down` never uses `Mining.approach` or `Mining.inCell`: the character is already above the
+block, so it anchors in place and mines the block below. That keeps the shaft going instead of
+silently skipping every deep block.
+
+## Staying inside the cavity
+
+`Position` keeps the character inside the mine:
+
+- `Position.safe(cell)` = cell is empty (no block at those coordinates), `cell.Y >= minCellY` (0)
+  and at least `minSolidNeighbors` (3) of the 6 neighbours are solid.
+- `Position.nearestSafe(worldPos, radius)` scans a cube of blocks around the position and returns
+  the closest safe cell.
+- `Position.enforce(character)` snaps the character to `Predictor.worldOf(safeCell)` if the
+  current cell is not safe. The surface (`Y <= surfaceY`) is the only exception.
+- `Mining.approach` only returns safe cells; `Mining.inCell` reuses the same rule.
+- Loot pickup teleports to the nearest safe cell around the drop, so the character never lands
+  inside a block or outside the mine.
+
+## Loot priority
+
+Loot order follows the ore list in the UI (`Ores.namesList`, sorted by price):
+
+- `{BlockName}_Drop` → resource name by stripping `_Drop`;
+- `Ores.priority(name)` returns the index in that list;
+- selected ores go first, unselected get `+1000`;
+- ties are resolved by distance to the character.
+
+`Loot.collectAll` sorts every pass with this key before teleporting.
