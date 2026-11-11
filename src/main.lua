@@ -53,13 +53,13 @@ local Log = {
 
 local function logPrint(...)
     if Log.enabled then
-        print("[em2]", ...)
+        print("[nm2]", ...)
     end
 end
 
 local function logWarn(...)
     if Log.enabled then
-        warn("[em2]", ...)
+        warn("[nm2]", ...)
     end
 end
 
@@ -1454,7 +1454,7 @@ end
 
 function Ui.create()
     local library = Ui.load()
-    local window = library.init("Epic Mining 2", "v1.1.0", "EM2_MAIN")
+    local window = library.init("nazar mining 2", "v1.1.0", "NM2_MAIN")
 
     local main, _ = window:AddTab("Main", "white-hat tests")
 
