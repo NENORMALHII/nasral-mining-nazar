@@ -1,0 +1,1 @@
+Drops of blocks are located in workspace.TargetFilter, the fodler contains {BlockName}_Drop, and int this model a Part which is named {BlockName} or just use :IsA(part)
