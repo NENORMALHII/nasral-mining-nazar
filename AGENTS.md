@@ -9,6 +9,9 @@ Everything runs client-side in an executor.
 - Place dump: `docs/game/place-20741661.rbxl`
 - Decompiled pickaxe client: `docs/game/minescript.lua`
 - Mining protocol notes: `docs/game/mining-protocol.md`
+- Pickaxe stats: `docs/game/pickaxeslist.lua`
+- Player attributes: `docs/game/playerstats.txt`
+- Pickaxe handle stats: `docs/game/toolhandleslist.lua`
 
 ## Layout
 

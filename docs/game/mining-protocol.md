@@ -120,3 +120,45 @@ fallback above the ore. `Mining.inCell` checks a 1.5-stud box around the root ag
 Unreachable ores are ignored and the mode falls back to `Dig down`.
 
 Exact prediction requires the server generation script or the real seed attribute name.
+
+## Stats used by the bot
+
+From `docs/game/pickaxeslist.lua`:
+
+- `BaseMineTime` — real wait time for the equipped pickaxe, resolved through the tool's
+  `ToolClass` attribute (fallback: tool name) and also updated from `UpdatePickaxe`.
+- `Tier`, `InstaMine`, `DoubleDropChance` — informational; tier does not gate ore access.
+
+From `docs/game/playerstats.txt` (LocalPlayer attributes):
+
+- `ToolSpeedModifier` — reduces mine time: `base * (100 - value) / 100`.
+- `WorldId` — must match the block's `WorldId` or the server rejects the block.
+- `Luck`, `DoubleDropChance`, `WalkSpeed` — not used by the bot.
+
+Wait time: `base * (100 - ToolSpeedModifier) / 100 * Resource.MineTimeModifier + 0.05 + ping * 2`.
+
+Position formula (same as `ReplicatedFirst.Util`):
+
+```
+block  -> world: (61.5 + 7x, 7998.5 - 7y, -56.5 + 7z)
+world  -> block: (floor((X - 61.5)/7 + 0.5),
+                  -floor((Y - 7998.5)/7 + 0.5),
+                  floor((Z + 56.5)/7 + 0.5))
+```
+
+The stand point is the center of an empty neighbouring cell with at least 3 solid neighbours
+and `Y >= 1`, so the character stays in a pit inside the mine.
+
+## Pickaxe handle detection
+
+`Modules.Tools.ToolHandles` is loaded as `Game.Handles`. `Mining.handleName` resolves the handle:
+
+1. attribute `WoodMaterial` (from `Constants.ATTR_TOOL_WOOD_MATERIAL`);
+2. attribute `Handle` or `Wood`;
+3. a `StringValue` descendant whose name contains `wood` or `handle`;
+4. handle name contained in the tool name.
+
+`Mining.handleInfo` returns the handle entry and its name. The handle only affects buffs
+(`SpeedModifier`, `LuckModifier`, `DoubleDropChanceModifier`, etc.). Mine time still uses
+`ToolSpeedModifier`, which the server already folds buffs into, so the bot must not add the
+handle bonus twice.

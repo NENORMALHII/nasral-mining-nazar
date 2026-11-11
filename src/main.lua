@@ -2,6 +2,7 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
 
 ---------------------------------------------------------------------------
 -- Config
@@ -25,8 +26,9 @@ local Config = {
     oreCacheTime = 1,
     depthWeight = 8,
     shaftDig = true,
-    lootRange = 300,
-    lootDwell = 0.03,
+    lootRange = 200,
+    lootDwell = 0.12,
+    lootAttempts = 2,
 
 
     blockEvent = "BlockEvent",
@@ -66,6 +68,8 @@ pcall(function()
     Game.Resources = require(modules:WaitForChild("Resources"))
     Game.Mine = require(modules:WaitForChild("Mining"):WaitForChild("Mine"))
     Game.Constants = require(modules:WaitForChild("Constants"))
+    Game.Pickaxes = require(modules:WaitForChild("Tools"):WaitForChild("Pickaxes"))
+    Game.Handles = require(modules:WaitForChild("Tools"):WaitForChild("ToolHandles"))
 end)
 
 Game.attrMinePosition = (Game.Constants and Game.Constants.ATTR_MINE_POSITION) or "MinePosition"
@@ -393,6 +397,14 @@ function Predictor.hash(blockPosition)
     return value % 1000
 end
 
+function Predictor.worldOf(blockPosition)
+    return Vector3.new(
+        BASE_X + 7 * blockPosition.X,
+        BASE_ALTITUDE - 7 * blockPosition.Y,
+        BASE_Z + 7 * blockPosition.Z
+    )
+end
+
 function Predictor.blockBelow(worldPosition)
     local mine = workspace:FindFirstChild(Config.mineName)
     if not mine then
@@ -410,6 +422,57 @@ end
 local Mining = {
     baseMineTime = Config.defaultMineTime,
 }
+
+function Mining.pickaxeInfo(pickaxe)
+    if not Game.Pickaxes or not pickaxe then
+        return nil
+    end
+
+    local className = pickaxe:GetAttribute("ToolClass") or pickaxe.Name
+    return Game.Pickaxes[className]
+end
+
+function Mining.handleName(pickaxe)
+    if not pickaxe then
+        return nil
+    end
+
+    local attrName = (Game.Constants and Game.Constants.ATTR_TOOL_WOOD_MATERIAL) or "WoodMaterial"
+    local name = pickaxe:GetAttribute(attrName)
+
+    if type(name) ~= "string" then
+        name = pickaxe:GetAttribute("Handle") or pickaxe:GetAttribute("Wood")
+    end
+
+    if type(name) == "string" then
+        return name
+    end
+
+    for _, descendant in ipairs(pickaxe:GetDescendants()) do
+        local lower = descendant.Name:lower()
+        if descendant:IsA("StringValue") and (lower:find("wood") or lower:find("handle")) then
+            return descendant.Value
+        end
+    end
+
+    if Game.Handles then
+        for handle in pairs(Game.Handles) do
+            if pickaxe.Name:find(handle, 1, true) then
+                return handle
+            end
+        end
+    end
+
+    return nil
+end
+
+function Mining.handleInfo(pickaxe)
+    local name = Mining.handleName(pickaxe)
+    if name and Game.Handles and Game.Handles[name] then
+        return Game.Handles[name], name
+    end
+    return nil, name
+end
 
 function Mining.bind(pickaxe)
     local remote = pickaxe:FindFirstChild(Config.pickaxeRemote)
@@ -439,6 +502,19 @@ function Mining.prepare(character)
         Mining.pickaxe = pickaxe
         Mining.rebound = false
         Mining.bind(pickaxe)
+
+        local info = Mining.pickaxeInfo(pickaxe)
+        if info and type(info.BaseMineTime) == "number" then
+            Mining.baseMineTime = info.BaseMineTime
+        end
+
+        local _, handleName = Mining.handleInfo(pickaxe)
+        Mining.handle = handleName
+        logPrint(("pickaxe %s base=%.2f handle=%s"):format(
+            pickaxe.Name,
+            Mining.baseMineTime,
+            tostring(handleName)
+        ))
     end
 
     if pickaxe.Parent ~= character then
@@ -618,30 +694,60 @@ function Mining.inCell(character)
         return false
     end
 
+    local cell = Predictor.toBlock(root.Position)
+    if mine:FindFirstChild(vec3ToString(cell)) then
+        return false
+    end
+
     overlapParams.FilterDescendantsInstances = { mine }
     local parts = workspace:GetPartBoundsInBox(
         CFrame.new(root.Position),
-        Vector3.new(1.5, 1.5, 1.5),
+        Vector3.new(1, 1, 1),
         overlapParams
     )
 
     return #parts == 0
 end
 
+function Mining.solidNeighbors(blockPosition, mine)
+    local count = 0
+
+    for _, key in ipairs(offsetOrder) do
+        local offset = blockOffsets[key]
+        if offset and mine:FindFirstChild(vec3ToString(blockPosition + offset)) then
+            count += 1
+        end
+    end
+
+    return count
+end
+
 function Mining.approach(block)
     local position = block:GetAttribute(Game.attrMinePosition)
     local mine = workspace:FindFirstChild(Config.mineName)
+    if not position or not mine then
+        return nil
+    end
 
-    if position and mine then
-        for _, key in ipairs(offsetOrder) do
-            local offset = blockOffsets[key]
-            if offset and mine:FindFirstChild(vec3ToString(position + offset)) == nil then
-                return block.Position + offset * Vector3.new(blockSize, -blockSize, blockSize)
+    local best, bestCount
+
+    for _, key in ipairs(offsetOrder) do
+        local offset = blockOffsets[key]
+        local cell = offset and position + offset
+
+        if cell and cell.Y >= 1 and mine:FindFirstChild(vec3ToString(cell)) == nil then
+            local count = Mining.solidNeighbors(cell, mine)
+            if count >= 3 and (not bestCount or count > bestCount) then
+                best, bestCount = cell, count
             end
         end
     end
 
-    return nil
+    if not best then
+        return nil
+    end
+
+    return Predictor.worldOf(best)
 end
 
 ---------------------------------------------------------------------------
@@ -825,6 +931,46 @@ function Loot.ignore(drop)
     lootIgnored[drop] = os.clock() + 10
 end
 
+function Loot.part(drop)
+    if drop:IsA("BasePart") then
+        return drop
+    end
+    return drop:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function tryPickup(character, drop)
+    local part = Loot.part(drop)
+    if not part then
+        return false
+    end
+
+    for _ = 1, Config.lootAttempts do
+        if not drop.Parent then
+            return true
+        end
+
+        Movement.instant(character, part.Position)
+        RunService.Heartbeat:Wait()
+        RunService.Heartbeat:Wait()
+        task.wait(Config.lootDwell)
+
+        if not drop.Parent then
+            return true
+        end
+
+        local prompt = drop:FindFirstChildWhichIsA("ProximityPrompt", true)
+        if prompt then
+            pcall(function()
+                prompt:InputHoldBegin()
+                prompt:InputHoldEnd()
+            end)
+            task.wait(Config.lootDwell)
+        end
+    end
+
+    return not drop.Parent
+end
+
 function Loot.collectAll(character)
     local drops = workspace:FindFirstChild("Drops")
     if not drops then
@@ -856,23 +1002,10 @@ function Loot.collectAll(character)
 
     local picked = 0
     for _, candidate in ipairs(candidates) do
-        if not candidate.drop.Parent then
-            continue
+        if tryPickup(character, candidate.drop) or candidate.drop.Parent then
+            Loot.ignore(candidate.drop)
+            picked += 1
         end
-        Movement.instant(character, Loot.position(candidate.drop))
-        task.wait(Config.lootDwell)
-
-        local prompt = candidate.drop:FindFirstChildWhichIsA("ProximityPrompt", true)
-        if prompt and candidate.drop.Parent then
-            pcall(function()
-                prompt:InputHoldBegin()
-                prompt:InputHoldEnd()
-            end)
-            task.wait(0.05)
-        end
-
-        Loot.ignore(candidate.drop)
-        picked += 1
     end
 
     if picked > 0 then
@@ -942,7 +1075,7 @@ local FarmMode = Mode.new("Farm", function(self)
         end
 
         local below = Predictor.blockBelow(root.Position)
-        local stand = below and Mining.approach(below)
+        local stand = below and (Mining.approach(below) or root.Position)
         if not stand or not Mining.prepare(character) then
             return false
         end
@@ -1008,6 +1141,7 @@ local FarmMode = Mode.new("Farm", function(self)
         Ores.ignore(ore)
     elseif result then
         Ores.invalidate()
+        task.wait(0.15)
         Loot.collectAll(character)
     else
         Ores.ignore(ore)
@@ -1258,6 +1392,23 @@ task.spawn(function()
             sample.Name,
             tostring(typeOf(sample)),
             tostring(sample:GetAttribute(Game.attrWorldId))
+        ))
+    end
+
+    local info = pickaxe and Mining.pickaxeInfo(pickaxe)
+    local handle, handleName = pickaxe and Mining.handleInfo(pickaxe)
+    print(("[main] player world=%s toolspeed=%s pickaxe_tier=%s base=%s handle=%s"):format(
+        tostring(Players.LocalPlayer:GetAttribute(Game.attrWorldId)),
+        tostring(Players.LocalPlayer:GetAttribute("ToolSpeedModifier")),
+        tostring(info and info.Tier),
+        tostring(info and info.BaseMineTime),
+        tostring(handleName)
+    ))
+    if handle then
+        print(("[main] handle speed=%s luck=%s double=%s"):format(
+            tostring(handle.SpeedModifier),
+            tostring(handle.LuckModifier),
+            tostring(handle.DoubleDropChanceModifier)
         ))
     end
 
