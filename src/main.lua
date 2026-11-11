@@ -8,48 +8,52 @@ local UserInputService = game:GetService("UserInputService")
 ---------------------------------------------------------------------------
 
 local Config = {
-    loopDelay = 0.05,
-    moveSpeed = 80,
-    moveStopDistance = 2.5,
-    mineTimeSafety = 1.05,
+    loopDelay = 0.04,
 
-    mushroomDelay = 0.4,
+    instantMove = false,
+    tweenSpeed = 120,
+    moveStopDistance = 2.5,
+
+    mineTimeSafety = 0.05,
+    mineRejectGrace = 0.6,
+
+    mushroomDelay = 0.35,
+    mushroomIgnore = 5,
+
     mineName = "Mine",
-    oreRange = 500,
+    oreRange = 160,
     oreCacheTime = 1,
+    depthWeight = 8,
+    shaftDig = true,
     lootRange = 300,
+    lootInstant = true,
+    lootDwell = 0.08,
 
     blockEvent = "BlockEvent",
     minedEvent = "BlockMinedEvent",
     pickaxeRemote = "UpdatePickaxe",
     defaultMineTime = 4,
-
-    orePrices = {
-        Dirt = 3,
-        Stone = 5,
-        Coal = 12,
-        ["Copper Ore"] = 20,
-        ["Iron Ore"] = 32,
-        Sulfur = 38,
-        ["Silver Ore"] = 45,
-        Emerald = 65,
-        Ruby = 85,
-        Ignis = 90,
-        Sapphire = 110,
-        ["Gold Ore"] = 150,
-        Hellstone = 18,
-        Sanctite = 20,
-        Quartz = 225,
-        Amethyst = 300,
-        Obsidian = 300,
-        Diamond = 400,
-        ["Uranium Ore"] = 300,
-        ["Mithril Ore"] = 300,
-        ["Promethium Ore"] = 300,
-        ["Malachite Ore"] = 550,
-        ["Azurite Ore"] = 550,
-    },
 }
+
+---------------------------------------------------------------------------
+-- Log
+---------------------------------------------------------------------------
+
+local Log = {
+    enabled = false,
+}
+
+local function logPrint(...)
+    if Log.enabled then
+        print("[em2]", ...)
+    end
+end
+
+local function logWarn(...)
+    if Log.enabled then
+        warn("[em2]", ...)
+    end
+end
 
 ---------------------------------------------------------------------------
 -- Game modules
@@ -77,25 +81,11 @@ local blockOffsets = (Game.Mine and Game.Mine.OFFSETS) or {
     BACK = Vector3.new(0, 0, -1),
 }
 
+local offsetOrder = { "UP", "FRONT", "BACK", "LEFT", "RIGHT", "DOWN" }
+
 ---------------------------------------------------------------------------
 -- Helpers
 ---------------------------------------------------------------------------
-
-local Log = {
-    enabled = false,
-}
-
-function Log.print(...)
-    if Log.enabled then
-        print("[em2]", ...)
-    end
-end
-
-function Log.warn(...)
-    if Log.enabled then
-        warn("[em2]", ...)
-    end
-end
 
 local function vec3ToString(position)
     return ("%d,%d,%d"):format(position.X, position.Y, position.Z)
@@ -117,59 +107,65 @@ local function resourceInfo(name)
 end
 
 ---------------------------------------------------------------------------
--- Manager
+-- Mode (base class)
 ---------------------------------------------------------------------------
 
-local Manager = {}
+local Mode = {}
+Mode.__index = Mode
 
-function Manager.new(step, cleanup)
-    local manager = {
+function Mode.new(name, step, cleanup)
+    return setmetatable({
+        name = name,
         enabled = false,
         token = 0,
-    }
+        step = step,
+        cleanup = cleanup,
+    }, Mode)
+end
 
-    function manager.start()
-        if manager.enabled then
-            return
-        end
+function Mode:start()
+    if self.enabled then
+        return
+    end
 
-        manager.enabled = true
-        manager.token += 1
-        local token = manager.token
+    self.enabled = true
+    self.token += 1
+    local token = self.token
 
-        task.spawn(function()
-            while manager.enabled and manager.token == token do
-                local ok, err = pcall(step)
-                if not ok then
-                    warn("[main] " .. tostring(err))
-                end
-                task.wait(Config.loopDelay)
+    task.spawn(function()
+        while self.enabled and self.token == token do
+            local ok, err = pcall(self.step, self)
+            if not ok then
+                logWarn(self.name .. " error: " .. tostring(err))
             end
-        end)
+            task.wait(Config.loopDelay)
+        end
+    end)
+end
+
+function Mode:stop()
+    if not self.enabled then
+        return
     end
 
-    function manager.stop()
-        if not manager.enabled then
-            return
-        end
+    self.enabled = false
+    self.token += 1
 
-        manager.enabled = false
-        manager.token += 1
-        if cleanup then
-            cleanup()
+    if self.cleanup then
+        local ok, err = pcall(self.cleanup, self)
+        if not ok then
+            logWarn(self.name .. " cleanup error: " .. tostring(err))
         end
     end
+end
 
-    function manager.toggle()
-        if manager.enabled then
-            manager.stop()
-        else
-            manager.start()
-        end
-        return manager.enabled
+function Mode:toggle()
+    if self.enabled then
+        self:stop()
+    else
+        self:start()
     end
-
-    return manager
+    return self.enabled
 end
 
 ---------------------------------------------------------------------------
@@ -216,56 +212,67 @@ function Character.getPickaxe(character)
     return nil
 end
 
----------------------------------------------------------------------------
--- Movement (anchored tween)
----------------------------------------------------------------------------
-
-local Movement = {}
-
-local function setPlatformStand(character, state)
+function Character.platformStand(character, state)
     local humanoid = character and character:FindFirstChildOfClass("Humanoid")
     if humanoid then
         humanoid.PlatformStand = state
     end
 end
 
+---------------------------------------------------------------------------
+-- Movement
+---------------------------------------------------------------------------
+
+local Movement = {}
+
+local function safeAnchor(root, state)
+    if root and root.Parent then
+        pcall(function()
+            root.Anchored = state
+        end)
+    end
+end
+
 function Movement.release()
     if Movement.tween then
-        Movement.tween:Cancel()
-    end
-    Movement.tween = nil
-
-    if Movement.holdRoot then
-        Movement.holdRoot.Anchored = false
-        Movement.holdRoot = nil
+        pcall(function()
+            Movement.tween:Cancel()
+        end)
+        Movement.tween = nil
     end
 
-    if Movement.root then
-        Movement.root.Anchored = false
-    end
+    safeAnchor(Movement.holdRoot, false)
+    Movement.holdRoot = nil
+
+    safeAnchor(Movement.root, false)
     Movement.root = nil
 
-    setPlatformStand(Movement.character, false)
+    Character.platformStand(Movement.character, false)
     Movement.character = nil
+end
+
+function Movement.cancel()
+    Movement.release()
+end
+
+function Movement.instant(character, position)
+    Movement.release()
+    if character and character.PrimaryPart then
+        character:PivotTo(CFrame.new(position))
+    end
 end
 
 function Movement.hold(character)
     local root = character.PrimaryPart
     if root then
-        root.Anchored = true
+        safeAnchor(root, true)
         Movement.holdRoot = root
     end
 end
 
 function Movement.releaseHold()
-    if Movement.holdRoot then
-        Movement.holdRoot.Anchored = false
-        Movement.holdRoot = nil
-    end
-end
-
-function Movement.cancel()
-    Movement.release()
+    safeAnchor(Movement.holdRoot, false)
+    Movement.holdRoot = nil
 end
 
 function Movement.to(character, position, speed)
@@ -276,19 +283,27 @@ function Movement.to(character, position, speed)
 
     Movement.release()
 
-    local distance = (position - root.Position).Magnitude
-    if distance < Config.moveStopDistance then
+    if (position - root.Position).Magnitude < Config.moveStopDistance then
         return
     end
 
-    speed = speed or Config.moveSpeed
-    setPlatformStand(character, true)
+    if Config.instantMove then
+        character:PivotTo(CFrame.new(position))
+        Character.platformStand(character, false)
+        return
+    end
 
-    root.Anchored = true
+    Character.platformStand(character, true)
+    safeAnchor(root, true)
     Movement.character = character
     Movement.root = root
 
-    local duration = math.clamp(distance / speed, 0.1, 5)
+    local duration = math.clamp(
+        (position - root.Position).Magnitude / math.max(speed or Config.tweenSpeed, 1),
+        0.05,
+        5
+    )
+
     local tween = TweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear), {
         CFrame = CFrame.new(position),
     })
@@ -318,7 +333,6 @@ end
 
 local Mining = {
     baseMineTime = Config.defaultMineTime,
-    lastReject = 0,
 }
 
 function Mining.bind(pickaxe)
@@ -340,19 +354,28 @@ function Mining.prepare(character)
         return nil
     end
 
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if not humanoid then
+        return nil
+    end
+
     if Mining.pickaxe ~= pickaxe then
         Mining.pickaxe = pickaxe
+        Mining.rebound = false
         Mining.bind(pickaxe)
     end
 
     if pickaxe.Parent ~= character then
-        local humanoid = character:FindFirstChildOfClass("Humanoid")
-        if not humanoid then
-            return nil
-        end
         humanoid:EquipTool(pickaxe)
-        task.wait(0.15)
+        task.wait(0.1)
+    elseif not Mining.rebound then
+        humanoid:UnequipTools()
+        task.wait(0.05)
+        humanoid:EquipTool(pickaxe)
+        task.wait(0.1)
     end
+
+    Mining.rebound = true
 
     return pickaxe
 end
@@ -362,7 +385,19 @@ function Mining.mineTime(block)
     local modifier = info and info.MineTimeModifier or 1
     local speed = Players.LocalPlayer:GetAttribute("ToolSpeedModifier") or 0
 
-    return Mining.baseMineTime * ((100 - speed) / 100) * modifier
+    return math.max(Mining.baseMineTime * ((100 - speed) / 100) * modifier, 0.05)
+end
+
+function Mining.waitTime(block)
+    local ping = 0
+    local ok, value = pcall(function()
+        return Players.LocalPlayer:GetNetworkPing()
+    end)
+    if ok and type(value) == "number" then
+        ping = math.min(value, 0.5)
+    end
+
+    return Mining.mineTime(block) + Config.mineTimeSafety + ping * 2
 end
 
 function Mining.maxDistance()
@@ -415,7 +450,7 @@ function Mining.why(block)
 
     local world = block:GetAttribute(Game.attrWorldId)
     local playerWorld = Players.LocalPlayer:GetAttribute(Game.attrWorldId)
-    if world ~= nil and playerWorld ~= nil and tostring(world) ~= tostring(playerWorld) then
+    if playerWorld ~= nil and tostring(world) ~= tostring(playerWorld) then
         return "world"
     end
 
@@ -440,20 +475,18 @@ function Mining.inRange(character, block)
     if not root then
         return false
     end
-    return (block.Position - root.Position).Magnitude <= Mining.maxDistance()
+    return (block.Position - root.Position).Magnitude <= Mining.maxDistance() - 1
 end
 
 function Mining.mine(character, block)
-    if not Mining.allowed(block) then
-        if os.clock() - Mining.lastReject > 5 then
-            Mining.lastReject = os.clock()
-            warn("[mining] rejected " .. block.Name .. " type=" .. tostring(typeOf(block)))
-        end
+    local reason = Mining.why(block)
+    if reason then
+        logWarn(("skip %s: %s"):format(block.Name, reason))
         return false
     end
 
     if not Mining.inRange(character, block) then
-        Log.warn("out of range " .. block.Name)
+        logWarn("out of range " .. block.Name)
         return false
     end
 
@@ -461,25 +494,29 @@ function Mining.mine(character, block)
     local blockEvent = ReplicatedStorage:FindFirstChild(Config.blockEvent)
     local minedEvent = ReplicatedStorage:FindFirstChild(Config.minedEvent)
     if not position or not blockEvent or not minedEvent then
-        warn("[mining] remotes not found")
+        logWarn("remotes not found")
         return false
     end
 
-    Log.print(("mine start %s type=%s time=%.2f"):format(
+    logPrint(("mine %s type=%s wait=%.2f"):format(
         block.Name,
         tostring(typeOf(block)),
-        Mining.mineTime(block)
+        Mining.waitTime(block)
     ))
 
     blockEvent:FireServer(block.Name, { dug = true })
-    task.wait(Mining.mineTime(block) * Config.mineTimeSafety + 0.3)
+    task.wait(Mining.waitTime(block))
 
     if not block.Parent then
         return true
     end
 
     minedEvent:FireServer({ blockName = vec3ToString(position) })
-    task.wait(0.3)
+
+    local deadline = os.clock() + Config.mineRejectGrace
+    while block.Parent and os.clock() < deadline do
+        task.wait(0.03)
+    end
 
     if block.Parent then
         blockEvent:FireServer(block.Name, { dug = false })
@@ -495,8 +532,9 @@ function Mining.approach(block)
     local mine = workspace:FindFirstChild(Config.mineName)
 
     if position and mine then
-        for _, offset in pairs(blockOffsets) do
-            if mine:FindFirstChild(vec3ToString(position + offset)) == nil then
+        for _, key in ipairs(offsetOrder) do
+            local offset = blockOffsets[key]
+            if offset and mine:FindFirstChild(vec3ToString(position + offset)) == nil then
                 return block.Position + offset * Vector3.new(blockSize, -blockSize, blockSize)
             end
         end
@@ -506,21 +544,79 @@ function Mining.approach(block)
 end
 
 ---------------------------------------------------------------------------
--- Target (mushrooms)
+-- Predictor (depth + seed based)
 ---------------------------------------------------------------------------
 
-local Target = {}
+local Predictor = {}
 
-function Target.mushroom()
-    for _, node in ipairs(workspace:GetChildren()) do
-        if node.Name == "HarvestableNode" then
-            local model = node:FindFirstChildWhichIsA("Model")
-            if model and model:FindFirstChild("BoundingBox") then
-                return model
+local BASE_X = 61.5
+local BASE_Z = -56.5
+local BASE_ALTITUDE = 7998.5
+
+function Predictor.toBlock(position)
+    return Vector3.new(
+        math.floor((position.X - BASE_X) / 7 + 0.5),
+        -math.floor((position.Y - BASE_ALTITUDE) / 7 + 0.5),
+        math.floor((position.Z - BASE_Z) / 7 + 0.5)
+    )
+end
+
+function Predictor.seed()
+    if Predictor.value then
+        return Predictor.value
+    end
+
+    local sources = {
+        workspace,
+        workspace:FindFirstChild(Config.mineName),
+        ReplicatedStorage,
+    }
+
+    for _, instance in ipairs(sources) do
+        if instance then
+            for name, value in pairs(instance:GetAttributes()) do
+                if type(name) == "string" and name:lower():find("seed") then
+                    Predictor.value = tostring(value)
+                    break
+                end
             end
         end
+        if Predictor.value then
+            break
+        end
     end
-    return nil
+
+    Predictor.value = Predictor.value
+        or ("w" .. tostring(Players.LocalPlayer:GetAttribute(Game.attrWorldId) or 0))
+
+    logPrint("predictor seed " .. Predictor.value)
+
+    return Predictor.value
+end
+
+function Predictor.hash(blockPosition)
+    local seed = Predictor.seed()
+    local value = 0
+
+    for index = 1, #seed do
+        value = (value * 31 + seed:byte(index)) % 2147483647
+    end
+
+    value = bit32.bxor(value, math.floor(blockPosition.X) * 73856093)
+    value = bit32.bxor(value, math.floor(blockPosition.Y) * 19349663)
+    value = bit32.bxor(value, math.floor(blockPosition.Z) * 83492791)
+
+    return value % 1000
+end
+
+function Predictor.blockBelow(worldPosition)
+    local mine = workspace:FindFirstChild(Config.mineName)
+    if not mine then
+        return nil
+    end
+
+    local blockPosition = Predictor.toBlock(worldPosition)
+    return mine:FindFirstChild(vec3ToString(blockPosition + Vector3.new(0, 1, 0)))
 end
 
 ---------------------------------------------------------------------------
@@ -540,28 +636,19 @@ function Ores.price(name)
     if info and info.BasePrice then
         return info.BasePrice
     end
-    return Config.orePrices[name] or 0
+    return 0
 end
 
 function Ores.names()
-    local names, seen = {}, {}
-    local sources = {}
+    local names = {}
+    local seen = {}
 
     if Game.Resources then
         for name, info in pairs(Game.Resources) do
-            if type(info) == "table" and info.Natural and info.BasePrice then
-                sources[name] = true
+            if type(info) == "table" and info.Natural and not seen[name] then
+                seen[name] = true
+                table.insert(names, name)
             end
-        end
-    end
-    for name in pairs(Config.orePrices) do
-        sources[name] = true
-    end
-
-    for name in pairs(sources) do
-        if not seen[name] then
-            seen[name] = true
-            table.insert(names, name)
         end
     end
 
@@ -570,28 +657,6 @@ function Ores.names()
     end)
 
     return names
-end
-
-function Ores.defaultSelected(name)
-    return Ores.price(name) > 0
-end
-
-function Ores.setSelected(names)
-    selected = names or {}
-end
-
-function Ores.getSelected()
-    if #selected > 0 then
-        return selected
-    end
-
-    local defaults = {}
-    for _, name in ipairs(Ores.names()) do
-        if Ores.defaultSelected(name) then
-            table.insert(defaults, name)
-        end
-    end
-    return defaults
 end
 
 function Ores.bindSelection(selection, names)
@@ -620,7 +685,7 @@ end
 function Ores.isSelected(name)
     local names = currentNames()
     if #names == 0 then
-        return Ores.defaultSelected(name)
+        return true
     end
     for _, entry in ipairs(names) do
         if entry == name then
@@ -628,17 +693,6 @@ function Ores.isSelected(name)
         end
     end
     return false
-end
-
-local function claimable(block)
-    if not block.Parent or not block:GetAttribute(Game.attrMinePosition) then
-        return false
-    end
-    local dug = block:FindFirstChild("Dug")
-    if dug and dug.Value ~= "" and dug.Value ~= Players.LocalPlayer.Name then
-        return false
-    end
-    return true
 end
 
 local function formatReasons(reasons)
@@ -656,7 +710,7 @@ function Ores.refresh()
 
     local mine = workspace:FindFirstChild(Config.mineName)
     if not mine then
-        Log.warn("mine not found")
+        logWarn("mine not found")
         return
     end
 
@@ -678,20 +732,11 @@ function Ores.refresh()
         end
     end
 
-    Log.print(("ores: blocks=%d cached=%d %s"):format(#blocks, #cache, formatReasons(reasons)))
+    logPrint(("ores: blocks=%d cached=%d %s"):format(#blocks, #cache, formatReasons(reasons)))
 
     if #cache == 0 and os.clock() - lastWarning > 10 then
         lastWarning = os.clock()
-        local sample = blocks[1]
         warn(("[ores] 0 targets, blocks=%d, reasons: %s"):format(#blocks, formatReasons(reasons)))
-        if sample then
-            warn(("[ores] sample=%s type=%s position=%s world=%s"):format(
-                sample.Name,
-                tostring(typeOf(sample)),
-                tostring(sample:GetAttribute(Game.attrMinePosition)),
-                tostring(sample:GetAttribute(Game.attrWorldId))
-            ))
-        end
     end
 end
 
@@ -700,21 +745,28 @@ function Ores.nearest(position)
         Ores.refresh()
     end
 
-    local best, bestDistance, bestPrice
+    local best, bestDistance, bestScore
     local now = os.clock()
+    local playerBlock = Predictor.toBlock(position)
 
     for _, block in ipairs(cache) do
         local untilIgnore = ignored[block]
-        if (not untilIgnore or untilIgnore <= now) and claimable(block) then
+        if not untilIgnore or untilIgnore <= now then
             local distance = (block.Position - position).Magnitude
-            local price = Ores.price(typeOf(block))
+            if distance <= Config.oreRange then
+                local blockPosition = block:GetAttribute(Game.attrMinePosition)
+                local price = Ores.price(typeOf(block))
+                local depth = 0
 
-            local better = not best
-                or price > bestPrice
-                or (price == bestPrice and distance < bestDistance)
+                if blockPosition then
+                    depth = math.max(0, blockPosition.Y - playerBlock.Y)
+                end
 
-            if distance <= Config.oreRange and better then
-                best, bestDistance, bestPrice = block, distance, price
+                local score = price + depth * Config.depthWeight + Predictor.hash(blockPosition or block.Position) / 1000
+
+                if not best or score > bestScore then
+                    best, bestDistance, bestScore = block, distance, score
+                end
             end
         end
     end
@@ -770,51 +822,105 @@ function Loot.ignore(drop)
     lootIgnored[drop] = os.clock() + 10
 end
 
----------------------------------------------------------------------------
--- Mushrooms (manager)
----------------------------------------------------------------------------
-
-local Mushrooms
-
-Mushrooms = Manager.new(function()
-    local model = Target.mushroom()
-    if not model then
-        task.wait(0.3)
-        return
+function Loot.collectAll(character)
+    local drops = workspace:FindFirstChild("Drops")
+    if not drops then
+        return 0
     end
 
-    local box = model.BoundingBox
-    local interact = box:FindFirstChild("Interact")
-    if not interact then
-        return
+    local origin = character.PrimaryPart and character.PrimaryPart.Position
+    if not origin then
+        return 0
     end
 
+    local candidates = {}
+    local now = os.clock()
+
+    for _, drop in ipairs(drops:GetChildren()) do
+        local untilIgnore = lootIgnored[drop]
+        if (drop:IsA("Model") or drop:IsA("BasePart")) and (not untilIgnore or untilIgnore <= now) then
+            local position = Loot.position(drop)
+            local distance = (position - origin).Magnitude
+            if distance <= Config.lootRange then
+                table.insert(candidates, { drop = drop, distance = distance })
+            end
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        return a.distance < b.distance
+    end)
+
+    local picked = 0
+    for _, candidate in ipairs(candidates) do
+        if not candidate.drop.Parent then
+            continue
+        end
+        Movement.instant(character, Loot.position(candidate.drop))
+        task.wait(Config.lootDwell)
+
+        local prompt = candidate.drop:FindFirstChildWhichIsA("ProximityPrompt", true)
+        if prompt and candidate.drop.Parent then
+            pcall(function()
+                prompt:InputHoldBegin()
+                prompt:InputHoldEnd()
+            end)
+            task.wait(0.05)
+        end
+
+        Loot.ignore(candidate.drop)
+        picked += 1
+    end
+
+    if picked > 0 then
+        logPrint("loot picked " .. picked)
+    end
+
+    return picked
+end
+
+---------------------------------------------------------------------------
+-- Mushroom node
+---------------------------------------------------------------------------
+
+local MushroomNode = {}
+local mushroomIgnored = {}
+
+function MushroomNode.nearest(position)
+    local best, bestDistance
+    local now = os.clock()
+
+    for _, node in ipairs(workspace:GetChildren()) do
+        if node.Name == "HarvestableNode" then
+            local untilIgnore = mushroomIgnored[node]
+            if not untilIgnore or untilIgnore <= now then
+                local model = node:FindFirstChildWhichIsA("Model")
+                local box = model and model:FindFirstChild("BoundingBox")
+                if box and box:FindFirstChild("Interact") then
+                    local distance = (box.Position - position).Magnitude
+                    if not bestDistance or distance < bestDistance then
+                        best, bestDistance = box, distance
+                    end
+                end
+            end
+        end
+    end
+
+    return best, bestDistance
+end
+
+function MushroomNode.ignore(box)
+    local node = box.Parent or box
+    mushroomIgnored[node] = os.clock() + Config.mushroomIgnore
+end
+
+---------------------------------------------------------------------------
+-- Farm mode
+---------------------------------------------------------------------------
+
+local FarmMode = Mode.new("Farm", function(self)
     local character = Character.get()
-    if not Mushrooms.enabled then
-        return
-    end
-
-    Movement.to(character, box.Position + Vector3.new(0, 3, 0), Config.moveSpeed)
-    Movement.hold(character)
-    task.wait(Config.mushroomDelay)
-
-    if not Mushrooms.enabled then
-        Movement.releaseHold()
-        return
-    end
-    interact.InteractEvent:FireServer()
-    Movement.releaseHold()
-end, Movement.cancel)
-
----------------------------------------------------------------------------
--- Farmer (manager)
----------------------------------------------------------------------------
-
-local Farmer
-
-Farmer = Manager.new(function()
-    local character = Character.get()
-    if not Farmer.enabled then
+    if not self.enabled then
         return
     end
 
@@ -823,50 +929,156 @@ Farmer = Manager.new(function()
         return
     end
 
-    local ore, oreDistance = Ores.nearest(root.Position)
-    local loot, lootDistance = Loot.nearest(root.Position)
+    if Config.lootInstant then
+        Loot.collectAll(character)
+    end
 
-    if loot and (not ore or lootDistance < oreDistance) then
-        Movement.to(character, Loot.position(loot) + Vector3.new(0, 3, 0), Config.moveSpeed)
-        Loot.ignore(loot)
-        return
+    local ore, oreDistance = Ores.nearest(root.Position)
+
+    if not Config.lootInstant then
+        local loot, lootDistance = Loot.nearest(root.Position)
+        if loot and (not ore or lootDistance < oreDistance) then
+            Movement.to(character, Loot.position(loot) + Vector3.new(0, 3, 0))
+            Loot.ignore(loot)
+            return
+        end
     end
 
     if not ore then
-        Log.print("no ore targets")
+        if Config.shaftDig then
+            local below = Predictor.blockBelow(root.Position)
+            if below and Mining.allowed(below) then
+                if Mining.prepare(character) then
+                    Movement.to(character, Mining.approach(below))
+                    Movement.hold(character)
+                    local dug = pcall(Mining.mine, character, below)
+                    Movement.releaseHold()
+                    if not dug then
+                        Ores.invalidate()
+                    end
+                end
+                return
+            end
+        end
+        task.wait(0.2)
+        return
+    end
+
+    if not Mining.prepare(character) then
+        logWarn("no pickaxe")
         task.wait(0.3)
         return
     end
 
-    Log.print(("target %s type=%s dist=%.1f price=%d"):format(
+    logPrint(("target %s type=%s dist=%.1f price=%d"):format(
         ore.Name,
         tostring(typeOf(ore)),
         oreDistance,
         Ores.price(typeOf(ore))
     ))
 
-    if not Mining.prepare(character) then
-        warn("[farmer] no pickaxe")
-        task.wait(0.5)
-        return
-    end
+    Movement.to(character, Mining.approach(ore))
 
-    Movement.to(character, Mining.approach(ore), Config.moveSpeed)
-
-    if not Farmer.enabled then
+    if not self.enabled then
         return
     end
 
     Movement.hold(character)
-    Mining.mine(character, ore)
+    local mined, result = pcall(Mining.mine, character, ore)
     Movement.releaseHold()
 
-    if ore.Parent then
+    if not mined then
+        logWarn("mine error: " .. tostring(result))
         Ores.ignore(ore)
-    else
+    elseif result then
         Ores.invalidate()
+        if Config.lootInstant then
+            Loot.collectAll(character)
+        end
+    else
+        Ores.ignore(ore)
     end
 end, Movement.cancel)
+
+---------------------------------------------------------------------------
+-- Mushroom mode
+---------------------------------------------------------------------------
+
+local MushroomMode = Mode.new("Mushrooms", function(self)
+    local character = Character.get()
+    if not self.enabled then
+        return
+    end
+
+    local root = character.PrimaryPart
+    if not root then
+        return
+    end
+
+    local box = MushroomNode.nearest(root.Position)
+    if not box then
+        logPrint("no mushrooms")
+        task.wait(0.2)
+        return
+    end
+
+    local interact = box:FindFirstChild("Interact")
+    if not interact then
+        return
+    end
+
+    Movement.to(character, box.Position + Vector3.new(0, 3, 0))
+    Movement.hold(character)
+    task.wait(Config.mushroomDelay)
+
+    if self.enabled then
+        interact.InteractEvent:FireServer()
+    end
+
+    Movement.releaseHold()
+    MushroomNode.ignore(box)
+end, Movement.cancel)
+
+---------------------------------------------------------------------------
+-- Modes registry
+---------------------------------------------------------------------------
+
+local Modes = {
+    list = { FarmMode, MushroomMode },
+    active = FarmMode,
+}
+
+function Modes.byName(name)
+    for _, mode in ipairs(Modes.list) do
+        if mode.name == name then
+            return mode
+        end
+    end
+    return nil
+end
+
+function Modes.select(mode)
+    if not mode or Modes.active == mode then
+        return
+    end
+    for _, other in ipairs(Modes.list) do
+        other:stop()
+    end
+    Modes.active = mode
+end
+
+function Modes.enable(mode)
+    if not mode then
+        return
+    end
+    for _, other in ipairs(Modes.list) do
+        if other ~= mode then
+            other:stop()
+        end
+    end
+    Modes.active = mode
+    mode:start()
+end
 
 ---------------------------------------------------------------------------
 -- UI
@@ -890,98 +1102,135 @@ function Ui.load()
     return loadstring(game:HttpGet("https://raw.githubusercontent.com/cueshut/saves/main/compact"))()
 end
 
-function Ui.create(managers)
+function Ui.create()
     local library = Ui.load()
-    local window = library.init("Epic Mining 2", "v1.0.0", "EM2_MAIN")
+    local window = library.init("Epic Mining 2", "v1.1.0", "EM2_MAIN")
 
-    local main, _ = window:AddTab("Managers", "white-hat tests")
-    local toggles = main:AddSeperator("Toggles")
+    local main, _ = window:AddTab("Main", "white-hat tests")
 
-    for _, manager in ipairs(managers) do
-        toggles:AddToggle({
-            title = manager.title,
-            desc = manager.desc,
-            checked = manager.instance.enabled,
-            callback = function(state)
-                if state then
-                    manager.instance.start()
-                else
-                    manager.instance.stop()
+    local modePanel = main:AddSeperator("Mode")
+    local enabled = false
+
+    local modeDropdown
+    modeDropdown = modePanel:AddDropdown({
+        title = "Category",
+        options = { "Farm", "Mushrooms" },
+        callback = function(index)
+            local mode = Modes.list[index]
+            Modes.select(mode)
+            if enabled and mode then
+                Modes.enable(mode)
+            end
+        end,
+    })
+
+    modePanel:AddToggle({
+        title = "Enabled",
+        callback = function(state)
+            enabled = state
+            if state then
+                Modes.enable(Modes.active)
+            else
+                for _, mode in ipairs(Modes.list) do
+                    mode:stop()
                 end
-            end,
-        })
-    end
+            end
+        end,
+    })
 
-    local ores = main:AddSeperator("Ore selection")
+    local movePanel = main:AddSeperator("Movement")
+    movePanel:AddToggle({
+        title = "Instant move",
+        desc = "teleport instead of tween",
+        callback = function(state)
+            Config.instantMove = state
+        end,
+    })
+
+    movePanel:AddToggle({
+        title = "Dig down",
+        desc = "dig the block below when no selected ore is near",
+        checked = Config.shaftDig,
+        callback = function(state)
+            Config.shaftDig = state
+        end,
+    })
+
+    movePanel:AddToggle({
+        title = "Instant loot",
+        desc = "teleport to every drop before mining",
+        checked = Config.lootInstant,
+        callback = function(state)
+            Config.lootInstant = state
+        end,
+    })
+
+    movePanel:AddSlider({
+        title = "Tween speed",
+        values = { min = 20, max = 400, default = Config.tweenSpeed, round = 1 },
+        callback = function(value)
+            Config.tweenSpeed = value
+        end,
+    })
+
+    local orePanel = main:AddSeperator("Farm ores")
     local names = Ores.names()
     local defaults = {}
 
     for index, name in ipairs(names) do
-        if Ores.defaultSelected(name) then
-            table.insert(defaults, index)
-        end
+        table.insert(defaults, index)
     end
 
-    local selection = ores:AddSelection({
+    local selection = orePanel:AddSelection({
         title = "Ores",
         options = names,
-        callback = function(indices)
-            local picked = {}
-            for _, index in ipairs(indices) do
-                if names[index] then
-                    table.insert(picked, names[index])
-                end
-            end
-            Ores.setSelected(picked)
-            Ores.invalidate()
-        end,
+        default = defaults,
     })
 
     selection.setSelected(defaults)
     Ores.bindSelection(selection, names)
 
-    local debug = main:AddSeperator("Debug")
-    debug:AddToggle({
+    local debugPanel = main:AddSeperator("Debug")
+    debugPanel:AddToggle({
         title = "Verbose logs",
-        desc = "print ore rejection reasons and mining steps",
+        desc = "print ore reasons and mining steps",
         callback = function(state)
             Log.enabled = state
-            print("[em2] verbose logs " .. (state and "on" or "off"))
         end,
     })
+
+    modeDropdown.setSelected(1)
 
     return window
 end
 
-local managers = {
-    {
-        title = "Mushrooms",
-        desc = "tween to HarvestableNode and fire Interact",
-        instance = Mushrooms,
-        key = Enum.KeyCode.F1,
-    },
-    {
-        title = "Farmer",
-        desc = "tween to selected ore or loot, mine within range",
-        instance = Farmer,
-        key = Enum.KeyCode.F2,
-    },
-}
+---------------------------------------------------------------------------
+-- Bootstrap
+---------------------------------------------------------------------------
 
-local ok, err = pcall(Ui.create, managers)
+local ok, err = pcall(Ui.create)
 if not ok then
     warn("[main] ui failed: " .. tostring(err))
 end
+
+local hotkeys = {
+    [Enum.KeyCode.F1] = FarmMode,
+    [Enum.KeyCode.F2] = MushroomMode,
+}
 
 UserInputService.InputBegan:Connect(function(input, processed)
     if processed then
         return
     end
-    for _, manager in ipairs(managers) do
-        if input.KeyCode == manager.key then
-            manager.instance.toggle()
-            print(("[main] %s = %s"):format(manager.title, tostring(manager.instance.enabled)))
+
+    local mode = hotkeys[input.KeyCode]
+    if mode then
+        if mode.enabled then
+            mode:stop()
+        else
+            Modes.enable(mode)
         end
+        print(("[main] %s = %s"):format(mode.name, tostring(mode.enabled)))
     end
 end)
 
@@ -989,25 +1238,23 @@ task.spawn(function()
     local character = Character.get()
     local pickaxe = Character.getPickaxe(character)
     local mine = workspace:FindFirstChild(Config.mineName)
-
     local blocks = mine and mine:GetChildren() or {}
     local sample = blocks[1]
 
-    print(("[main] mine=%s blocks=%d pickaxe=%s ores=%d selected=%d"):format(
+    print(("[main] mine=%s blocks=%d pickaxe=%s ores=%d"):format(
         mine and "yes" or "no",
         #blocks,
         pickaxe and pickaxe.Name or "none",
-        #Ores.names(),
-        #Ores.getSelected()
+        #Ores.names()
     ))
 
     if sample then
-        print(("[main] sample=%s type=%s position=%s"):format(
+        print(("[main] sample=%s type=%s world=%s"):format(
             sample.Name,
             tostring(typeOf(sample)),
-            tostring(sample:GetAttribute(Game.attrMinePosition))
+            tostring(sample:GetAttribute(Game.attrWorldId))
         ))
     end
 
-    print("[main] F1 mushrooms, F2 farmer")
+    print("[main] F1 farm, F2 mushrooms")
 end)

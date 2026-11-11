@@ -82,3 +82,35 @@ Anchored tween is the reliable option for this character:
 5. Hold the root anchored while mining so distance checks keep passing.
 
 `AlignPosition`/`LinearVelocity` fight the humanoid and cause tumbling.
+
+## Client modes
+
+`src/main.lua` uses a `Mode` class. Two instances, one per category:
+
+- `FarmMode` — picks the highest-price ore (distance breaks ties), moves, mines, collects `Drops`.
+- `MushroomMode` — finds the nearest `HarvestableNode`, moves, fires `InteractEvent`.
+
+Only one mode runs at a time. UI: `Category` dropdown + `Enabled` toggle.
+Hotkeys: `F1` farm, `F2` mushrooms. Movement: `Instant move` toggle and `Tween speed` slider.
+
+## Instant loot
+
+`Loot.collectAll` teleports the character to every `Workspace.Drops` child inside `lootRange`,
+nearest first, waits `lootDwell` (0.08 s) per drop so the server sees the touch, and marks the
+drop ignored for 10 s. Runs at the start of every farm tick and right after a successful mine.
+Toggle: `Instant loot`.
+
+## Downward strategy and seed predictor
+
+Mine generation code is server-side and missing from the place dump. `Predictor` therefore:
+
+- reads any attribute whose name contains `seed` on `Workspace`, `Workspace.Mine` or
+  `ReplicatedStorage`; falls back to `w<WorldId>`;
+- converts world position to block coordinates with the `Util.GetBlockCoords` formula;
+- hashes seed + block coordinates with `bit32.bxor` for deterministic tie-breaking.
+
+Target score: `BasePrice + max(0, blockY - playerBlockY) * depthWeight + hash / 1000`.
+So deeper ores win, and the route is stable for the same seed.
+If no selected ore is in range, Farm digs the block below the player (`Dig down` toggle).
+
+Exact prediction requires the server generation script or the real seed attribute name.
