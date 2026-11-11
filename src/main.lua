@@ -1258,6 +1258,22 @@ local FarmMode = Mode.new("Farm", function(self)
         return
     end
 
+    local shaftBlock = Predictor.blockBelow(root.Position)
+    if shaftBlock and not Ores.isSelected(typeOf(shaftBlock) or "") then
+        if Mining.prepare(character) then
+            logPrint("clear path " .. shaftBlock.Name .. " (" .. tostring(typeOf(shaftBlock)) .. ")")
+            Movement.hold(character)
+            local ok = pcall(Mining.mine, character, shaftBlock, true)
+            Movement.releaseHold()
+            if ok then
+                task.wait(Config.lootSpawnWait)
+                Loot.sync()
+                Loot.collectAll(character)
+            end
+        end
+        return
+    end
+
     local ore, oreDistance = Ores.nearest(root.Position)
 
     local function DigOnlyDown()

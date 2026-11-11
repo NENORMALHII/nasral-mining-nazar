@@ -185,6 +185,9 @@ Once the character drops into the first hole (Y >= 0), normal shaft logic takes 
 block, so it anchors in place and mines the block below. That keeps the shaft going instead of
 silently skipping every deep block.
 
+Excluded ores are not skipped when they block the shaft: if the block directly below is not in
+the ore selection, Farm clears it (`clear path`) before choosing a distant selected ore.
+
 ## Staying inside the cavity
 
 `Position` keeps the character inside the mine:
