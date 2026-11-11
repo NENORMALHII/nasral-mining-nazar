@@ -26,9 +26,13 @@ local Config = {
     oreCacheTime = 1,
     depthWeight = 8,
     shaftDig = true,
-    lootRange = 200,
+    lootRange = 150,
     lootDwell = 0.12,
     lootAttempts = 2,
+    lootSpawnWait = 0.35,
+
+    surfaceY = 0,
+    surfaceDig = true,
 
 
     blockEvent = "BlockEvent",
@@ -630,7 +634,15 @@ function Mining.inRange(character, block)
     return (block.Position - root.Position).Magnitude <= Mining.maxDistance() - 1
 end
 
-function Mining.mine(character, block)
+function Mining.surface(character)
+    local root = character and character.PrimaryPart
+    if not root then
+        return false
+    end
+    return Predictor.toBlock(root.Position).Y <= Config.surfaceY
+end
+
+function Mining.mine(character, block, skipCell)
     local reason = Mining.why(block)
     if reason then
         logWarn(("skip %s: %s"):format(block.Name, reason))
@@ -642,7 +654,7 @@ function Mining.mine(character, block)
         return false
     end
 
-    if not Mining.inCell(character) then
+    if not skipCell and not Mining.inCell(character) then
         logWarn("not between blocks " .. block.Name)
         return false
     end
@@ -905,6 +917,23 @@ function Ores.nearest(position)
     return best, bestDistance
 end
 
+function Ores.random(character)
+    local root = character and character.PrimaryPart
+    local mine = workspace:FindFirstChild(Config.mineName)
+    if not root or not mine then
+        return nil
+    end
+
+    local limit = Mining.maxDistance() - 1
+    for _, block in ipairs(mine:GetChildren()) do
+        if Mining.allowed(block) and (block.Position - root.Position).Magnitude <= limit then
+            return block
+        end
+    end
+
+    return nil
+end
+
 function Ores.ignore(block)
     ignored[block] = os.clock() + 5
 end
@@ -914,28 +943,38 @@ function Ores.invalidate()
 end
 
 ---------------------------------------------------------------------------
--- Loot
+-- Loot (workspace.TargetFilter/{BlockName}_Drop)
 ---------------------------------------------------------------------------
 
 local Loot = {}
 local lootIgnored = {}
 
-function Loot.position(drop)
-    if drop:IsA("Model") then
-        return drop:GetPivot().Position
-    end
-    return drop.Position
-end
-
-function Loot.ignore(drop)
-    lootIgnored[drop] = os.clock() + 10
+function Loot.container()
+    return workspace:FindFirstChild("TargetFilter") or workspace:FindFirstChild("Drops")
 end
 
 function Loot.part(drop)
     if drop:IsA("BasePart") then
         return drop
     end
+
+    for _, child in ipairs(drop:GetChildren()) do
+        if child:IsA("BasePart") then
+            return child
+        end
+    end
+
     return drop:FindFirstChildWhichIsA("BasePart", true)
+end
+
+function Loot.owner(drop)
+    local dropScript = drop:FindFirstChild("DropScript", true)
+    local playerValue = dropScript and dropScript:FindFirstChild("Player")
+    return playerValue and playerValue.Value
+end
+
+function Loot.mine(drop)
+    return Loot.owner(drop) == Players.LocalPlayer
 end
 
 local function tryPickup(character, drop)
@@ -945,7 +984,7 @@ local function tryPickup(character, drop)
     end
 
     for _ = 1, Config.lootAttempts do
-        if not drop.Parent then
+        if not drop.Parent or not part.Parent then
             return true
         end
 
@@ -957,23 +996,14 @@ local function tryPickup(character, drop)
         if not drop.Parent then
             return true
         end
-
-        local prompt = drop:FindFirstChildWhichIsA("ProximityPrompt", true)
-        if prompt then
-            pcall(function()
-                prompt:InputHoldBegin()
-                prompt:InputHoldEnd()
-            end)
-            task.wait(Config.lootDwell)
-        end
     end
 
     return not drop.Parent
 end
 
 function Loot.collectAll(character)
-    local drops = workspace:FindFirstChild("Drops")
-    if not drops then
+    local container = Loot.container()
+    if not container then
         return 0
     end
 
@@ -985,13 +1015,15 @@ function Loot.collectAll(character)
     local candidates = {}
     local now = os.clock()
 
-    for _, drop in ipairs(drops:GetChildren()) do
+    for _, drop in ipairs(container:GetChildren()) do
         local untilIgnore = lootIgnored[drop]
         if (drop:IsA("Model") or drop:IsA("BasePart")) and (not untilIgnore or untilIgnore <= now) then
-            local position = Loot.position(drop)
-            local distance = (position - origin).Magnitude
-            if distance <= Config.lootRange then
-                table.insert(candidates, { drop = drop, distance = distance })
+            local part = Loot.part(drop)
+            if part and Loot.mine(drop) then
+                local distance = (part.Position - origin).Magnitude
+                if distance <= Config.lootRange then
+                    table.insert(candidates, { drop = drop, distance = distance })
+                end
             end
         end
     end
@@ -1067,6 +1099,21 @@ local FarmMode = Mode.new("Farm", function(self)
 
     Loot.collectAll(character)
 
+    if Config.surfaceDig and Mining.surface(character) then
+        local target = Predictor.blockBelow(root.Position) or Ores.random(character)
+        if target and Mining.prepare(character) then
+            logPrint("surface break " .. target.Name)
+            Movement.hold(character)
+            local ok = pcall(Mining.mine, character, target, true)
+            Movement.releaseHold()
+            if ok then
+                task.wait(Config.lootSpawnWait)
+                Loot.collectAll(character)
+            end
+        end
+        return
+    end
+
     local ore, oreDistance = Ores.nearest(root.Position)
 
     local function digDown()
@@ -1141,7 +1188,7 @@ local FarmMode = Mode.new("Farm", function(self)
         Ores.ignore(ore)
     elseif result then
         Ores.invalidate()
-        task.wait(0.15)
+        task.wait(Config.lootSpawnWait)
         Loot.collectAll(character)
     else
         Ores.ignore(ore)

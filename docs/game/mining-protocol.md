@@ -162,3 +162,19 @@ and `Y >= 1`, so the character stays in a pit inside the mine.
 (`SpeedModifier`, `LuckModifier`, `DoubleDropChanceModifier`, etc.). Mine time still uses
 `ToolSpeedModifier`, which the server already folds buffs into, so the bot must not add the
 handle bonus twice.
+
+## Drops (from `docs/game/blockdropinstructions.txt`)
+
+Drops live in `workspace.TargetFilter`, one model per broken block, named `{BlockName}_Drop`.
+Inside there is a part (block name or any `BasePart`), a `DropScript`, and under it a
+`StringValue` named `Player` — the player who broke the block.
+
+`Loot.collectAll` only picks drops where `DropScript.Player.Value == LocalPlayer`, teleports to
+the drop part, waits two heartbeats plus `lootDwell` and retries once. It runs after `lootSpawnWait` (0.35 s) so the drop has time to spawn; the character
+is not teleported into the block instantly.
+
+## Surface (first layer)
+
+While the player's block Y is `<= surfaceY` (0), Farm skips the empty-cell calculation: it breaks
+the block below or any allowed block within `MaxDistance`. This avoids bad formula results at
+the surface, where the character could be pushed out of the map or fall into a random hole.
