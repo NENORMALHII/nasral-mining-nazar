@@ -453,7 +453,7 @@ local Ui = {}
 
 function Ui.load()
     if type(readfile) == "function" and type(isfile) == "function" then
-        for _, path in ipairs({ "uilib/source.lua", "uilib\\source.lua" }) do
+        for _, path in ipairs({ "vendor/uilib/source.lua", "vendor\\uilib\\source.lua" }) do
             if isfile(path) then
                 local ok, library = pcall(function()
                     return loadstring(readfile(path))()
