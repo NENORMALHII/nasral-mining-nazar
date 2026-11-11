@@ -62,12 +62,9 @@ Server side is not in the place dump, so server checks below are inferred.
 - `ATTR_WORLD_ID = "WorldId"`, `ATTR_MINE_POSITION = "MinePosition"`.
 - `PLACE_ID_STAGING` and `PLACE_ID_TESTING` are used by `CommonUtils.IsDevPlace`.
 
-## Bypass flags in `src/main.lua`
+## Ore selection
 
-`Config.bypass` switches server-side checks on one at a time:
-
-- `skipStart` — send only `BlockMinedEvent`, no `dug = true` claim.
-- `skipWait` — finish immediately, no mine time.
-- `ignoreLiquid` — allow ores with liquid neighbours.
-- `ignoreWorld` — allow blocks from another `WorldId`.
-- `anyType` — allow Bedrock, Oil, Lava, Grass, Void.
+`Ores.names()` builds the list from `Resources` (`Natural` + `BasePrice`) and falls back to
+`Config.orePrices`. The UI selection stores explicit resource names in `Ores.setSelected`.
+Empty selection falls back to `BasePrice >= Config.minOreValue`. Tier gating is not used:
+pickaxe tier changes mine time, not ore access.
