@@ -200,11 +200,10 @@ silently skipping every deep block.
 
 ## Loot priority
 
-Loot order follows the ore list in the UI (`Ores.namesList`, sorted by price):
+Loot order:
 
 - `{BlockName}_Drop` → resource name by stripping `_Drop`;
-- `Ores.priority(name)` returns the index in that list;
-- selected ores go first, unselected get `+1000`;
-- ties are resolved by distance to the character.
+- only drops whose resource is selected in the UI are collected;
+- higher `BasePrice` first, ties by distance.
 
 `Loot.collectAll` sorts every pass with this key before teleporting.

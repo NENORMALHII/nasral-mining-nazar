@@ -932,18 +932,6 @@ function Ores.isSelected(name)
     return false
 end
 
-function Ores.priority(name)
-    local list = Ores.namesList or Ores.names()
-
-    for index, entry in ipairs(list) do
-        if entry == name then
-            return index
-        end
-    end
-
-    return math.huge
-end
-
 local function formatReasons(reasons)
     local parts = {}
     for reason, count in pairs(reasons) do
@@ -1114,18 +1102,17 @@ function Loot.collectAll(character)
         for _, drop in ipairs(container:GetChildren()) do
             if (drop:IsA("Model") or drop:IsA("BasePart")) and Loot.part(drop) and Loot.mine(drop) then
                 local name = tostring(drop.Name):gsub("_Drop$", "")
-                local priority = Ores.priority(name)
-                if not Ores.isSelected(name) then
-                    priority += 1000
-                end
+                local part = Loot.part(drop)
 
-                table.insert(candidates, {
-                    drop = drop,
-                    priority = priority,
-                    distance = character.PrimaryPart
-                        and (Loot.part(drop).Position - character.PrimaryPart.Position).Magnitude
-                        or 0,
-                })
+                if Ores.isSelected(name) then
+                    table.insert(candidates, {
+                        drop = drop,
+                        price = Ores.price(name),
+                        distance = character.PrimaryPart
+                            and (part.Position - character.PrimaryPart.Position).Magnitude
+                            or 0,
+                    })
+                end
             end
         end
 
@@ -1134,8 +1121,8 @@ function Loot.collectAll(character)
         end
 
         table.sort(candidates, function(a, b)
-            if a.priority ~= b.priority then
-                return a.priority < b.priority
+            if a.price ~= b.price then
+                return a.price > b.price
             end
             return a.distance < b.distance
         end)
