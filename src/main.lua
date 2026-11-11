@@ -1,5 +1,6 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
 
 ---------------------------------------------------------------------------
 -- Config
@@ -18,6 +19,8 @@ local Config = {
     minOreValue = 100,
     oreRange = 500,
     oreCacheTime = 1,
+    moveSpeed = 80,
+    lootRange = 200,
 
     -- White-hat toggles. false = keep the flow valid, true = test the server.
     bypass = {
@@ -66,10 +69,39 @@ pcall(function()
     Game.Resources = require(modules:WaitForChild("Resources"))
     Game.Mine = require(modules:WaitForChild("Mining"):WaitForChild("Mine"))
     Game.Constants = require(modules:WaitForChild("Constants"))
+    Game.Pickaxes = require(modules:WaitForChild("Tools"):WaitForChild("Pickaxes"))
 end)
 
 Game.attrMinePosition = (Game.Constants and Game.Constants.ATTR_MINE_POSITION) or "MinePosition"
 Game.attrWorldId = (Game.Constants and Game.Constants.ATTR_WORLD_ID) or "WorldId"
+Game.attrToolClass = (Game.Constants and Game.Constants.ATTR_TOOL_TYPE) or "ToolClass"
+
+-- Ore tier required by progression. Any pickaxe of that tier or higher can mine it.
+local OreTier = {
+    Dirt = 1,
+    Stone = 1,
+    Coal = 1,
+    ["Copper Ore"] = 2,
+    ["Iron Ore"] = 3,
+    Sulfur = 3,
+    ["Silver Ore"] = 3,
+    Emerald = 4,
+    Ruby = 4,
+    Sapphire = 4,
+    Sanctite = 4,
+    ["Gold Ore"] = 5,
+    Quartz = 5,
+    Amethyst = 5,
+    Hellstone = 5,
+    Ignis = 5,
+    Diamond = 6,
+    Obsidian = 6,
+    ["Uranium Ore"] = 6,
+    ["Mithril Ore"] = 6,
+    ["Promethium Ore"] = 6,
+    ["Malachite Ore"] = 6,
+    ["Azurite Ore"] = 6,
+}
 
 local blockSize = (Game.Mine and Game.Mine.BLOCK_SIZE) or 7
 local blockOffsets = (Game.Mine and Game.Mine.OFFSETS) or {
@@ -227,6 +259,7 @@ function Mining.prepare(character)
 
     if Mining.pickaxe ~= pickaxe then
         Mining.pickaxe = pickaxe
+        Mining.tier = nil
         Mining.bind(pickaxe)
     end
 
@@ -240,6 +273,91 @@ function Mining.prepare(character)
     end
 
     return pickaxe
+end
+
+---------------------------------------------------------------------------
+-- Movement (tween)
+---------------------------------------------------------------------------
+
+local Movement = {}
+
+function Movement.cancel()
+    if Movement.tween then
+        Movement.tween:Cancel()
+        Movement.tween = nil
+    end
+end
+
+function Movement.to(character, position, speed)
+    local root = character.PrimaryPart
+    if not root then
+        return
+    end
+
+    Movement.cancel()
+
+    local distance = (position - root.Position).Magnitude
+    if distance < 0.5 then
+        return
+    end
+
+    local duration = math.clamp(distance / (speed or Config.moveSpeed), 0.1, 4)
+    local tween = TweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear), {
+        CFrame = CFrame.new(position),
+    })
+
+    Movement.tween = tween
+    tween:Play()
+
+    local elapsed = 0
+    while Movement.tween == tween and elapsed < duration do
+        task.wait(0.05)
+        elapsed += 0.05
+    end
+
+    if Movement.tween == tween then
+        Movement.tween = nil
+    end
+end
+
+function Mining.pickaxeTier()
+    if Mining.tier then
+        return Mining.tier
+    end
+
+    local pickaxe = Mining.pickaxe
+    if not pickaxe then
+        return nil
+    end
+
+    local className = pickaxe:GetAttribute(Game.attrToolClass) or pickaxe.Name
+    local info = Game.Pickaxes and Game.Pickaxes[className]
+    if info and info.Tier then
+        Mining.tier = info.Tier
+        return Mining.tier
+    end
+
+    if Game.Pickaxes then
+        for _, data in pairs(Game.Pickaxes) do
+            if type(data) == "table" and data.BaseMineTime and data.Tier then
+                if math.abs(data.BaseMineTime - Mining.baseMineTime) < 0.05 then
+                    Mining.tier = data.Tier
+                    return Mining.tier
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+function Mining.tierAllowed(block)
+    local required = OreTier[typeOf(block)]
+    local tier = Mining.pickaxeTier()
+    if not required or not tier then
+        return true
+    end
+    return required <= tier
 end
 
 function Mining.mineTime(block)
@@ -299,6 +417,10 @@ function Mining.allowed(block)
     end
 
     if not Config.bypass.ignoreLiquid and Mining.besideLiquid(block) then
+        return false
+    end
+
+    if not Mining.tierAllowed(block) then
         return false
     end
 
@@ -467,6 +589,46 @@ function Ores.ignore(block)
 end
 
 ---------------------------------------------------------------------------
+-- Loot
+---------------------------------------------------------------------------
+
+local Loot = {}
+local lootIgnored = {}
+
+function Loot.position(drop)
+    if drop:IsA("Model") then
+        return drop:GetPivot().Position
+    end
+    return drop.Position
+end
+
+function Loot.nearest(position)
+    local best, bestDistance
+    local drops = workspace:FindFirstChild("Drops")
+    if not drops then
+        return nil
+    end
+
+    local now = os.clock()
+    for _, drop in ipairs(drops:GetChildren()) do
+        local untilIgnore = lootIgnored[drop]
+        local valid = drop.Parent and (drop:IsA("Model") or drop:IsA("BasePart"))
+        if valid and (not untilIgnore or untilIgnore <= now) then
+            local distance = (Loot.position(drop) - position).Magnitude
+            if distance <= Config.lootRange and (not bestDistance or distance < bestDistance) then
+                best, bestDistance = drop, distance
+            end
+        end
+    end
+
+    return best, bestDistance
+end
+
+function Loot.ignore(drop)
+    lootIgnored[drop] = os.clock() + 10
+end
+
+---------------------------------------------------------------------------
 -- Mushrooms (manager)
 ---------------------------------------------------------------------------
 
@@ -491,14 +653,14 @@ Mushrooms = Manager.new(function()
         return
     end
 
-    character:PivotTo(box:GetPivot())
+    Movement.to(character, box.Position + Vector3.new(0, 3, 0), Config.moveSpeed)
     task.wait(Config.mushroomDelay)
 
     if not Mushrooms.enabled then
         return
     end
     interact.InteractEvent:FireServer()
-end)
+end, Movement.cancel)
 
 ---------------------------------------------------------------------------
 -- Digger (manager)
@@ -528,14 +690,14 @@ Digger = Manager.new(function()
 end)
 
 ---------------------------------------------------------------------------
--- Ore-runner (manager)
+-- Farmer (manager)
 ---------------------------------------------------------------------------
 
-local OreRunner
+local Farmer
 
-OreRunner = Manager.new(function()
+Farmer = Manager.new(function()
     local character = Character.get()
-    if not OreRunner.enabled then
+    if not Farmer.enabled then
         return
     end
 
@@ -544,31 +706,38 @@ OreRunner = Manager.new(function()
         return
     end
 
-    local target = Ores.nearest(root.Position)
-    if not target then
-        task.wait(0.5)
-        return
-    end
-
     if not Mining.prepare(character) then
-        warn("[ore-runner] no pickaxe")
+        warn("[farmer] no pickaxe")
         task.wait(0.5)
         return
     end
 
-    character:PivotTo(CFrame.new(Mining.approach(target)))
-    task.wait(0.2)
+    local ore, oreDistance = Ores.nearest(root.Position)
+    local loot, lootDistance = Loot.nearest(root.Position)
 
-    if not OreRunner.enabled then
+    if loot and (not ore or lootDistance < oreDistance) then
+        Movement.to(character, Loot.position(loot) + Vector3.new(0, 3, 0), Config.moveSpeed)
+        Loot.ignore(loot)
         return
     end
 
-    Mining.mine(target)
-
-    if target.Parent then
-        Ores.ignore(target)
+    if not ore then
+        task.wait(0.5)
+        return
     end
-end)
+
+    Movement.to(character, Mining.approach(ore), Config.moveSpeed)
+
+    if not Farmer.enabled then
+        return
+    end
+
+    Mining.mine(ore)
+
+    if ore.Parent then
+        Ores.ignore(ore)
+    end
+end, Movement.cancel)
 
 ---------------------------------------------------------------------------
 -- UI
@@ -620,7 +789,7 @@ end
 Ui.create({
     {
         title = "Mushrooms",
-        desc = "teleport to HarvestableNode and fire Interact",
+        desc = "tween to HarvestableNode and fire Interact",
         instance = Mushrooms,
     },
     {
@@ -629,8 +798,8 @@ Ui.create({
         instance = Digger,
     },
     {
-        title = "Ore-runner",
-        desc = "teleport to valuable ore and mine it",
-        instance = OreRunner,
+        title = "Farmer",
+        desc = "tween to valuable ore and loot, mine what the pickaxe tier allows",
+        instance = Farmer,
     },
 })
