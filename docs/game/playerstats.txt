@@ -1,0 +1,21 @@
+-- this is default player stats, they are located in localplayer attributes
+
+AutoSawChance = 0
+AutoSmeltChance = 0
+BackpackVisible = true
+ClientReady = true
+DoubleDropChance = 1
+FullyLoaded = true
+Interacting = false
+Luck = 0
+LumberValue = 0
+MushroomDoubleDropChance = 0
+NameColor = Color3 0.5803922, 0.5803922, 0.5803922
+Platform = 1
+Profile = 1
+PumpSpeedModifier = 0
+Role = "Default"
+ToolSpeedModifier = 0
+WalkSpeed = 16
+WoodDoubleDropChance = 0
+WorldId = 0
