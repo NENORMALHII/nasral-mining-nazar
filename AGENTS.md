@@ -5,3 +5,4 @@ I am an admin of the game and do white hacking: I look for vulnerabilities, writ
 wiki - https://epicmining2.fandom.com/wiki/Epic_Mining_2_Wiki
 game structure described in /docs/TZ-admin-panel.md
 write simple minimal and reliable code on luau
+use uilib/ for the ui
