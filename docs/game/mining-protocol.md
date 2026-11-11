@@ -66,8 +66,10 @@ Server side is not in the place dump, so server checks below are inferred.
 
 `Ores.names()` builds the list from `Resources` (`Natural` + `BasePrice`) and falls back to
 `Config.orePrices`. The UI selection stores explicit resource names in `Ores.setSelected`.
-Empty selection falls back to `BasePrice >= Config.minOreValue`. Tier gating is not used:
-pickaxe tier changes mine time, not ore access.
+Default selection is every ore with `BasePrice > 0`. The uilib selection callback is not
+used; `Ores.isSelected` polls `selection.getSelected()` directly. Target choice is by highest
+price first, then distance. Tier gating is not used: pickaxe tier changes mine time, not ore
+access.
 
 ## Movement
 

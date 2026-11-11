@@ -24,8 +24,6 @@ local Config = {
     pickaxeRemote = "UpdatePickaxe",
     defaultMineTime = 4,
 
-    minOreValue = 20,
-
     orePrices = {
         Dirt = 3,
         Stone = 5,
@@ -82,6 +80,22 @@ local blockOffsets = (Game.Mine and Game.Mine.OFFSETS) or {
 ---------------------------------------------------------------------------
 -- Helpers
 ---------------------------------------------------------------------------
+
+local Log = {
+    enabled = false,
+}
+
+function Log.print(...)
+    if Log.enabled then
+        print("[em2]", ...)
+    end
+end
+
+function Log.warn(...)
+    if Log.enabled then
+        warn("[em2]", ...)
+    end
+end
 
 local function vec3ToString(position)
     return ("%d,%d,%d"):format(position.X, position.Y, position.Z)
@@ -376,36 +390,49 @@ function Mining.besideLiquid(block)
     return false
 end
 
-function Mining.allowed(block)
-    if not block.Parent or not block:GetAttribute(Game.attrMinePosition) then
-        return false
+function Mining.why(block)
+    if not block.Parent then
+        return "parent"
+    end
+
+    if not block:GetAttribute(Game.attrMinePosition) then
+        return "position"
     end
 
     local name = typeOf(block)
     if not name then
-        return false
+        return "type"
     end
 
     if name == "Bedrock" or block:GetAttribute("IsBedrock") == true then
-        return false
+        return "bedrock"
     end
 
     local blocked = { Oil = true, Lava = true, Grass = true, Void = true }
     if blocked[name] then
-        return false
+        return "blocked"
     end
 
     local world = block:GetAttribute(Game.attrWorldId)
     local playerWorld = Players.LocalPlayer:GetAttribute(Game.attrWorldId)
     if world ~= nil and playerWorld ~= nil and tostring(world) ~= tostring(playerWorld) then
-        return false
+        return "world"
+    end
+
+    local dug = block:FindFirstChild("Dug")
+    if dug and dug.Value ~= "" and dug.Value ~= Players.LocalPlayer.Name then
+        return "dug"
     end
 
     if Mining.besideLiquid(block) then
-        return false
+        return "liquid"
     end
 
-    return true
+    return nil
+end
+
+function Mining.allowed(block)
+    return Mining.why(block) == nil
 end
 
 function Mining.inRange(character, block)
@@ -426,6 +453,7 @@ function Mining.mine(character, block)
     end
 
     if not Mining.inRange(character, block) then
+        Log.warn("out of range " .. block.Name)
         return false
     end
 
@@ -436,6 +464,12 @@ function Mining.mine(character, block)
         warn("[mining] remotes not found")
         return false
     end
+
+    Log.print(("mine start %s type=%s time=%.2f"):format(
+        block.Name,
+        tostring(typeOf(block)),
+        Mining.mineTime(block)
+    ))
 
     blockEvent:FireServer(block.Name, { dug = true })
     task.wait(Mining.mineTime(block) * Config.mineTimeSafety + 0.3)
@@ -539,7 +573,7 @@ function Ores.names()
 end
 
 function Ores.defaultSelected(name)
-    return Ores.price(name) >= Config.minOreValue
+    return Ores.price(name) > 0
 end
 
 function Ores.setSelected(names)
@@ -560,11 +594,35 @@ function Ores.getSelected()
     return defaults
 end
 
+function Ores.bindSelection(selection, names)
+    Ores.selection = selection
+    Ores.namesList = names
+end
+
+local function currentNames()
+    local selection = Ores.selection
+    if selection and Ores.namesList then
+        local indices = selection.getSelected()
+        if #indices > 0 then
+            local names = {}
+            for _, index in ipairs(indices) do
+                local name = Ores.namesList[index]
+                if name then
+                    table.insert(names, name)
+                end
+            end
+            return names
+        end
+    end
+    return selected
+end
+
 function Ores.isSelected(name)
-    if #selected == 0 then
+    local names = currentNames()
+    if #names == 0 then
         return Ores.defaultSelected(name)
     end
-    for _, entry in ipairs(selected) do
+    for _, entry in ipairs(names) do
         if entry == name then
             return true
         end
@@ -583,32 +641,55 @@ local function claimable(block)
     return true
 end
 
+local function formatReasons(reasons)
+    local parts = {}
+    for reason, count in pairs(reasons) do
+        table.insert(parts, ("%s=%d"):format(reason, count))
+    end
+    table.sort(parts)
+    return table.concat(parts, " ")
+end
+
 function Ores.refresh()
     cache = {}
     cacheTime = os.clock()
 
     local mine = workspace:FindFirstChild(Config.mineName)
     if not mine then
+        Log.warn("mine not found")
         return
     end
 
-    for _, block in ipairs(mine:GetChildren()) do
+    local blocks = mine:GetChildren()
+    local reasons = {}
+
+    for _, block in ipairs(blocks) do
         local name = typeOf(block)
-        if name and Ores.isSelected(name) and claimable(block) and Mining.allowed(block) then
+        local reason = Mining.why(block)
+
+        if not reason and not Ores.isSelected(name or "") then
+            reason = "notSelected"
+        end
+
+        if reason then
+            reasons[reason] = (reasons[reason] or 0) + 1
+        else
             table.insert(cache, block)
         end
     end
 
+    Log.print(("ores: blocks=%d cached=%d %s"):format(#blocks, #cache, formatReasons(reasons)))
+
     if #cache == 0 and os.clock() - lastWarning > 10 then
         lastWarning = os.clock()
-        local blocks = mine:GetChildren()
         local sample = blocks[1]
+        warn(("[ores] 0 targets, blocks=%d, reasons: %s"):format(#blocks, formatReasons(reasons)))
         if sample then
-            warn(("[ores] 0 targets, blocks=%d, sample=%s type=%s position=%s"):format(
-                #blocks,
+            warn(("[ores] sample=%s type=%s position=%s world=%s"):format(
                 sample.Name,
                 tostring(typeOf(sample)),
-                tostring(sample:GetAttribute(Game.attrMinePosition))
+                tostring(sample:GetAttribute(Game.attrMinePosition)),
+                tostring(sample:GetAttribute(Game.attrWorldId))
             ))
         end
     end
@@ -619,14 +700,21 @@ function Ores.nearest(position)
         Ores.refresh()
     end
 
-    local best, bestDistance
+    local best, bestDistance, bestPrice
     local now = os.clock()
+
     for _, block in ipairs(cache) do
         local untilIgnore = ignored[block]
         if (not untilIgnore or untilIgnore <= now) and claimable(block) then
             local distance = (block.Position - position).Magnitude
-            if distance <= Config.oreRange and (not bestDistance or distance < bestDistance) then
-                best, bestDistance = block, distance
+            local price = Ores.price(typeOf(block))
+
+            local better = not best
+                or price > bestPrice
+                or (price == bestPrice and distance < bestDistance)
+
+            if distance <= Config.oreRange and better then
+                best, bestDistance, bestPrice = block, distance, price
             end
         end
     end
@@ -745,9 +833,17 @@ Farmer = Manager.new(function()
     end
 
     if not ore then
+        Log.print("no ore targets")
         task.wait(0.3)
         return
     end
+
+    Log.print(("target %s type=%s dist=%.1f price=%d"):format(
+        ore.Name,
+        tostring(typeOf(ore)),
+        oreDistance,
+        Ores.price(typeOf(ore))
+    ))
 
     if not Mining.prepare(character) then
         warn("[farmer] no pickaxe")
@@ -842,6 +938,17 @@ function Ui.create(managers)
     })
 
     selection.setSelected(defaults)
+    Ores.bindSelection(selection, names)
+
+    local debug = main:AddSeperator("Debug")
+    debug:AddToggle({
+        title = "Verbose logs",
+        desc = "print ore rejection reasons and mining steps",
+        callback = function(state)
+            Log.enabled = state
+            print("[em2] verbose logs " .. (state and "on" or "off"))
+        end,
+    })
 
     return window
 end
