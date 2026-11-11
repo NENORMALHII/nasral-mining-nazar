@@ -26,8 +26,18 @@ local Config = {
     depthWeight = 8,
     shaftDig = true,
     lootRange = 300,
-    lootInstant = true,
-    lootDwell = 0.08,
+    lootDwell = 0.03,
+
+    baseOres = {
+        Dirt = true,
+        Stone = true,
+        Coal = true,
+        Bedrock = true,
+        Grass = true,
+        Void = true,
+        Oil = true,
+        Lava = true,
+    },
 
     blockEvent = "BlockEvent",
     minedEvent = "BlockMinedEvent",
@@ -328,6 +338,82 @@ function Movement.to(character, position, speed)
 end
 
 ---------------------------------------------------------------------------
+-- Predictor (depth + seed based)
+---------------------------------------------------------------------------
+
+local Predictor = {}
+
+local BASE_X = 61.5
+local BASE_Z = -56.5
+local BASE_ALTITUDE = 7998.5
+
+function Predictor.toBlock(position)
+    return Vector3.new(
+        math.floor((position.X - BASE_X) / 7 + 0.5),
+        -math.floor((position.Y - BASE_ALTITUDE) / 7 + 0.5),
+        math.floor((position.Z - BASE_Z) / 7 + 0.5)
+    )
+end
+
+function Predictor.seed()
+    if Predictor.value then
+        return Predictor.value
+    end
+
+    local sources = {
+        workspace,
+        workspace:FindFirstChild(Config.mineName),
+        ReplicatedStorage,
+    }
+
+    for _, instance in ipairs(sources) do
+        if instance then
+            for name, value in pairs(instance:GetAttributes()) do
+                if type(name) == "string" and name:lower():find("seed") then
+                    Predictor.value = tostring(value)
+                    break
+                end
+            end
+        end
+        if Predictor.value then
+            break
+        end
+    end
+
+    Predictor.value = Predictor.value
+        or ("w" .. tostring(Players.LocalPlayer:GetAttribute(Game.attrWorldId) or 0))
+
+    logPrint("predictor seed " .. Predictor.value)
+
+    return Predictor.value
+end
+
+function Predictor.hash(blockPosition)
+    local seed = Predictor.seed()
+    local value = 0
+
+    for index = 1, #seed do
+        value = (value * 31 + seed:byte(index)) % 2147483647
+    end
+
+    value = bit32.bxor(value, math.floor(blockPosition.X) * 73856093)
+    value = bit32.bxor(value, math.floor(blockPosition.Y) * 19349663)
+    value = bit32.bxor(value, math.floor(blockPosition.Z) * 83492791)
+
+    return value % 1000
+end
+
+function Predictor.blockBelow(worldPosition)
+    local mine = workspace:FindFirstChild(Config.mineName)
+    if not mine then
+        return nil
+    end
+
+    local blockPosition = Predictor.toBlock(worldPosition)
+    return mine:FindFirstChild(vec3ToString(blockPosition + Vector3.new(0, 1, 0)))
+end
+
+---------------------------------------------------------------------------
 -- Mining
 ---------------------------------------------------------------------------
 
@@ -490,6 +576,11 @@ function Mining.mine(character, block)
         return false
     end
 
+    if not Mining.inCell(character) then
+        logWarn("not between blocks " .. block.Name)
+        return false
+    end
+
     local position = block:GetAttribute(Game.attrMinePosition)
     local blockEvent = ReplicatedStorage:FindFirstChild(Config.blockEvent)
     local minedEvent = ReplicatedStorage:FindFirstChild(Config.minedEvent)
@@ -527,6 +618,17 @@ function Mining.mine(character, block)
     return true
 end
 
+function Mining.inCell(character)
+    local root = character and character.PrimaryPart
+    local mine = workspace:FindFirstChild(Config.mineName)
+    if not root or not mine then
+        return false
+    end
+
+    local blockPosition = Predictor.toBlock(root.Position)
+    return mine:FindFirstChild(vec3ToString(blockPosition)) == nil
+end
+
 function Mining.approach(block)
     local position = block:GetAttribute(Game.attrMinePosition)
     local mine = workspace:FindFirstChild(Config.mineName)
@@ -540,83 +642,7 @@ function Mining.approach(block)
         end
     end
 
-    return block.Position + Vector3.new(0, blockSize, 0)
-end
-
----------------------------------------------------------------------------
--- Predictor (depth + seed based)
----------------------------------------------------------------------------
-
-local Predictor = {}
-
-local BASE_X = 61.5
-local BASE_Z = -56.5
-local BASE_ALTITUDE = 7998.5
-
-function Predictor.toBlock(position)
-    return Vector3.new(
-        math.floor((position.X - BASE_X) / 7 + 0.5),
-        -math.floor((position.Y - BASE_ALTITUDE) / 7 + 0.5),
-        math.floor((position.Z - BASE_Z) / 7 + 0.5)
-    )
-end
-
-function Predictor.seed()
-    if Predictor.value then
-        return Predictor.value
-    end
-
-    local sources = {
-        workspace,
-        workspace:FindFirstChild(Config.mineName),
-        ReplicatedStorage,
-    }
-
-    for _, instance in ipairs(sources) do
-        if instance then
-            for name, value in pairs(instance:GetAttributes()) do
-                if type(name) == "string" and name:lower():find("seed") then
-                    Predictor.value = tostring(value)
-                    break
-                end
-            end
-        end
-        if Predictor.value then
-            break
-        end
-    end
-
-    Predictor.value = Predictor.value
-        or ("w" .. tostring(Players.LocalPlayer:GetAttribute(Game.attrWorldId) or 0))
-
-    logPrint("predictor seed " .. Predictor.value)
-
-    return Predictor.value
-end
-
-function Predictor.hash(blockPosition)
-    local seed = Predictor.seed()
-    local value = 0
-
-    for index = 1, #seed do
-        value = (value * 31 + seed:byte(index)) % 2147483647
-    end
-
-    value = bit32.bxor(value, math.floor(blockPosition.X) * 73856093)
-    value = bit32.bxor(value, math.floor(blockPosition.Y) * 19349663)
-    value = bit32.bxor(value, math.floor(blockPosition.Z) * 83492791)
-
-    return value % 1000
-end
-
-function Predictor.blockBelow(worldPosition)
-    local mine = workspace:FindFirstChild(Config.mineName)
-    if not mine then
-        return nil
-    end
-
-    local blockPosition = Predictor.toBlock(worldPosition)
-    return mine:FindFirstChild(vec3ToString(blockPosition + Vector3.new(0, 1, 0)))
+    return nil
 end
 
 ---------------------------------------------------------------------------
@@ -639,13 +665,17 @@ function Ores.price(name)
     return 0
 end
 
+function Ores.selectable(name)
+    return not Config.baseOres[name]
+end
+
 function Ores.names()
     local names = {}
     local seen = {}
 
     if Game.Resources then
         for name, info in pairs(Game.Resources) do
-            if type(info) == "table" and info.Natural and not seen[name] then
+            if type(info) == "table" and info.Natural and not seen[name] and Ores.selectable(name) then
                 seen[name] = true
                 table.insert(names, name)
             end
@@ -685,7 +715,7 @@ end
 function Ores.isSelected(name)
     local names = currentNames()
     if #names == 0 then
-        return true
+        return Ores.selectable(name)
     end
     for _, entry in ipairs(names) do
         if entry == name then
@@ -794,28 +824,6 @@ function Loot.position(drop)
         return drop:GetPivot().Position
     end
     return drop.Position
-end
-
-function Loot.nearest(position)
-    local drops = workspace:FindFirstChild("Drops")
-    if not drops then
-        return nil
-    end
-
-    local best, bestDistance
-    local now = os.clock()
-
-    for _, drop in ipairs(drops:GetChildren()) do
-        local untilIgnore = lootIgnored[drop]
-        if (drop:IsA("Model") or drop:IsA("BasePart")) and (not untilIgnore or untilIgnore <= now) then
-            local distance = (Loot.position(drop) - position).Magnitude
-            if distance <= Config.lootRange and (not bestDistance or distance < bestDistance) then
-                best, bestDistance = drop, distance
-            end
-        end
-    end
-
-    return best, bestDistance
 end
 
 function Loot.ignore(drop)
@@ -929,27 +937,17 @@ local FarmMode = Mode.new("Farm", function(self)
         return
     end
 
-    if Config.lootInstant then
-        Loot.collectAll(character)
-    end
+    Loot.collectAll(character)
 
     local ore, oreDistance = Ores.nearest(root.Position)
-
-    if not Config.lootInstant then
-        local loot, lootDistance = Loot.nearest(root.Position)
-        if loot and (not ore or lootDistance < oreDistance) then
-            Movement.to(character, Loot.position(loot) + Vector3.new(0, 3, 0))
-            Loot.ignore(loot)
-            return
-        end
-    end
 
     if not ore then
         if Config.shaftDig then
             local below = Predictor.blockBelow(root.Position)
-            if below and Mining.allowed(below) then
-                if Mining.prepare(character) then
-                    Movement.to(character, Mining.approach(below))
+            local stand = below and Mining.approach(below)
+            if stand and Mining.prepare(character) then
+                Movement.to(character, stand)
+                if Mining.inCell(character) then
                     Movement.hold(character)
                     local dug = pcall(Mining.mine, character, below)
                     Movement.releaseHold()
@@ -977,9 +975,22 @@ local FarmMode = Mode.new("Farm", function(self)
         Ores.price(typeOf(ore))
     ))
 
-    Movement.to(character, Mining.approach(ore))
+    local stand = Mining.approach(ore)
+    if not stand then
+        logWarn("no empty cell next to " .. ore.Name)
+        Ores.ignore(ore)
+        return
+    end
+
+    Movement.to(character, stand)
 
     if not self.enabled then
+        return
+    end
+
+    if not Mining.inCell(character) then
+        logWarn("not in a cell, skipping " .. ore.Name)
+        Ores.ignore(ore)
         return
     end
 
@@ -992,9 +1003,7 @@ local FarmMode = Mode.new("Farm", function(self)
         Ores.ignore(ore)
     elseif result then
         Ores.invalidate()
-        if Config.lootInstant then
-            Loot.collectAll(character)
-        end
+        Loot.collectAll(character)
     else
         Ores.ignore(ore)
     end
@@ -1153,15 +1162,6 @@ function Ui.create()
         checked = Config.shaftDig,
         callback = function(state)
             Config.shaftDig = state
-        end,
-    })
-
-    movePanel:AddToggle({
-        title = "Instant loot",
-        desc = "teleport to every drop before mining",
-        checked = Config.lootInstant,
-        callback = function(state)
-            Config.lootInstant = state
         end,
     })
 

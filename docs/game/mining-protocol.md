@@ -96,9 +96,10 @@ Hotkeys: `F1` farm, `F2` mushrooms. Movement: `Instant move` toggle and `Tween s
 ## Instant loot
 
 `Loot.collectAll` teleports the character to every `Workspace.Drops` child inside `lootRange`,
-nearest first, waits `lootDwell` (0.08 s) per drop so the server sees the touch, and marks the
-drop ignored for 10 s. Runs at the start of every farm tick and right after a successful mine.
-Toggle: `Instant loot`.
+nearest first, waits `lootDwell` per drop so the server sees the touch, and marks the drop
+ignored for 10 s. Always on: runs at the start of every farm tick and right after a successful
+mine. Base ores (`Dirt`, `Stone`, `Coal`, `Bedrock`, `Grass`, `Void`, `Oil`, `Lava`) are not
+offered in the ore selection and are mined only by the `Dig down` shaft.
 
 ## Downward strategy and seed predictor
 
@@ -112,5 +113,8 @@ Mine generation code is server-side and missing from the place dump. `Predictor`
 Target score: `BasePrice + max(0, blockY - playerBlockY) * depthWeight + hash / 1000`.
 So deeper ores win, and the route is stable for the same seed.
 If no selected ore is in range, Farm digs the block below the player (`Dig down` toggle).
+`Mining.approach` returns a point only inside an empty block cell next to the ore; there is no
+fallback above the ore. `Mining.inCell` verifies the player stands in an empty cell before
+`BlockEvent`, so the character is always between blocks, never outside the map.
 
 Exact prediction requires the server generation script or the real seed attribute name.
