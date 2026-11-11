@@ -28,16 +28,6 @@ local Config = {
     lootRange = 300,
     lootDwell = 0.03,
 
-    baseOres = {
-        Dirt = true,
-        Stone = true,
-        Coal = true,
-        Bedrock = true,
-        Grass = true,
-        Void = true,
-        Oil = true,
-        Lava = true,
-    },
 
     blockEvent = "BlockEvent",
     minedEvent = "BlockMinedEvent",
@@ -618,6 +608,9 @@ function Mining.mine(character, block)
     return true
 end
 
+local overlapParams = OverlapParams.new()
+overlapParams.FilterType = Enum.RaycastFilterType.Include
+
 function Mining.inCell(character)
     local root = character and character.PrimaryPart
     local mine = workspace:FindFirstChild(Config.mineName)
@@ -625,8 +618,14 @@ function Mining.inCell(character)
         return false
     end
 
-    local blockPosition = Predictor.toBlock(root.Position)
-    return mine:FindFirstChild(vec3ToString(blockPosition)) == nil
+    overlapParams.FilterDescendantsInstances = { mine }
+    local parts = workspace:GetPartBoundsInBox(
+        CFrame.new(root.Position),
+        Vector3.new(1.5, 1.5, 1.5),
+        overlapParams
+    )
+
+    return #parts == 0
 end
 
 function Mining.approach(block)
@@ -665,17 +664,13 @@ function Ores.price(name)
     return 0
 end
 
-function Ores.selectable(name)
-    return not Config.baseOres[name]
-end
-
 function Ores.names()
     local names = {}
     local seen = {}
 
     if Game.Resources then
         for name, info in pairs(Game.Resources) do
-            if type(info) == "table" and info.Natural and not seen[name] and Ores.selectable(name) then
+            if type(info) == "table" and info.Natural and not seen[name] then
                 seen[name] = true
                 table.insert(names, name)
             end
@@ -715,7 +710,7 @@ end
 function Ores.isSelected(name)
     local names = currentNames()
     if #names == 0 then
-        return Ores.selectable(name)
+        return true
     end
     for _, entry in ipairs(names) do
         if entry == name then
@@ -941,24 +936,33 @@ local FarmMode = Mode.new("Farm", function(self)
 
     local ore, oreDistance = Ores.nearest(root.Position)
 
-    if not ore then
-        if Config.shaftDig then
-            local below = Predictor.blockBelow(root.Position)
-            local stand = below and Mining.approach(below)
-            if stand and Mining.prepare(character) then
-                Movement.to(character, stand)
-                if Mining.inCell(character) then
-                    Movement.hold(character)
-                    local dug = pcall(Mining.mine, character, below)
-                    Movement.releaseHold()
-                    if not dug then
-                        Ores.invalidate()
-                    end
-                end
-                return
-            end
+    local function digDown()
+        if not Config.shaftDig then
+            return false
         end
-        task.wait(0.2)
+
+        local below = Predictor.blockBelow(root.Position)
+        local stand = below and Mining.approach(below)
+        if not stand or not Mining.prepare(character) then
+            return false
+        end
+
+        Movement.to(character, stand)
+        if not Mining.inCell(character) then
+            logWarn("shaft stand is not an empty cell")
+            return false
+        end
+
+        Movement.hold(character)
+        local dug = pcall(Mining.mine, character, below)
+        Movement.releaseHold()
+        return dug
+    end
+
+    if not ore then
+        if not digDown() then
+            task.wait(0.2)
+        end
         return
     end
 
@@ -977,8 +981,9 @@ local FarmMode = Mode.new("Farm", function(self)
 
     local stand = Mining.approach(ore)
     if not stand then
-        logWarn("no empty cell next to " .. ore.Name)
+        logWarn("no empty cell next to " .. ore.Name .. ", digging down")
         Ores.ignore(ore)
+        digDown()
         return
     end
 
