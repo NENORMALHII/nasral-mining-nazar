@@ -265,13 +265,6 @@ function Movement.cancel()
     Movement.release()
 end
 
-function Movement.instant(character, position)
-    Movement.release()
-    if character and character.PrimaryPart then
-        character:PivotTo(CFrame.new(position))
-    end
-end
-
 function Movement.hold(character)
     local root = character.PrimaryPart
     if root then
@@ -1060,22 +1053,14 @@ local function tryPickup(character, drop)
     end
 
     local cell = Position.nearestSafe(part.Position, Config.safeSearchRadius)
-    local targetPosition
-
-    if cell then
-        targetPosition = Predictor.worldOf(cell)
-    elseif Mining.surface(character) then
-        targetPosition = part.Position
-    else
-        return false
-    end
+    local targetPosition = cell and Predictor.worldOf(cell) or part.Position
 
     for _ = 1, Config.lootAttempts do
         if not drop.Parent or not part.Parent then
             return true
         end
 
-        Movement.instant(character, targetPosition)
+        Movement.to(character, targetPosition)
         RunService.Heartbeat:Wait()
         RunService.Heartbeat:Wait()
         task.wait(Config.lootDwell)
@@ -1217,7 +1202,7 @@ local FarmMode = Mode.new("Farm", function(self)
 
     local ore, oreDistance = Ores.nearest(root.Position)
 
-    local function digDown()
+    local function DigOnlyDown()
         if not Config.shaftDig then
             return false
         end
@@ -1235,7 +1220,7 @@ local FarmMode = Mode.new("Farm", function(self)
     end
 
     if not ore then
-        if not digDown() then
+        if not DigOnlyDown() then
             task.wait(0.2)
         end
         return
@@ -1258,7 +1243,7 @@ local FarmMode = Mode.new("Farm", function(self)
     if not stand then
         logWarn("no empty cell next to " .. ore.Name .. ", digging down")
         Ores.ignore(ore)
-        digDown()
+        DigOnlyDown()
         return
     end
 

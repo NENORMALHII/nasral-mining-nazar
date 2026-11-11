@@ -195,8 +195,8 @@ silently skipping every deep block.
 - `Position.enforce(character)` snaps the character to `Predictor.worldOf(safeCell)` if the
   current cell is not safe. The surface (`Y <= surfaceY`) is the only exception.
 - `Mining.approach` only returns safe cells; `Mining.inCell` reuses the same rule.
-- Loot pickup teleports to the nearest safe cell around the drop, so the character never lands
-  inside a block or outside the mine.
+- Loot pickup does not filter by distance: every own selected drop is attempted. It moves to the nearest safe cell around the drop (tween or instant according to `Movement`
+  settings), falling back to the drop position if none is found.
 
 ## Loot priority
 
