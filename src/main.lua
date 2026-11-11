@@ -1,5 +1,7 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
 
 ---------------------------------------------------------------------------
 -- Config
@@ -7,10 +9,8 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local Config = {
     loopDelay = 0.05,
-    moveSpeed = 60,
+    moveSpeed = 80,
     moveStopDistance = 2.5,
-    moveMaxForce = 1000000,
-    moveResponsiveness = 50,
     mineTimeSafety = 1.05,
 
     mushroomDelay = 0.4,
@@ -24,7 +24,7 @@ local Config = {
     pickaxeRemote = "UpdatePickaxe",
     defaultMineTime = 4,
 
-    minOreValue = 100,
+    minOreValue = 20,
 
     orePrices = {
         Dirt = 3,
@@ -203,7 +203,7 @@ function Character.getPickaxe(character)
 end
 
 ---------------------------------------------------------------------------
--- Movement (AlignPosition + AlignOrientation)
+-- Movement (anchored tween)
 ---------------------------------------------------------------------------
 
 local Movement = {}
@@ -216,58 +216,42 @@ local function setPlatformStand(character, state)
 end
 
 function Movement.release()
-    if Movement.align then
-        Movement.align:Destroy()
+    if Movement.tween then
+        Movement.tween:Cancel()
     end
-    if Movement.orientation then
-        Movement.orientation:Destroy()
+    Movement.tween = nil
+
+    if Movement.holdRoot then
+        Movement.holdRoot.Anchored = false
+        Movement.holdRoot = nil
     end
-    if Movement.attachment then
-        Movement.attachment:Destroy()
+
+    if Movement.root then
+        Movement.root.Anchored = false
     end
-    Movement.align = nil
-    Movement.orientation = nil
-    Movement.attachment = nil
+    Movement.root = nil
+
     setPlatformStand(Movement.character, false)
     Movement.character = nil
 end
 
-function Movement.cancel()
-    Movement.release()
+function Movement.hold(character)
+    local root = character.PrimaryPart
+    if root then
+        root.Anchored = true
+        Movement.holdRoot = root
+    end
 end
 
-local function createRig(character, root, speed)
-    local attachment = Instance.new("Attachment")
-    attachment.Name = "Em2MoveAttachment"
-    attachment.Parent = root
+function Movement.releaseHold()
+    if Movement.holdRoot then
+        Movement.holdRoot.Anchored = false
+        Movement.holdRoot = nil
+    end
+end
 
-    local align = Instance.new("AlignPosition")
-    align.Name = "Em2MoveAlign"
-    align.Attachment0 = attachment
-    align.Mode = Enum.PositionAlignmentMode.OneAttachment
-    align.ApplyAtCenterOfMass = false
-    align.MaxForce = Config.moveMaxForce
-    align.MaxVelocity = speed
-    align.Responsiveness = Config.moveResponsiveness
-    align.Position = root.Position
-    align.Parent = root
-
-    local orientation = Instance.new("AlignOrientation")
-    orientation.Name = "Em2MoveOrientation"
-    orientation.Attachment0 = attachment
-    orientation.Mode = Enum.OrientationAlignmentMode.OneAttachment
-    orientation.AlignType = Enum.AlignmentType.AllAxes
-    orientation.MaxTorque = Config.moveMaxForce
-    orientation.Responsiveness = Config.moveResponsiveness
-    orientation.CFrame = CFrame.new()
-    orientation.Parent = root
-
-    Movement.character = character
-    Movement.attachment = attachment
-    Movement.align = align
-    Movement.orientation = orientation
-
-    return align
+function Movement.cancel()
+    Movement.release()
 end
 
 function Movement.to(character, position, speed)
@@ -286,20 +270,31 @@ function Movement.to(character, position, speed)
     speed = speed or Config.moveSpeed
     setPlatformStand(character, true)
 
-    local align = createRig(character, root, speed)
-    align.Position = position
+    root.Anchored = true
+    Movement.character = character
+    Movement.root = root
 
-    local deadline = os.clock() + distance / speed + 2
+    local duration = math.clamp(distance / speed, 0.1, 5)
+    local tween = TweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear), {
+        CFrame = CFrame.new(position),
+    })
 
-    while Movement.align == align and (root.Position - position).Magnitude > Config.moveStopDistance do
-        if os.clock() > deadline then
-            break
-        end
-        task.wait(0.05)
+    Movement.tween = tween
+    tween:Play()
+
+    local deadline = os.clock() + duration + 1
+    while Movement.tween == tween and os.clock() < deadline do
+        task.wait(0.03)
     end
 
-    if Movement.align == align then
+    local reached = (root.Position - position).Magnitude <= Config.moveStopDistance + 3
+
+    if Movement.tween == tween then
         Movement.release()
+    end
+
+    if not reached and root.Parent then
+        character:PivotTo(CFrame.new(position))
     end
 end
 
@@ -309,6 +304,7 @@ end
 
 local Mining = {
     baseMineTime = Config.defaultMineTime,
+    lastReject = 0,
 }
 
 function Mining.bind(pickaxe)
@@ -421,7 +417,15 @@ function Mining.inRange(character, block)
 end
 
 function Mining.mine(character, block)
-    if not Mining.allowed(block) or not Mining.inRange(character, block) then
+    if not Mining.allowed(block) then
+        if os.clock() - Mining.lastReject > 5 then
+            Mining.lastReject = os.clock()
+            warn("[mining] rejected " .. block.Name .. " type=" .. tostring(typeOf(block)))
+        end
+        return false
+    end
+
+    if not Mining.inRange(character, block) then
         return false
     end
 
@@ -434,17 +438,19 @@ function Mining.mine(character, block)
     end
 
     blockEvent:FireServer(block.Name, { dug = true })
-    task.wait(Mining.mineTime(block) * Config.mineTimeSafety + 0.15)
+    task.wait(Mining.mineTime(block) * Config.mineTimeSafety + 0.3)
 
     if not block.Parent then
         return true
     end
 
     minedEvent:FireServer({ blockName = vec3ToString(position) })
-    task.wait(0.2)
+    task.wait(0.3)
 
     if block.Parent then
         blockEvent:FireServer(block.Name, { dug = false })
+        warn("[mining] server rejected " .. block.Name .. " (" .. tostring(typeOf(block)) .. ")")
+        return false
     end
 
     return true
@@ -538,6 +544,20 @@ end
 
 function Ores.setSelected(names)
     selected = names or {}
+end
+
+function Ores.getSelected()
+    if #selected > 0 then
+        return selected
+    end
+
+    local defaults = {}
+    for _, name in ipairs(Ores.names()) do
+        if Ores.defaultSelected(name) then
+            table.insert(defaults, name)
+        end
+    end
+    return defaults
 end
 
 function Ores.isSelected(name)
@@ -687,12 +707,15 @@ Mushrooms = Manager.new(function()
     end
 
     Movement.to(character, box.Position + Vector3.new(0, 3, 0), Config.moveSpeed)
+    Movement.hold(character)
     task.wait(Config.mushroomDelay)
 
     if not Mushrooms.enabled then
+        Movement.releaseHold()
         return
     end
     interact.InteractEvent:FireServer()
+    Movement.releaseHold()
 end, Movement.cancel)
 
 ---------------------------------------------------------------------------
@@ -738,7 +761,9 @@ Farmer = Manager.new(function()
         return
     end
 
+    Movement.hold(character)
     Mining.mine(character, ore)
+    Movement.releaseHold()
 
     if ore.Parent then
         Ores.ignore(ore)
@@ -821,15 +846,61 @@ function Ui.create(managers)
     return window
 end
 
-Ui.create({
+local managers = {
     {
         title = "Mushrooms",
-        desc = "constraint move to HarvestableNode and fire Interact",
+        desc = "tween to HarvestableNode and fire Interact",
         instance = Mushrooms,
+        key = Enum.KeyCode.F1,
     },
     {
         title = "Farmer",
-        desc = "constraint move to selected ore or loot, mine within range",
+        desc = "tween to selected ore or loot, mine within range",
         instance = Farmer,
+        key = Enum.KeyCode.F2,
     },
-})
+}
+
+local ok, err = pcall(Ui.create, managers)
+if not ok then
+    warn("[main] ui failed: " .. tostring(err))
+end
+
+UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then
+        return
+    end
+    for _, manager in ipairs(managers) do
+        if input.KeyCode == manager.key then
+            manager.instance.toggle()
+            print(("[main] %s = %s"):format(manager.title, tostring(manager.instance.enabled)))
+        end
+    end
+end)
+
+task.spawn(function()
+    local character = Character.get()
+    local pickaxe = Character.getPickaxe(character)
+    local mine = workspace:FindFirstChild(Config.mineName)
+
+    local blocks = mine and mine:GetChildren() or {}
+    local sample = blocks[1]
+
+    print(("[main] mine=%s blocks=%d pickaxe=%s ores=%d selected=%d"):format(
+        mine and "yes" or "no",
+        #blocks,
+        pickaxe and pickaxe.Name or "none",
+        #Ores.names(),
+        #Ores.getSelected()
+    ))
+
+    if sample then
+        print(("[main] sample=%s type=%s position=%s"):format(
+            sample.Name,
+            tostring(typeOf(sample)),
+            tostring(sample:GetAttribute(Game.attrMinePosition))
+        ))
+    end
+
+    print("[main] F1 mushrooms, F2 farmer")
+end)

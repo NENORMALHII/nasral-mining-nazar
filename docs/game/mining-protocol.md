@@ -68,3 +68,15 @@ Server side is not in the place dump, so server checks below are inferred.
 `Config.orePrices`. The UI selection stores explicit resource names in `Ores.setSelected`.
 Empty selection falls back to `BasePrice >= Config.minOreValue`. Tier gating is not used:
 pickaxe tier changes mine time, not ore access.
+
+## Movement
+
+Anchored tween is the reliable option for this character:
+
+1. `Humanoid.PlatformStand = true`.
+2. `HumanoidRootPart.Anchored = true`.
+3. `TweenService:Create(root, TweenInfo.new(distance / speed, Linear), { CFrame = CFrame.new(target) })`.
+4. Wait for the tween, then unanchor and clear `PlatformStand`.
+5. Hold the root anchored while mining so distance checks keep passing.
+
+`AlignPosition`/`LinearVelocity` fight the humanoid and cause tumbling.
