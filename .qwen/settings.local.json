@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git status --short; echo ---; git diff --stat; echo ---; git log --oneline -5; echo ---; git status -sb | head -1)"
+    ]
+  }
+}

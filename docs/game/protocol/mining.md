@@ -92,6 +92,12 @@ so teleporting to the block centre was unnecessary and caused `BlockMinedEvent` 
 - Every teleport sets `Movement.lastMoveAt`; Farm waits `moveCooldown` (0.5 s) before the next
   `BlockEvent`, so mining never starts in the same tick as a position change.
 - `HumanoidRootPart` is anchored only during the `BlockEvent`/`BlockMinedEvent` window.
+- Side escape (`stepAside` in `src/main.lua`): if the block under the feet fails `Mining.why`
+  (liquid neighbour, `Oil/Lava/Grass/Void`, another player's `Dug`), digging down can never
+  succeed. Farm then jumps one column sideways, keeping the current height, into the richest
+  neighbouring cell that is empty at our level and has a diggable floor block below it.
+  Without this the loop re-attempted the same undiggable block every `loopDelay` and idled.
+  If no neighbour qualifies it logs `down-block undiggable, no side escape` and waits 1 s.
 
 ## Surface shafts
 
