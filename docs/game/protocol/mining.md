@@ -99,39 +99,32 @@ so teleporting to the block centre was unnecessary and caused `BlockMinedEvent` 
   Without this the loop re-attempted the same undiggable block every `loopDelay` and idled.
   If no neighbour qualifies it logs `down-block undiggable, no side escape` and waits 1 s.
 
-## Surface shafts
+## Surface pits
 
-While the player is on the surface (`Blocks.toBlock(root.Position).Y < surfaceDepth = 2`),
-Farm does not dig a fresh hole blindly:
+The mine field centre is `89.5, 7998.5, -21.5` (`Config.fieldCenter`). While the player is on
+the surface (`Blocks.toBlock(root.Position).Y < surfaceDepth = 2`):
 
-1. `Surface.choose(position)` scans columns in a `±6` block square around the player.
-2. `Surface.depth(mine, cell, topY)` counts empty cells from the player's own block cell `topY`
-   down to the first solid block, capped at `surfaceMaxDepth = 10`. Using the player cell instead
-   of a hard-coded `y = 0` keeps the scan correct at any mine altitude.
-3. A column is a valid shaft only when it hits a solid block inside the cap. Columns that stay
-   empty are outside the generated mine (void or unloaded) and are rejected — this was the reason
-   the bot jumped to the map edge and idled.
-4. The deepest valid column with `depth >= surfaceMinDepth = 2` wins; ties are broken by distance.
-   Depth is counted from the player's own cell, so a normal surface column has depth 1 and a
+1. If the player is farther than `fieldRadius = 14` studs from the field centre horizontally,
+   `Movement.jump` moves them there once and the tick ends. Pit detection only runs inside the
+   field.
+2. Block names are built from `MinePosition`, which can be shifted from the world formula by a
+   constant. `Blocks.calibrate()` measures that shift once: it finds the two blocks nearest to
+   the field centre, computes `offset = MinePosition - rawBlock(block.Position)` for both, and
+   accepts it only when both agree. `Blocks.toBlock` adds the offset, `Blocks.worldOf` subtracts
+   it, so every name lookup is exact. Unstable offsets are rejected (kept at zero).
+3. `Surface.depth(mine, x, z, topY)` counts empty cells from the player's own layer down to the
+   first solid block, capped at `surfaceMaxDepth = 10`. If no floor is found the column is
+   outside the generated mine and is ignored.
+4. `Surface.find` scans a `±6` block square, picks the deepest column with
+   `depth >= surfaceMinDepth = 2`, ties by distance. A normal surface column has depth 1; a
    one-block hole already has depth 2.
-5. The result is stored in `Surface.remembered` and re-validated on every call, so a mine reset
-   or a filled hole invalidates it.
-6. If the player is not above the chosen column, `Movement.jump` moves them to the mouth cell at
-   the player's own block Y (`Blocks.worldOf`). The jump is skipped when a block occupies that
-   cell — a cached mouth can be stale — and such a pit is dropped instead.
-7. A pit that can never be dug out is dropped: either the floor block under the mouth fails
-   `Mining.why` (`dug` by another player, `blocked` type, `liquid` neighbour, `bedrock`), or the
-   character stands on geometry that is not a mine block. `Surface.drop(cell)` deletes the cache
-   entry, bans the `X,Z` key for `surfacePitBan = 12` s and resets the 2 s scan throttle, so the
-   next tick re-scans and aims at another pit. `Surface.choose` skips banned columns in all three
-   branches (remembered, current-column cache, full scan). Without the ban the scan re-found the
-   same unusable pit from `Surface.pitCache` and the bot idled at its mouth.
+5. If the player is not above the pit, `Movement.jump` moves them to the mouth — the same block
+   cell at the player's current Y — and the tick ends. The next tick the character drops in.
+6. Above the mouth, the bot mines the block under the feet and waits to land. If there is no
+   block under the feet it simply falls.
 
-Transient failures keep the pit: a `mine` failure with `Mining.why(below) == nil` means no
-pickaxe, out of range or a server rejection, so the bot retries the same mouth next tick.
-
-Negative scans are cached for 2 s per block cell, so a surface without pits does not rescan the
-area every tick.
+No pit cache, no remembered pit and no ban list: the surface scan is one small loop and the
+normal dig-down path handles anything the pit cannot.
 
 ## Client modes
 
