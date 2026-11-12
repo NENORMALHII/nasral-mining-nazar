@@ -1,7 +1,7 @@
-# Mining protocol (from `docs/game/minescript.lua`)
+# Mining protocol (from `docs/game/decompiled/minescript.lua`)
 
 Client: `Workspace.<player>.Pick.MineScript` (LocalScript inside the pickaxe tool).
-Source of truth: `docs/game/minescript.lua`.
+Source of truth: `docs/game/decompiled/minescript.lua`.
 Server side is not in the place dump, so server checks below are inferred.
 
 ## Flow
@@ -123,13 +123,13 @@ Exact prediction requires the server generation script or the real seed attribut
 
 ## Stats used by the bot
 
-From `docs/game/pickaxeslist.lua`:
+From `docs/game/decompiled/tools-pickaxes.lua`:
 
 - `BaseMineTime` — real wait time for the equipped pickaxe, resolved through the tool's
   `ToolClass` attribute (fallback: tool name) and also updated from `UpdatePickaxe`.
 - `Tier`, `InstaMine`, `DoubleDropChance` — informational; tier does not gate ore access.
 
-From `docs/game/playerstats.txt` (LocalPlayer attributes):
+From `docs/game/data/player-stats.txt` (LocalPlayer attributes):
 
 - `ToolSpeedModifier` — reduces mine time: `base * (100 - value) / 100`.
 - `WorldId` — must match the block's `WorldId` or the server rejects the block.
@@ -163,7 +163,7 @@ and `Y >= 1`, so the character stays in a pit inside the mine.
 `ToolSpeedModifier`, which the server already folds buffs into, so the bot must not add the
 handle bonus twice.
 
-## Drops (from `docs/game/blockdropinstructions.txt`)
+## Drops (from `docs/game/instructions/block-drops.md`)
 
 Drops live in `workspace.TargetFilter`, one model per broken block, named `{BlockName}_Drop`.
 Inside there is a part (block name or any `BasePart`), a `DropScript`, and under it a
