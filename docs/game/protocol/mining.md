@@ -135,7 +135,23 @@ From `docs/game/data/player-stats.txt` (LocalPlayer attributes):
 - `WorldId` — must match the block's `WorldId` or the server rejects the block.
 - `Luck`, `DoubleDropChance`, `WalkSpeed` — not used by the bot.
 
-Wait time: `base * (100 - ToolSpeedModifier) / 100 * Resource.MineTimeModifier + 0.05 + ping * 2`.
+Wait time (bot formula, updated for server tolerance):
+
+```lua
+mineTime = BaseMineTime * (100 - ToolSpeedModifier) / 100 * MineTimeModifier
+preSwing = random(0.04 .. 0.12)   -- delay before BlockEvent (human reaction)
+swing    = random(0.02 .. 0.08)   -- delay after BlockEvent (swing animation)
+jitter   = random(0.05 .. 0.15)   -- per-block variance
+safety   = 0.18                   -- fixed buffer
+ping     = GetNetworkPing()       -- RTT, capped at 0.5
+waitTime = mineTime + safety + ping + jitter
+```
+
+Total time from `BlockEvent` to `BlockMinedEvent`: `preSwing + swing + waitTime`.
+
+The client fires `BlockEvent`, waits `preSwing + swing + waitTime`, then fires `BlockMinedEvent`.
+Server validates that elapsed time >= expected `mineTime` (with its own tolerance).
+If the bot finishes too early, the server rejects with "server rejected".
 
 Position formula (same as `ReplicatedFirst.Util`):
 

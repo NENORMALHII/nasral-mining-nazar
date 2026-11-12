@@ -15,9 +15,13 @@ local Config = {
     tweenSpeed = 120,
     moveStopDistance = 2.5,
 
-    mineTimeSafety = 0.05,
-    mineJitterMin = 0.02,
-    mineJitterMax = 0.09,
+    mineTimeSafety = 0.18,
+    mineJitterMin = 0.05,
+    mineJitterMax = 0.15,
+    minePreSwingMin = 0.04,
+    minePreSwingMax = 0.12,
+    mineSwingMin = 0.02,
+    mineSwingMax = 0.08,
     mineRejectGrace = 0.6,
 
     mushroomDelay = 0.35,
@@ -1076,7 +1080,16 @@ function Mining.waitTime(block)
     end
 
     local jitter = math.random() * (Config.mineJitterMax - Config.mineJitterMin) + Config.mineJitterMin
-    return Mining.mineTime(block) + Config.mineTimeSafety + ping * 2 + jitter
+    local baseWait = Mining.mineTime(block) + Config.mineTimeSafety + ping + jitter
+    return baseWait
+end
+
+function Mining.preSwingDelay()
+    return math.random() * (Config.minePreSwingMax - Config.minePreSwingMin) + Config.minePreSwingMin
+end
+
+function Mining.swingDelay()
+    return math.random() * (Config.mineSwingMax - Config.mineSwingMin) + Config.mineSwingMin
 end
 
 function Mining.maxDistance()
@@ -1196,17 +1209,29 @@ function Mining.mine(character, block)
 
     local modifier = resourceInfo(typeOf(block))
     modifier = modifier and modifier.MineTimeModifier or 1
-    logPrint(("mine %s type=%s base=%.2f toolspeed=%s mod=%.2f wait=%.2f"):format(
+    local waitTime = Mining.waitTime(block)
+    local preSwing = Mining.preSwingDelay()
+    local swing = Mining.swingDelay()
+    logPrint(("mine %s type=%s base=%.2f toolspeed=%s mod=%.2f wait=%.2f preSwing=%.2f swing=%.2f"):format(
         block.Name,
         tostring(typeOf(block)),
         Mining.baseMineTime,
         tostring(Players.LocalPlayer:GetAttribute("ToolSpeedModifier")),
         modifier,
-        Mining.waitTime(block)
+        waitTime,
+        preSwing,
+        swing
     ))
 
+    task.wait(preSwing)
+
+    if not block.Parent then
+        return false
+    end
+
     blockEvent:FireServer(block.Name, { dug = true })
-    task.wait(Mining.waitTime(block))
+    task.wait(swing)
+    task.wait(waitTime)
 
     if not block.Parent then
         return true
