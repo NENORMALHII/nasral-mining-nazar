@@ -73,13 +73,28 @@ access.
 
 ## Movement
 
-Anchored tween is the reliable option for this character:
+Mining does not move the character at all. The server accepts any block within
+`Pick.MaxDistance` (25), so teleporting to the block centre was unnecessary and was the
+main reason for `BlockMinedEvent` rejections: the server saw a position jump right before
+`BlockEvent` on every block.
+
+Rules in `src/main.lua`:
+
+1. Farm mines only blocks within `Mining.reach() = MaxDistance - 4` (21 studs).
+2. No ore is chased across the mine. If nothing selected is in reach, the bot digs the
+   block under the feet, one block at a time.
+3. After a shaft block breaks, the character falls naturally (`Movement.waitLanded`).
+4. Teleports are used only for loot and mushrooms. After any teleport the bot waits for the
+   position to stop changing (`Movement.settle`) and blocks new mining for `moveCooldown`
+   (0.6 s), so `BlockEvent` never lands in the same tick as a position change.
+5. `HumanoidRootPart` is anchored only during the `BlockEvent`/`BlockMinedEvent` window.
+
+Tween steps, when a teleport is required:
 
 1. `Humanoid.PlatformStand = true`.
 2. `HumanoidRootPart.Anchored = true`.
 3. `TweenService:Create(root, TweenInfo.new(distance / speed, Linear), { CFrame = CFrame.new(target) })`.
-4. Wait for the tween, then unanchor and clear `PlatformStand`.
-5. Hold the root anchored while mining so distance checks keep passing.
+4. Wait for the tween, unanchor, clear `PlatformStand`, `Movement.settle`.
 
 `AlignPosition`/`LinearVelocity` fight the humanoid and cause tumbling.
 
@@ -87,20 +102,27 @@ Anchored tween is the reliable option for this character:
 
 `src/main.lua` uses a `Mode` class. Two instances, one per category:
 
-- `FarmMode` — picks the highest-price ore (distance breaks ties), moves, mines, collects `Drops`.
+- `FarmMode` — mines the best selected block already in reach, no movement; digs down when
+  nothing is reachable; collects loot in batches.
 - `MushroomMode` — finds the nearest `HarvestableNode`, moves, fires `InteractEvent`.
 
 Only one mode runs at a time. UI: `Category` dropdown + `Enabled` toggle.
 Hotkeys: `F1` farm, `F2` mushrooms. Movement: `Instant move` toggle and `Tween speed` slider.
 
-## Instant loot
+## Loot collection
 
-`Loot.collectAll` teleports the character to every `Workspace.Drops` child inside `lootRange`,
-nearest first, waits `lootDwell` per drop so the server sees the touch, and marks the drop
-ignored for 10 s. Always on: runs at the start of every farm tick and right after a successful
-mine. All natural resources, including `Dirt`, `Stone` and `Coal`, are present in the ore selection
-and selected by default. The shaft fallback still digs straight down when nothing better is in
-range.
+Drops accumulate while the bot mines. `Loot.collectNearby(character, radius)` runs only when
+`Loot.count() >= lootBatch` (4), so the bot does not teleport after every block.
+
+- Only drops inside `lootCollectRadius` (18 studs) are considered.
+- The nearest drop is picked; if it is farther than `lootGroupRadius` (8) the bot performs one
+  teleport (`Movement.to`) and waits `lootDwell` (0.18 s).
+- At most `lootMoves` (2) teleports per collection pass.
+- Drops that disappear after a touch are removed from `Loot.pending` by `Loot.sync(true)`.
+- Drops owned by other players are ignored; `Loot.playerValue` accepts the player instance,
+  name, user id or string.
+
+All natural resources, including `Dirt`, `Stone` and `Coal`, are selected by default.
 
 ## Downward strategy and seed predictor
 

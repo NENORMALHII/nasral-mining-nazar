@@ -35,8 +35,17 @@ local Config = {
     oreCacheTime = 2,
     depthWeight = 8,
     shaftDig = true,
-    lootDwell = 0.12,
-    lootAttempts = 2,
+
+    mineReachMargin = 4,
+    moveCooldown = 0.6,
+    moveSettleTime = 0.35,
+    moveSettleEpsilon = 0.2,
+
+    lootBatch = 4,
+    lootCollectRadius = 18,
+    lootGroupRadius = 8,
+    lootMoves = 2,
+    lootDwell = 0.18,
     lootSpawnWait = 0.35,
     lootSyncInterval = 0.5,
 
@@ -365,6 +374,48 @@ function Movement.releaseHold()
     Movement.holdRoot = nil
 end
 
+function Movement.settle(character)
+    local root = character and character.PrimaryPart
+    if not root then
+        return
+    end
+
+    local deadline = os.clock() + Config.moveSettleTime
+    local last = root.Position
+    local stable = 0
+
+    while os.clock() < deadline do
+        RunService.Heartbeat:Wait()
+
+        if (root.Position - last).Magnitude <= Config.moveSettleEpsilon then
+            stable += 1
+        else
+            stable = 0
+        end
+
+        last = root.Position
+
+        if stable >= 2 then
+            return
+        end
+    end
+end
+
+function Movement.waitLanded(character, timeout)
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not humanoid then
+        return
+    end
+
+    local deadline = os.clock() + (timeout or 0.7)
+    while os.clock() < deadline do
+        if humanoid.FloorMaterial ~= Enum.Material.Air then
+            return
+        end
+        RunService.Heartbeat:Wait()
+    end
+end
+
 function Movement.to(character, position, speed)
     local root = character.PrimaryPart
     if not root then
@@ -374,12 +425,15 @@ function Movement.to(character, position, speed)
     Movement.release()
 
     if (position - root.Position).Magnitude < Config.moveStopDistance then
+        Movement.settle(character)
         return
     end
 
     if Config.instantMove then
         character:PivotTo(CFrame.new(position))
         Character.platformStand(character, false)
+        Movement.lastMoveAt = os.clock()
+        Movement.settle(character)
         return
     end
 
@@ -415,6 +469,9 @@ function Movement.to(character, position, speed)
     if not reached and root.Parent then
         character:PivotTo(CFrame.new(position))
     end
+
+    Movement.lastMoveAt = os.clock()
+    Movement.settle(character)
 end
 
 ---------------------------------------------------------------------------
@@ -1063,8 +1120,20 @@ function Mining.prepare(character)
         logPrint("tool attributes: " .. Mining.describe(pickaxe))
     end
 
-    -- Wait for server-authoritative BaseMineTime before first mine with this tool.
-    -- The server sends it via UpdatePickaxe.OnClientEvent when the tool equips.
+    if pickaxe.Parent ~= character then
+        humanoid:EquipTool(pickaxe)
+        task.wait(0.1)
+    elseif not Mining.rebound then
+        humanoid:UnequipTools()
+        task.wait(0.05)
+        humanoid:EquipTool(pickaxe)
+        task.wait(0.1)
+    end
+
+    Mining.rebound = true
+
+    -- The server sends BaseMineTime on equip via UpdatePickaxe.OnClientEvent.
+    -- Wait for it once per tool, after the re-equip above has triggered it.
     if toolChanged and type(Mining.serverBase) ~= "number" then
         local deadline = os.clock() + Config.mineWaitForServer
         while os.clock() < deadline do
@@ -1080,18 +1149,6 @@ function Mining.prepare(character)
             tostring(Mining.handle)
         ))
     end
-
-    if pickaxe.Parent ~= character then
-        humanoid:EquipTool(pickaxe)
-        task.wait(0.1)
-    elseif not Mining.rebound then
-        humanoid:UnequipTools()
-        task.wait(0.05)
-        humanoid:EquipTool(pickaxe)
-        task.wait(0.1)
-    end
-
-    Mining.rebound = true
 
     return pickaxe
 end
@@ -1201,12 +1258,16 @@ function Mining.allowed(block)
     return Mining.why(block) == nil
 end
 
+function Mining.reach()
+    return math.max(8, Mining.maxDistance() - Config.mineReachMargin)
+end
+
 function Mining.inRange(character, block)
     local root = character.PrimaryPart
     if not root then
         return false
     end
-    return (block.Position - root.Position).Magnitude <= Mining.maxDistance() - 1
+    return (block.Position - root.Position).Magnitude <= Mining.reach()
 end
 
 function Mining.surface(character)
@@ -1439,11 +1500,12 @@ function Ores.refresh()
     end
 end
 
-function Ores.nearest(position)
+function Ores.nearest(position, maxDistance)
     if os.clock() - cacheTime > Config.oreCacheTime then
         Ores.refresh()
     end
 
+    local limit = maxDistance or Config.oreRange
     local best, bestDistance, bestScore
     local now = os.clock()
     local playerBlock = Predictor.toBlock(position)
@@ -1457,7 +1519,7 @@ function Ores.nearest(position)
             if name and Ores.isSelected(name) and Mining.valid(block) == nil then
                 local distance = (block.Position - position).Magnitude
 
-                if distance <= Config.oreRange then
+                if distance <= limit then
                     local blockPosition = block:GetAttribute(Game.attrMinePosition)
                     local price = Ores.price(name)
                     local depth = blockPosition and math.max(0, blockPosition.Y - playerBlock.Y) or 0
@@ -1585,56 +1647,78 @@ function Loot.remove(drop)
     end
 end
 
-local function tryPickup(character, drop)
-    for _ = 1, 3 do
-        if not drop.Parent then
-            return true
+function Loot.nearest(position)
+    local best, bestDistance
+
+    for _, drop in ipairs(Loot.pending) do
+        if drop.Parent then
+            local part = Loot.part(drop)
+            if part then
+                local distance = (part.Position - position).Magnitude
+                if not bestDistance or distance < bestDistance then
+                    best, bestDistance = drop, distance
+                end
+            end
         end
-
-        local part = Loot.part(drop)
-        if not part or not part.Parent then
-            return not drop.Parent
-        end
-
-        Movement.to(character, part.Position)
-        RunService.Heartbeat:Wait()
-        RunService.Heartbeat:Wait()
-        task.wait(Config.lootDwell)
-
-        if not drop.Parent then
-            return true
-        end
-
-        task.wait(0.1)
     end
 
-    return not drop.Parent
+    return best, bestDistance
 end
 
-function Loot.collectAll(character)
-    Loot.sync()
+-- Collects only drops that are close to the player. Never chases a drop across the map:
+-- one teleport per cluster, maximum Config.lootMoves moves per call.
+function Loot.collectNearby(character, radius)
+    Loot.sync(true)
 
-    if #Loot.pending == 0 then
+    local root = character.PrimaryPart
+    if not root then
         return 0
     end
 
-    table.sort(Loot.pending, function(a, b)
-        return Ores.price(Loot.name(a)) > Ores.price(Loot.name(b))
-    end)
-
+    local limit = radius or Config.lootCollectRadius
     local picked = 0
+    local moves = 0
+    local idle = 0
 
-    for index = #Loot.pending, 1, -1 do
-        local drop = Loot.pending[index]
-        if not drop.Parent then
-            Loot.remove(drop)
-        elseif tryPickup(character, drop) then
-            Loot.remove(drop)
-            picked += 1
+    while true do
+        local count = #Loot.pending
+        if count == 0 then
+            break
+        end
+
+        local drop, distance = Loot.nearest(root.Position)
+        if not drop or not distance or distance > limit then
+            break
+        end
+
+        if distance > Config.lootGroupRadius then
+            if moves >= Config.lootMoves then
+                break
+            end
+
+            local part = Loot.part(drop)
+            if not part then
+                Loot.remove(drop)
+                picked += 1
+            else
+                Movement.to(character, part.Position)
+                moves += 1
+            end
+        end
+
+        task.wait(Config.lootDwell)
+        Loot.sync(true)
+
+        if #Loot.pending >= count then
+            idle += 1
+            if idle >= 2 or moves >= Config.lootMoves then
+                break
+            end
+        else
+            picked += count - #Loot.pending
+            idle = 0
         end
     end
-
-    Loot.sync()
 
     if picked > 0 then
         logPrint("loot picked " .. picked)
@@ -1695,80 +1779,87 @@ local FarmMode = Mode.new("Farm", function(self)
 
     Ores.checkSelection()
 
-    Loot.sync(true)
+    Loot.sync()
 
-    if Loot.count() > 0 then
-        for _ = 1, 3 do
-            Loot.collectAll(character)
-            if Loot.count() == 0 then
-                break
-            end
-            task.wait(0.05)
-        end
-
-        if Loot.count() > 0 then
-            logPrint("waiting for loot " .. Loot.count())
-            task.wait(0.05)
-            return
-        end
+    if Loot.count() >= Config.lootBatch then
+        Loot.collectNearby(character, Config.lootCollectRadius)
     end
 
-    local function mineBlock(block, label)
+    local function mine(block, label)
         if not block or not block.Parent then
             return false
         end
-        if not Mining.prepare(character) then
+        if not Mining.inRange(character, block) then
+            return false
+        end
+
+        local pickaxe = Mining.prepare(character)
+        if not pickaxe then
             logWarn("no pickaxe")
             return false
         end
 
-        logPrint(label .. " " .. block.Name .. " (" .. tostring(typeOf(block)) .. ")")
-
-        Movement.to(character, block.Position)
+        -- Do not start a new block right after a teleport: the server treats a
+        -- position change plus BlockEvent in the same tick as suspicious.
+        if Movement.lastMoveAt then
+            local elapsed = os.clock() - Movement.lastMoveAt
+            if elapsed < Config.moveCooldown then
+                task.wait(Config.moveCooldown - elapsed)
+            end
+        end
 
         if not self.enabled then
             return false
         end
 
+        logPrint(("%s %s (%s)"):format(label, block.Name, tostring(typeOf(block))))
+
         Movement.hold(character)
         local ok, result = pcall(Mining.mine, character, block)
         Movement.releaseHold()
 
-        if ok and result then
-            Ores.invalidate()
-            task.wait(Config.lootSpawnWait)
-            Loot.sync(true)
-            Loot.collectAll(character)
-            return true
+        if not ok or not result then
+            return false
         end
 
-        return false
+        Ores.invalidate()
+        task.wait(Config.lootSpawnWait)
+        return true
     end
 
-    if Config.surfaceDig and Mining.surface(character) then
-        mineBlock(Predictor.blockBelow(root.Position), "surface")
-        return
-    end
-
-    local shaftBlock = Predictor.blockBelow(root.Position)
-    if shaftBlock and not Ores.isSelected(typeOf(shaftBlock) or "") then
-        mineBlock(shaftBlock, "clear path")
-        return
-    end
-
-    local ore = Ores.nearest(root.Position)
+    -- Mine only what is already in reach. No teleport to the ore.
+    local ore = Ores.nearest(root.Position, Mining.reach())
     if ore then
-        if not mineBlock(ore, "target") then
+        if not mine(ore, "ore") then
             Ores.ignore(ore)
         end
         return
     end
 
-    if Config.shaftDig then
-        mineBlock(shaftBlock, "dig down")
-    else
-        task.wait(0.1)
+    -- Nothing reachable: dig straight down, one block at a time.
+    local below = Predictor.blockBelow(root.Position)
+    if not below then
+        -- shaft is open under the feet, gravity takes the character down
+        Movement.waitLanded(character)
+        task.wait(0.15)
+        return
     end
+
+    local label = "dig"
+    if Config.surfaceDig and Mining.surface(character) then
+        label = "surface"
+    elseif not Ores.isSelected(typeOf(below) or "") then
+        label = "clear"
+    end
+
+    if not mine(below, label) then
+        Ores.ignore(below)
+        return
+    end
+
+    -- The block under the feet is gone: let the character fall into the new
+    -- cell and land before the next BlockEvent.
+    Movement.waitLanded(character)
 end, Movement.cancel)
 
 ---------------------------------------------------------------------------

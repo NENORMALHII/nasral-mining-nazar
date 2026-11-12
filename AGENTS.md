@@ -63,6 +63,6 @@ legacy/                   old scripts kept for reference
 - `UpdatePickaxe` is server→client only. It carries `BaseMineTime`. Never call `FireServer` on it.
 - Mine time: `BaseMineTime * (100 - ToolSpeedModifier) / 100 * Resource.MineTimeModifier + ping margin`.
 - Client-side checks: block belongs to `Workspace.Mine`, within range, has `MinePosition`, `Type` not in `Oil/Lava/Grass/Void`, not Bedrock, same world attribute, `Dug` free or ours, no adjacent liquid.
-- Movement: tween or instant `PivotTo` to the centre of the target block, anchor `HumanoidRootPart` while mining. `LinearVelocity`/`AlignPosition` with `PlatformStand` cause tumbling.
+- Movement: mine without moving. Only blocks within `MaxDistance - 4` are targeted; dig straight down otherwise. Teleports (loot only) are followed by `Movement.settle` and a `moveCooldown` before the next `BlockEvent`. `LinearVelocity`/`AlignPosition` with `PlatformStand` cause tumbling.
 - Drops: `workspace.TargetFilter/{BlockName}_Drop`, owner in `DropScript.Player`; collect own selected drops before mining.
 - Full details: `docs/game/protocol/mining.md`.
