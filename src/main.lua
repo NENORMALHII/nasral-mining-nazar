@@ -520,6 +520,7 @@ local Surface = {
     remembered = nil,
     lastCell = nil,
     lastScan = 0,
+    pitCache = {},
 }
 
 -- Counts empty cells from topY down to the first solid block.
@@ -539,6 +540,27 @@ function Surface.depth(mine, cell, topY)
     return depth, false
 end
 
+function Surface.key(cell)
+    return cell.X .. "," .. cell.Z
+end
+
+function Surface.cacheGet(key)
+    local cached = Surface.pitCache[key]
+    if not cached then
+        return nil
+    end
+    local now = os.clock()
+    if now - cached.time > 5 then
+        Surface.pitCache[key] = nil
+        return nil
+    end
+    return cached.pit
+end
+
+function Surface.cacheSet(key, pit)
+    Surface.pitCache[key] = { pit = pit, time = os.clock() }
+end
+
 function Surface.choose(position)
     local mine = workspace:FindFirstChild(Config.mineName)
     if not mine then
@@ -548,19 +570,35 @@ function Surface.choose(position)
     local center = Blocks.toBlock(position)
     local topY = center.Y
 
+    -- 1. Try remembered pit first (same X,Z)
     if Surface.remembered then
+        local key = Surface.key(Surface.remembered.cell)
+        local cached = Surface.cacheGet(key)
+        if cached then
+            return cached
+        end
+
         local cell = Vector3.new(Surface.remembered.cell.X, topY, Surface.remembered.cell.Z)
         local depth, hasBottom = Surface.depth(mine, cell, topY)
 
         if hasBottom and depth >= Config.surfaceMinDepth then
             Surface.remembered.cell = cell
             Surface.remembered.depth = depth
+            Surface.cacheSet(key, Surface.remembered)
             return Surface.remembered
         end
 
         Surface.remembered = nil
     end
 
+    -- 2. Check cache for current column
+    local currentKey = Surface.key(center)
+    local cached = Surface.cacheGet(currentKey)
+    if cached then
+        return cached
+    end
+
+    -- 3. Full scan only if cache miss
     if Surface.lastCell == center and os.clock() - Surface.lastScan < 2 then
         return nil
     end
@@ -574,6 +612,18 @@ function Surface.choose(position)
     for dx = -radius, radius do
         for dz = -radius, radius do
             local cell = Vector3.new(center.X + dx, topY, center.Z + dz)
+            local key = Surface.key(cell)
+            local cachedPit = Surface.cacheGet(key)
+
+            if cachedPit then
+                if not bestDepth
+                    or cachedPit.depth > bestDepth
+                    or (cachedPit.depth == bestDepth and (Blocks.worldOf(cell) - position).Magnitude < bestDistance) then
+                    best, bestDepth, bestDistance = cell, cachedPit.depth, (Blocks.worldOf(cell) - position).Magnitude
+                end
+                continue
+            end
+
             local depth, hasBottom = Surface.depth(mine, cell, topY)
 
             if hasBottom and depth >= Config.surfaceMinDepth then
@@ -584,6 +634,8 @@ function Surface.choose(position)
                     or (depth == bestDepth and distance < bestDistance) then
                     best, bestDepth, bestDistance = cell, depth, distance
                 end
+
+                Surface.cacheSet(key, { cell = cell, depth = depth })
             end
         end
     end
@@ -593,6 +645,7 @@ function Surface.choose(position)
     end
 
     Surface.remembered = { cell = best, depth = bestDepth }
+    Surface.cacheSet(Surface.key(best), Surface.remembered)
     logPrint(("surface shaft %s depth=%d"):format(vec3ToString(best), bestDepth))
     return Surface.remembered
 end
