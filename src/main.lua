@@ -47,17 +47,47 @@ local Config = {
 
 local Log = {
     enabled = false,
+    lines = {},
+    maxLines = 12,
+    render = nil,
 }
 
+local function joinArgs(...)
+    local parts = {}
+
+    for index = 1, select("#", ...) do
+        table.insert(parts, tostring(select(index, ...)))
+    end
+
+    return table.concat(parts, " ")
+end
+
+local function pushLog(text)
+    local line = ("%s  %s"):format(os.date("%H:%M:%S"), text)
+    table.insert(Log.lines, line)
+
+    while #Log.lines > Log.maxLines do
+        table.remove(Log.lines, 1)
+    end
+
+    if Log.render then
+        pcall(Log.render, Log.lines)
+    end
+end
+
 local function logPrint(...)
+    local text = joinArgs(...)
+    pushLog(text)
     if Log.enabled then
-        print("[nm2]", ...)
+        print("[nm2]", text)
     end
 end
 
 local function logWarn(...)
+    local text = joinArgs(...)
+    pushLog(text)
     if Log.enabled then
-        warn("[nm2]", ...)
+        warn("[nm2]", text)
     end
 end
 
@@ -686,7 +716,7 @@ function Mining.mine(character, block)
 
     if block.Parent then
         blockEvent:FireServer(block.Name, { dug = false })
-        warn("[mining] server rejected " .. block.Name .. " (" .. tostring(typeOf(block)) .. ")")
+        logWarn("server rejected " .. block.Name .. " (" .. tostring(typeOf(block)) .. ")")
         return false
     end
 
@@ -1442,12 +1472,112 @@ function Ui.create()
 end
 
 ---------------------------------------------------------------------------
+-- Log view
+---------------------------------------------------------------------------
+
+local LogView = {}
+
+function LogView.create()
+    local playerGui = Players.LocalPlayer:WaitForChild("PlayerGui")
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "NM2_Logs"
+    gui.ResetOnSpawn = false
+    gui.Parent = playerGui
+
+    local frame = Instance.new("Frame")
+    frame.Name = "LogFrame"
+    frame.Size = UDim2.fromOffset(520, 150)
+    frame.Position = UDim2.new(0, 10, 1, -160)
+    frame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    frame.BackgroundTransparency = 0.15
+    frame.BorderSizePixel = 0
+    frame.Parent = gui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = frame
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -12, 0, 16)
+    title.Position = UDim2.fromOffset(6, 4)
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 11
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextColor3 = Color3.fromRGB(150, 200, 150)
+    title.Text = "NM2 logs"
+    title.Parent = frame
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -12, 1, -26)
+    label.Position = UDim2.fromOffset(6, 20)
+    label.BackgroundTransparency = 1
+    label.Font = Enum.Font.Code
+    label.TextSize = 12
+    label.TextWrapped = true
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextYAlignment = Enum.TextYAlignment.Bottom
+    label.TextColor3 = Color3.fromRGB(220, 220, 220)
+    label.Text = ""
+    label.Parent = frame
+
+    local function render(lines)
+        label.Text = table.concat(lines, "\n")
+    end
+
+    Log.render = render
+    render(Log.lines)
+
+    return gui
+end
+
+---------------------------------------------------------------------------
+-- GUI toggle button
+---------------------------------------------------------------------------
+
+function Ui.toggleButton(window)
+    local playerGui = Players.LocalPlayer:WaitForChild("PlayerGui")
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "NM2_Toggle"
+    gui.ResetOnSpawn = false
+    gui.Parent = playerGui
+
+    local button = Instance.new("TextButton")
+    button.Size = UDim2.fromOffset(52, 24)
+    button.Position = UDim2.new(0, 10, 0, 36)
+    button.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    button.BorderSizePixel = 0
+    button.Font = Enum.Font.GothamBold
+    button.TextSize = 12
+    button.TextColor3 = Color3.fromRGB(230, 230, 230)
+    button.Text = "Hide"
+    button.Parent = gui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 4)
+    corner.Parent = button
+
+    button.Activated:Connect(function()
+        local visible = window:ToggleGUI()
+        button.Text = visible and "Hide" or "Show"
+    end)
+
+    return gui
+end
+
+---------------------------------------------------------------------------
 -- Bootstrap
 ---------------------------------------------------------------------------
 
-local ok, err = pcall(Ui.create)
-if not ok then
-    warn("[main] ui failed: " .. tostring(err))
+LogView.create()
+
+local ok, window = pcall(Ui.create)
+if ok and window then
+    Ui.toggleButton(window)
+else
+    warn("[main] ui failed: " .. tostring(window))
 end
 
 local hotkeys = {
