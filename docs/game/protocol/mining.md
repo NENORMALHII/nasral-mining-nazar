@@ -64,91 +64,61 @@ Server side is not in the place dump, so server checks below are inferred.
 
 ## Ore selection
 
-`Ores.names()` builds the list from `Resources` (`Natural` + `BasePrice`) and falls back to
-`Config.orePrices`. The UI selection stores explicit resource names in `Ores.setSelected`.
-Default selection is every ore with `BasePrice > 0`. The uilib selection callback is not
-used; `Ores.isSelected` polls `selection.getSelected()` directly. Target choice is by highest
-price first, then distance. Tier gating is not used: pickaxe tier changes mine time, not ore
-access.
+`Ores.names()` builds the list from `Resources` (`Natural`), sorted by `BasePrice`.
+The UI stores selected indices; `Ores.isSelected(name)` maps them to names.
+Empty selection means nothing is selected.
+
+## Target selection (no prediction)
+
+There is no seed hashing and no depth heuristic. `Ores.nearest(position, radius)`:
+
+- converts the player position to block coordinates (`Blocks.toBlock`);
+- scans only the `±ceil(radius/7)` cube around the player with
+  `mine:FindFirstChild("x,y,z")`, instead of iterating every child of `Workspace.Mine`;
+- skips blocks that are not selected, invalid (world, `Dug`, `MinePosition`) or out of range;
+- score: `BasePrice * 1000 - distance`, so the most valuable block wins and distance breaks ties;
+- `Ores.ignore(block)` skips a failed block for 5 s.
+
+Radius is `Mining.reach() = Pick.MaxDistance - 4` (21 studs).
 
 ## Movement
 
-Mining does not move the character at all. The server accepts any block within
-`Pick.MaxDistance` (25), so teleporting to the block centre was unnecessary and was the
-main reason for `BlockMinedEvent` rejections: the server saw a position jump right before
-`BlockEvent` on every block.
+Mining does not move the character. The server accepts any block within `Pick.MaxDistance`,
+so teleporting to the block centre was unnecessary and caused `BlockMinedEvent` rejections.
 
-Rules in `src/main.lua`:
-
-1. Farm mines only blocks within `Mining.reach() = MaxDistance - 4` (21 studs).
-2. No ore is chased across the mine. If nothing selected is in reach, the bot digs the
-   block under the feet, one block at a time.
-3. After a shaft block breaks, the character falls naturally (`Movement.waitLanded`).
-4. Teleports are used only for loot and mushrooms. After any teleport the bot waits for the
-   position to stop changing (`Movement.settle`) and blocks new mining for `moveCooldown`
-   (0.6 s), so `BlockEvent` never lands in the same tick as a position change.
-5. `HumanoidRootPart` is anchored only during the `BlockEvent`/`BlockMinedEvent` window.
-
-Tween steps, when a teleport is required:
-
-1. `Humanoid.PlatformStand = true`.
-2. `HumanoidRootPart.Anchored = true`.
-3. `TweenService:Create(root, TweenInfo.new(distance / speed, Linear), { CFrame = CFrame.new(target) })`.
-4. Wait for the tween, unanchor, clear `PlatformStand`, `Movement.settle`.
-
-`AlignPosition`/`LinearVelocity` fight the humanoid and cause tumbling.
+- Farm mines only blocks already in reach; otherwise it digs the block under the feet.
+- After a shaft block breaks the character falls naturally (`Movement.waitLanded`).
+- Loot teleports use `Movement.jump` (`PivotTo` directly, no tween).
+- Every teleport sets `Movement.lastMoveAt`; Farm waits `moveCooldown` (0.5 s) before the next
+  `BlockEvent`, so mining never starts in the same tick as a position change.
+- `HumanoidRootPart` is anchored only during the `BlockEvent`/`BlockMinedEvent` window.
 
 ## Client modes
 
-`src/main.lua` uses a `Mode` class. Two instances, one per category:
+- `FarmMode` — loot first, then the best selected block in reach, otherwise dig straight down.
+- `MushroomMode` — nearest `HarvestableNode`, moves there, fires `InteractEvent`.
 
-- `FarmMode` — mines the best selected block already in reach, no movement; digs down when
-  nothing is reachable; collects loot in batches.
-- `MushroomMode` — finds the nearest `HarvestableNode`, moves, fires `InteractEvent`.
+## Loot
 
-Only one mode runs at a time. UI: `Category` dropdown + `Enabled` toggle.
-Hotkeys: `F1` farm, `F2` mushrooms. Movement: `Instant move` toggle and `Tween speed` slider.
+Drops are `workspace.TargetFilter/{BlockName}_Drop` models with `DropScript.Player`.
+`Loot.sync` keeps own selected drops in `Loot.pending`.
 
-## Loot collection
+`Loot.collectAll(character)` runs first on every Farm tick:
 
-Drops accumulate while the bot mines. `Loot.collectNearby(character, radius)` runs only when
-`Loot.count() >= lootBatch` (4), so the bot does not teleport after every block.
+1. sorts pending drops by `BasePrice`;
+2. teleports to each drop with `Movement.jump`;
+3. waits `lootDwell` for the touch;
+4. removes collected drops and moves to the next.
 
-- Only drops inside `lootCollectRadius` (18 studs) are considered.
-- The nearest drop is picked; if it is farther than `lootGroupRadius` (8) the bot performs one
-  teleport (`Movement.to`) and waits `lootDwell` (0.18 s).
-- At most `lootMoves` (2) teleports per collection pass.
-- Drops that disappear after a touch are removed from `Loot.pending` by `Loot.sync(true)`.
-- Drops owned by other players are ignored; `Loot.playerValue` accepts the player instance,
-  name, user id or string.
-
-All natural resources, including `Dirt`, `Stone` and `Coal`, are selected by default.
-
-## Downward strategy and seed predictor
-
-Mine generation code is server-side and missing from the place dump. `Predictor` therefore:
-
-- reads any attribute whose name contains `seed` on `Workspace`, `Workspace.Mine` or
-  `ReplicatedStorage`; falls back to `w<WorldId>`;
-- converts world position to block coordinates with the `Util.GetBlockCoords` formula;
-- hashes seed + block coordinates with `bit32.bxor` for deterministic tie-breaking.
-
-Target score: `BasePrice + max(0, blockY - playerBlockY) * depthWeight + hash / 1000`.
-So deeper ores win, and the route is stable for the same seed.
-If no selected ore is in range, Farm digs the block below the player (`Dig down` toggle).
-`Mining.approach` returns a point only inside an empty block cell next to the ore; there is no
-fallback above the ore. `Mining.inCell` checks a 1.5-stud box around the root against
-`Workspace.Mine` with `GetPartBoundsInBox`; no overlap means the character is between blocks.
-Unreachable ores are ignored and the mode falls back to `Dig down`.
-
-Exact prediction requires the server generation script or the real seed attribute name.
+No radius limit, no batching: the character always goes to its own loot before mining again.
 
 ## Stats used by the bot
 
 From `docs/game/decompiled/tools-pickaxes.lua`:
 
-- `BaseMineTime` — real wait time for the equipped pickaxe, resolved through the tool's
-  `ToolClass` attribute (fallback: tool name) and also updated from `UpdatePickaxe`.
+- `BaseMineTime` — real wait time for the equipped pickaxe, resolved from the
+  `ATTR_TOOL_MATERIAL` attribute, then the tool name, then the `Head` part; also updated from
+  `UpdatePickaxe`.
 - `Tier`, `InstaMine`, `DoubleDropChance` — informational; tier does not gate ore access.
 
 From `docs/game/data/player-stats.txt` (LocalPlayer attributes):
@@ -204,95 +174,33 @@ world  -> block: (floor((X - 61.5)/7 + 0.5),
                   floor((Z + 56.5)/7 + 0.5))
 ```
 
-The stand point is the center of an empty neighbouring cell with at least 3 solid neighbours
-and `Y >= 1`, so the character stays in a pit inside the mine.
-
 ## Pickaxe handle detection
 
-`Modules.Tools.ToolHandles` is loaded as `Game.Handles`. `Mining.handleName` resolves the handle:
+`Mining.detect(pickaxe)` resolves and caches both values:
 
-1. attribute `WoodMaterial` (from `Constants.ATTR_TOOL_WOOD_MATERIAL`);
-2. attribute `Handle` or `Wood`;
-3. a `StringValue` descendant whose name contains `wood` or `handle`;
-4. handle name contained in the tool name.
+- pickaxe: `ATTR_TOOL_MATERIAL` attribute, then tool name, then `Head` part material + colour
+  against `Tools.Pickaxes`;
+- handle: `ATTR_TOOL_WOOD_MATERIAL` attribute, then `Handle` part colour against
+  `Tools.ToolHandles`.
 
-`Mining.handleInfo` returns the handle entry and its name. The handle only affects buffs
-(`SpeedModifier`, `LuckModifier`, `DoubleDropChanceModifier`, etc.). Mine time still uses
-`ToolSpeedModifier`, which the server already folds buffs into, so the bot must not add the
-handle bonus twice.
+Attribute values are normalized (`pickaxe`, `pick`, `axe`, `wood`, `handle` stripped, punctuation
+removed), so `Stone` matches `Stone Pickaxe` and `Oak Wood` matches `Oak`.
+
+`Stone` is both a handle and a pickaxe head material; handles are never read from the
+`Material` attribute, only from `WoodMaterial`.
+
+Handle buffs are not added to mine time: the server already folds them into `ToolSpeedModifier`.
 
 ## Drops (from `docs/game/instructions/block-drops.md`)
 
 Drops live in `workspace.TargetFilter`, one model per broken block, named `{BlockName}_Drop`.
-Inside there is a part (block name or any `BasePart`), a `DropScript`, and under it a
-`StringValue` named `Player` — the player who broke the block.
+Inside there is a `BasePart`, a `DropScript`, and under it a `StringValue` named `Player` —
+the player who broke the block.
 
 `Loot.collectAll` only picks drops where `DropScript.Player.Value` matches `LocalPlayer`
 (instance, name, user id or string). Drops are cached in `Loot.pending` by `Loot.sync` and stay
-there until picked, even if they move or end up above the mine. Each drop gets three attempts,
-the part position is re-read every attempt, and there is no distance limit. Runs after `lootSpawnWait` (0.35 s) so the drop has time to spawn; the character
-is not teleported into the block instantly.
-
-## Surface (first layer)
-
-While the player's block Y is `<= surfaceY` (-1, meaning the character stands on top of the
-first block layer), Farm skips the empty-cell calculation and breaks exactly the block below.
-Once the character drops into the first hole (Y >= 0), normal shaft logic takes over.
-
-`Dig down` never uses `Mining.approach` or `Mining.inCell`: the character is already above the
-block, so it anchors in place and mines the block below. That keeps the shaft going instead of
-silently skipping every deep block.
-
-Excluded ores are not skipped when they block the shaft: if the block directly below is not in
-the ore selection, Farm clears it (`clear path`) before choosing a distant selected ore.
-
-## Digging position
-
-The bot always moves into the centre of the block it mines (`Movement.to(block.Position)`),
-holds `HumanoidRootPart` anchored during `BlockEvent`/`BlockMinedEvent`, then releases. No
-neighbour-cell heuristics and no `GetPartBoundsInBox` checks are used anymore: they were the main
-source of freezes and of the bot leaving the shaft.
-
-## Loot priority
-
-Loot order:
-
-- `{BlockName}_Drop` → resource name by stripping `_Drop`;
-- only drops whose resource is selected in the UI are collected;
-- higher `BasePrice` first, ties by distance.
-
-`Loot.collectAll` sorts every pass with this key before teleporting.
-
-## Loot-first rule
-
-Farm does not mine while any own selected drop exists:
-
-1. `Loot.sync()` fills `Loot.pending` with own selected drops from `workspace.TargetFilter`.
-2. `collectLoot` runs up to 6 rounds of `Loot.collectAll`, 0.1 s apart.
-3. If `Loot.count()` is still above zero, the tick ends and mining waits; the next tick retries.
-4. Mining resumes only when `Loot.count() == 0`.
-
-## Pickaxe and handle detection (current)
-
-`Mining.pickaxeInfo` tries, in order:
-
-1. attribute `ToolClass` (`Constants.ATTR_TOOL_TYPE`);
-2. tool name;
-3. any tool attribute value that matches a key in `Tools.Pickaxes`;
-4. any `StringValue` descendant value that matches a key;
-5. `Head` part material + color matching a pickaxe definition.
-
-`Mining.handleName` tries:
-
-1. attribute `WoodMaterial`;
-2. attributes `Handle`, `Wood`;
-3. any attribute or `StringValue` value matching a key in `Tools.ToolHandles`;
-4. handle name contained in the tool name;
-5. `Handle` part color matching a handle definition.
-
-Mine time remains `BaseMineTime * (100 - ToolSpeedModifier) / 100 * MineTimeModifier`, then
-`+ 0.05 + ping * 2 + random(0.02..0.09)`. Handles are not added again: the server already folds
-their buffs into `ToolSpeedModifier`.
+there until picked. The character teleports to the drop, waits for the touch, and repeats for the
+next drop; `lootSpawnWait` (0.3 s) after a block breaks gives the drop time to spawn.
 
 ## Cross-check: Delta decompile
 

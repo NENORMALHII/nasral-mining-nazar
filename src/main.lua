@@ -9,7 +9,7 @@ local RunService = game:GetService("RunService")
 ---------------------------------------------------------------------------
 
 local Config = {
-    loopDelay = 0.04,
+    loopDelay = 0.08,
 
     instantMove = false,
     tweenSpeed = 120,
@@ -31,27 +31,16 @@ local Config = {
     mushroomIgnore = 5,
 
     mineName = "Mine",
-    oreRange = 160,
-    oreCacheTime = 2,
-    depthWeight = 8,
-    shaftDig = true,
+    oreRange = 21,
 
     mineReachMargin = 4,
-    moveCooldown = 0.6,
-    moveSettleTime = 0.35,
+    moveCooldown = 0.5,
+    moveSettleTime = 0.25,
     moveSettleEpsilon = 0.2,
 
-    lootBatch = 4,
-    lootCollectRadius = 18,
-    lootGroupRadius = 8,
-    lootMoves = 2,
-    lootDwell = 0.18,
-    lootSpawnWait = 0.35,
-    lootSyncInterval = 0.5,
-
-    surfaceY = -1,
-    surfaceDig = true,
-
+    lootDwell = 0.12,
+    lootSpawnWait = 0.3,
+    lootSyncInterval = 0.4,
 
     blockEvent = "BlockEvent",
     minedEvent = "BlockMinedEvent",
@@ -177,7 +166,6 @@ Game.Handles = loadModule("Modules", "Tools", "ToolHandles")
 Game.attrMinePosition = (Game.Constants and Game.Constants.ATTR_MINE_POSITION) or "MinePosition"
 Game.attrWorldId = (Game.Constants and Game.Constants.ATTR_WORLD_ID) or "WorldId"
 
-local blockSize = (Game.Mine and Game.Mine.BLOCK_SIZE) or 7
 local blockOffsets = (Game.Mine and Game.Mine.OFFSETS) or {
     LEFT = Vector3.new(-1, 0, 0),
     RIGHT = Vector3.new(1, 0, 0),
@@ -186,8 +174,6 @@ local blockOffsets = (Game.Mine and Game.Mine.OFFSETS) or {
     FRONT = Vector3.new(0, 0, 1),
     BACK = Vector3.new(0, 0, -1),
 }
-
-local offsetOrder = { "UP", "FRONT", "BACK", "LEFT", "RIGHT", "DOWN" }
 
 ---------------------------------------------------------------------------
 -- Helpers
@@ -474,17 +460,28 @@ function Movement.to(character, position, speed)
     Movement.settle(character)
 end
 
+function Movement.jump(character, position)
+    local root = character.PrimaryPart
+    if not root then
+        return
+    end
+
+    Movement.release()
+    character:PivotTo(CFrame.new(position))
+    Movement.lastMoveAt = os.clock()
+end
+
 ---------------------------------------------------------------------------
--- Predictor (depth + seed based)
+-- Blocks (world <-> block coordinates)
 ---------------------------------------------------------------------------
 
-local Predictor = {}
+local Blocks = {}
 
 local BASE_X = 61.5
 local BASE_Z = -56.5
 local BASE_ALTITUDE = 7998.5
 
-function Predictor.toBlock(position)
+function Blocks.toBlock(position)
     return Vector3.new(
         math.floor((position.X - BASE_X) / 7 + 0.5),
         -math.floor((position.Y - BASE_ALTITUDE) / 7 + 0.5),
@@ -492,70 +489,14 @@ function Predictor.toBlock(position)
     )
 end
 
-function Predictor.seed()
-    if Predictor.value then
-        return Predictor.value
-    end
-
-    local sources = {
-        workspace,
-        workspace:FindFirstChild(Config.mineName),
-        ReplicatedStorage,
-    }
-
-    for _, instance in ipairs(sources) do
-        if instance then
-            for name, value in pairs(instance:GetAttributes()) do
-                if type(name) == "string" and name:lower():find("seed") then
-                    Predictor.value = tostring(value)
-                    break
-                end
-            end
-        end
-        if Predictor.value then
-            break
-        end
-    end
-
-    Predictor.value = Predictor.value
-        or ("w" .. tostring(Players.LocalPlayer:GetAttribute(Game.attrWorldId) or 0))
-
-    logPrint("predictor seed " .. Predictor.value)
-
-    return Predictor.value
-end
-
-function Predictor.hash(blockPosition)
-    local seed = Predictor.seed()
-    local value = 0
-
-    for index = 1, #seed do
-        value = (value * 31 + seed:byte(index)) % 2147483647
-    end
-
-    value = bit32.bxor(value, math.floor(blockPosition.X) * 73856093)
-    value = bit32.bxor(value, math.floor(blockPosition.Y) * 19349663)
-    value = bit32.bxor(value, math.floor(blockPosition.Z) * 83492791)
-
-    return value % 1000
-end
-
-function Predictor.worldOf(blockPosition)
-    return Vector3.new(
-        BASE_X + 7 * blockPosition.X,
-        BASE_ALTITUDE - 7 * blockPosition.Y,
-        BASE_Z + 7 * blockPosition.Z
-    )
-end
-
-function Predictor.blockBelow(worldPosition)
+function Blocks.below(worldPosition)
     local mine = workspace:FindFirstChild(Config.mineName)
     if not mine then
         return nil
     end
 
-    local blockPosition = Predictor.toBlock(worldPosition)
-    return mine:FindFirstChild(vec3ToString(blockPosition + Vector3.new(0, 1, 0)))
+    local cell = Blocks.toBlock(worldPosition) + Vector3.new(0, 1, 0)
+    return mine:FindFirstChild(vec3ToString(cell))
 end
 
 ---------------------------------------------------------------------------
@@ -565,6 +506,8 @@ end
 local Mining = {
     baseMineTime = Config.defaultMineTime,
 }
+
+local BLOCKED = { Oil = true, Lava = true, Grass = true, Void = true }
 
 local function colorOf(value)
     local kind = typeof(value)
@@ -604,10 +547,6 @@ local function normalizeName(value)
     end
 
     return text
-end
-
-local function escapePattern(text)
-    return (text:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0"))
 end
 
 local function matchTable(map, value)
@@ -661,26 +600,13 @@ end
 
 Mining.pickaxeAttrs = attrList(
     Game.Constants and Game.Constants.ATTR_TOOL_MATERIAL,
-    { "Material", "Pickaxe", "PickaxeType", "ToolType", "ToolClass" }
+    { "Material", "Pickaxe", "ToolClass" }
 )
 
 Mining.handleAttrs = attrList(
     Game.Constants and Game.Constants.ATTR_TOOL_WOOD_MATERIAL,
     { "WoodMaterial", "Handle", "Wood" }
 )
-
-local function attributeEntries(pickaxe, names)
-    local entries = {}
-
-    for _, name in ipairs(names) do
-        local value = pickaxe:GetAttribute(name)
-        if value ~= nil then
-            table.insert(entries, { name = name, value = value })
-        end
-    end
-
-    return entries
-end
 
 local function headPart(pickaxe)
     local head = pickaxe:FindFirstChild("Head")
@@ -697,265 +623,44 @@ local function headPart(pickaxe)
     return nil
 end
 
-local function findChildPath(root, names)
-    local current = root
-
-    for _, name in ipairs(names) do
-        if not current then
-            return nil
-        end
-        current = current:FindFirstChild(name)
-    end
-
-    return current
-end
-
-local function tooltipModules()
-    local scripts = Players.LocalPlayer:FindFirstChild("PlayerScripts")
-    if not scripts then
-        return {}
-    end
-
-    local modules = {}
-
-    for _, path in ipairs({
-        { "Modules", "Gui", "TooltipBuilder" },
-        { "Modules", "Gui", "Backpack", "Tooltip" },
-        { "Modules", "Gui", "NativeTooltip" },
-    }) do
-        local module = findChildPath(scripts, path)
-        if module and module:IsA("ModuleScript") then
-            table.insert(modules, module)
-        end
-    end
-
-    return modules
-end
-
-local function textOf(instance)
-    local ok, text = pcall(function()
-        return instance.Text
-    end)
-
-    if ok and type(text) == "string" and text ~= "" then
-        return text
-    end
-
-    ok, text = pcall(function()
-        return instance.ContentText
-    end)
-
-    if ok and type(text) == "string" and text ~= "" then
-        return text
-    end
-
-    return nil
-end
-
-local function collectText(value, out, depth)
-    if depth > 8 or #out > 120 then
-        return
-    end
-
-    local kind = typeof(value)
-
-    if kind == "string" then
-        if value ~= "" then
-            table.insert(out, value)
-        end
-        return
-    end
-
-    if kind == "number" then
-        table.insert(out, tostring(value))
-        return
-    end
-
-    if kind == "Instance" then
-        local text = textOf(value)
-        if text then
-            table.insert(out, text)
-        end
-
-        if value:IsA("GuiObject") then
-            for _, descendant in ipairs(value:GetDescendants()) do
-                local childText = textOf(descendant)
-                if childText then
-                    table.insert(out, childText)
-                end
-            end
-        end
-        return
-    end
-
-    if kind == "table" then
-        for key, item in pairs(value) do
-            if type(key) == "string" then
-                table.insert(out, key)
-            end
-            collectText(item, out, depth + 1)
-        end
-    end
-end
-
-local function tooltipText(pickaxe)
-    local chunks = {}
-
-    pcall(function()
-        local toolTip = pickaxe.ToolTip
-        if type(toolTip) == "string" and toolTip ~= "" then
-            table.insert(chunks, toolTip)
-        end
-    end)
-
-    pcall(function()
-        for _, module in ipairs(tooltipModules()) do
-            local ok, built = pcall(require, module)
-            if not ok or type(built) ~= "table" then
-                continue
-            end
-
-            for key, fn in pairs(built) do
-                if type(fn) ~= "function" or type(key) ~= "string" then
-                    continue
-                end
-
-                local lower = key:lower()
-                if not (lower:find("build") or lower:find("content") or lower:find("lines")) then
-                    continue
-                end
-
-                local okCall, result = pcall(fn, pickaxe)
-                if not okCall or result == nil then
-                    okCall, result = pcall(fn, pickaxe, 1)
-                end
-                if not okCall or result == nil then
-                    okCall, result = pcall(fn, { Tool = pickaxe }, 1)
-                end
-
-                if okCall and result ~= nil then
-                    collectText(result, chunks, 0)
-                end
-            end
-        end
-    end)
-
-    pcall(function()
-        local gui = Players.LocalPlayer:FindFirstChild("PlayerGui")
-        if not gui then
-            return
-        end
-
-        for _, object in ipairs(gui:GetDescendants()) do
-            if object.Name == "Tooltip" and object:IsA("GuiObject") and object.Visible then
-                for _, descendant in ipairs(object:GetDescendants()) do
-                    local text = textOf(descendant)
-                    if text then
-                        table.insert(chunks, text)
-                    end
-                end
-            end
-        end
-    end)
-
-    return table.concat(chunks, "\n")
-end
-
-local function pickaxeFromText(text)
-    if not Game.Pickaxes or text == "" then
-        return nil
-    end
-
-    local lower = text:lower()
-
-    for key in pairs(Game.Pickaxes) do
-        if lower:find(key:lower(), 1, true) then
-            return key
-        end
-    end
-
-    return nil
-end
-
-local function handleFromText(text)
-    if not Game.Handles or text == "" then
-        return nil
-    end
-
-    local lower = text:lower()
-
-    for key in pairs(Game.Pickaxes or {}) do
-        lower = lower:gsub(escapePattern(key:lower()), "")
-    end
-
-    for key in pairs(Game.Handles) do
-        local needle = key:lower()
-        if lower:find(needle .. " handle", 1, true)
-            or lower:find("handle " .. needle, 1, true)
-            or lower:find(needle .. " wood", 1, true)
-            or lower:find("wood " .. needle, 1, true) then
-            return key
-        end
-    end
-
-    for key in pairs(Game.Handles) do
-        local pattern = "%f[%a]" .. escapePattern(key:lower()) .. "%f[%A]"
-        if lower:find(pattern) then
-            return key
-        end
-    end
-
-    return nil
-end
-
-local function resolvePickaxe(pickaxe, text)
-    local entries = attributeEntries(pickaxe, Mining.pickaxeAttrs)
-    table.insert(entries, { name = "Name", value = pickaxe.Name })
-
-    for _, entry in ipairs(entries) do
-        local key = matchTable(Game.Pickaxes, entry.value)
+local function resolvePickaxe(pickaxe)
+    for _, attrName in ipairs(Mining.pickaxeAttrs) do
+        local key = matchTable(Game.Pickaxes, pickaxe:GetAttribute(attrName))
         if key then
-            return Game.Pickaxes[key], key, entry.name
+            return Game.Pickaxes[key], key, attrName
         end
+    end
+
+    local key = matchTable(Game.Pickaxes, pickaxe.Name)
+    if key then
+        return Game.Pickaxes[key], key, "name"
     end
 
     local head = headPart(pickaxe)
     if head and Game.Pickaxes then
-        for key, info in pairs(Game.Pickaxes) do
+        for name, info in pairs(Game.Pickaxes) do
             if info.Material == head.Material and colorMatches(info.Color, head.Color) then
-                return info, key, "head"
+                return info, name, "head"
             end
         end
-    end
-
-    local textKey = pickaxeFromText(text)
-    if textKey then
-        return Game.Pickaxes[textKey], textKey, "tooltip"
     end
 
     return nil
 end
 
-local function resolveHandle(pickaxe, text)
-    for _, entry in ipairs(attributeEntries(pickaxe, Mining.handleAttrs)) do
-        local key = matchTable(Game.Handles, entry.value)
+local function resolveHandle(pickaxe)
+    for _, attrName in ipairs(Mining.handleAttrs) do
+        local key = matchTable(Game.Handles, pickaxe:GetAttribute(attrName))
         if key then
-            return key, entry.name
+            return key, attrName
         end
     end
 
-    local textKey = handleFromText(text)
-    if textKey then
-        return textKey, "tooltip"
-    end
-
-    local handlePart = pickaxe:FindFirstChild("Handle")
-    if handlePart and handlePart:IsA("BasePart") and Game.Handles then
+    local part = pickaxe:FindFirstChild("Handle")
+    if part and part:IsA("BasePart") and Game.Handles then
         for key, info in pairs(Game.Handles) do
-            if colorMatches(info.Color, handlePart.Color) then
-                if info.Material == nil or info.Material == handlePart.Material then
-                    return key, "handle-part"
-                end
+            if colorMatches(info.Color, part.Color) then
+                return key, "handle-part"
             end
         end
     end
@@ -963,45 +668,45 @@ local function resolveHandle(pickaxe, text)
     return nil
 end
 
-local detectCache = setmetatable({}, { __mode = "k" })
-
-function Mining.signature(pickaxe)
+local function signature(pickaxe)
     local parts = { pickaxe.Name }
-    local attributes = pickaxe:GetAttributes()
-    local keys = {}
 
-    for key in pairs(attributes) do
-        table.insert(keys, key)
+    for _, attrName in ipairs(Mining.pickaxeAttrs) do
+        table.insert(parts, tostring(pickaxe:GetAttribute(attrName)))
     end
 
-    table.sort(keys)
-
-    for _, key in ipairs(keys) do
-        table.insert(parts, key .. "=" .. tostring(attributes[key]))
+    for _, attrName in ipairs(Mining.handleAttrs) do
+        table.insert(parts, tostring(pickaxe:GetAttribute(attrName)))
     end
 
     return table.concat(parts, "|")
 end
+
+local detectCache = setmetatable({}, { __mode = "k" })
 
 function Mining.detect(pickaxe)
     if not pickaxe then
         return nil
     end
 
-    local signature = Mining.signature(pickaxe)
+    local sig = signature(pickaxe)
     local cached = detectCache[pickaxe]
 
-    if cached and cached.signature == signature then
+    if cached and cached.signature == sig then
         return cached
     end
 
-    local result = {
-        signature = signature,
-        tooltip = tooltipText(pickaxe),
-    }
+    local info, pickaxeName, pickaxeSource = resolvePickaxe(pickaxe)
+    local handleName, handleSource = resolveHandle(pickaxe)
 
-    result.pickaxeInfo, result.pickaxeName, result.pickaxeSource = resolvePickaxe(pickaxe, result.tooltip)
-    result.handleName, result.handleSource = resolveHandle(pickaxe, result.tooltip)
+    local result = {
+        signature = sig,
+        pickaxeInfo = info,
+        pickaxeName = pickaxeName,
+        pickaxeSource = pickaxeSource,
+        handleName = handleName,
+        handleSource = handleSource,
+    }
 
     detectCache[pickaxe] = result
     return result
@@ -1014,11 +719,7 @@ function Mining.handleInfo(pickaxe)
     end
 
     local name = detected.handleName
-    if name and Game.Handles and Game.Handles[name] then
-        return Game.Handles[name], name, detected.handleSource
-    end
-
-    return nil, name, detected.handleSource
+    return name and Game.Handles and Game.Handles[name] or nil, name, detected.handleSource
 end
 
 function Mining.describe(pickaxe)
@@ -1027,17 +728,13 @@ function Mining.describe(pickaxe)
     end
 
     local parts = {}
-    local attributes = pickaxe:GetAttributes()
-    local keys = {}
 
-    for key in pairs(attributes) do
-        table.insert(keys, key)
+    for _, attrName in ipairs(Mining.pickaxeAttrs) do
+        table.insert(parts, ("%s=%s"):format(attrName, tostring(pickaxe:GetAttribute(attrName))))
     end
 
-    table.sort(keys)
-
-    for _, key in ipairs(keys) do
-        table.insert(parts, key .. "=" .. tostring(attributes[key]))
+    for _, attrName in ipairs(Mining.handleAttrs) do
+        table.insert(parts, ("%s=%s"):format(attrName, tostring(pickaxe:GetAttribute(attrName))))
     end
 
     return table.concat(parts, " ")
@@ -1222,8 +919,7 @@ function Mining.valid(block)
         return "bedrock"
     end
 
-    local blocked = { Oil = true, Lava = true, Grass = true, Void = true }
-    if blocked[name] then
+    if BLOCKED[name] then
         return "blocked"
     end
 
@@ -1254,10 +950,6 @@ function Mining.why(block)
     return nil
 end
 
-function Mining.allowed(block)
-    return Mining.why(block) == nil
-end
-
 function Mining.reach()
     return math.max(8, Mining.maxDistance() - Config.mineReachMargin)
 end
@@ -1268,14 +960,6 @@ function Mining.inRange(character, block)
         return false
     end
     return (block.Position - root.Position).Magnitude <= Mining.reach()
-end
-
-function Mining.surface(character)
-    local root = character and character.PrimaryPart
-    if not root then
-        return false
-    end
-    return Predictor.toBlock(root.Position).Y <= Config.surfaceY
 end
 
 function Mining.mine(character, block)
@@ -1298,28 +982,14 @@ function Mining.mine(character, block)
         return false
     end
 
-    local modifier = resourceInfo(typeOf(block))
-    modifier = modifier and modifier.MineTimeModifier or 1
-
-    local speedAttr = Players.LocalPlayer:GetAttribute("ToolSpeedModifier") or 0
-    local baseMine = Mining.mineTime(block)
-    local ping = Ping.sample()
-    local jitter = math.random() * (Config.mineJitterMax - Config.mineJitterMin) + Config.mineJitterMin
-    local safety = Config.mineSafetyBase + ping * Config.mineSafetyPingMult
-    local waitTime = baseMine + safety + jitter
+    local waitTime = Mining.waitTime(block)
     local preSwing = Mining.preSwingDelay()
     local swing = Mining.swingDelay()
 
-    logPrint(("mine %s type=%s base=%.2f speed=%s mod=%.2f ping=%.3f mine=%.3f safety=%.3f jitter=%.3f wait=%.3f preSwing=%.3f swing=%.3f"):format(
+    logPrint(("mine %s (%s) base=%.2f wait=%.2f pre=%.2f swing=%.2f"):format(
         block.Name,
         tostring(typeOf(block)),
         Mining.baseMineTime,
-        tostring(speedAttr),
-        modifier,
-        ping,
-        baseMine,
-        safety,
-        jitter,
         waitTime,
         preSwing,
         swing
@@ -1367,19 +1037,12 @@ end
 
 local Ores = {}
 
-local cache = {}
-local cacheTime = 0
-local lastWarning = 0
-local ignored = {}
 local namesCache
-local selectionKey
+local ignored = {}
 
 function Ores.price(name)
     local info = resourceInfo(name)
-    if info and info.BasePrice then
-        return info.BasePrice
-    end
-    return 0
+    return info and info.BasePrice or 0
 end
 
 function Ores.names()
@@ -1408,142 +1071,127 @@ end
 function Ores.bindSelection(selection, names)
     Ores.selection = selection
     Ores.namesList = names
-    Ores.invalidate()
+end
+
+local selectionCache = { time = 0 }
+
+function Ores.selectedSet()
+    local selection = Ores.selection
+    if not selection then
+        return nil
+    end
+
+    local indices = selection.getSelected() or {}
+    local keyParts = {}
+
+    for _, index in ipairs(indices) do
+        table.insert(keyParts, tostring(index))
+    end
+
+    local key = table.concat(keyParts, ",")
+    local now = os.clock()
+
+    if selectionCache.set and selectionCache.key == key and now - selectionCache.time < 0.5 then
+        return selectionCache.set
+    end
+
+    local set = {}
+
+    for _, index in ipairs(indices) do
+        local name = Ores.namesList[index]
+        if name then
+            set[name] = true
+        end
+    end
+
+    selectionCache.set = set
+    selectionCache.key = key
+    selectionCache.time = now
+    return set
 end
 
 function Ores.isSelected(name)
-    local selection = Ores.selection
-    if not selection then
+    local set = Ores.selectedSet()
+    if not set then
         return true
     end
 
-    local indices = selection.getSelected()
-    if #indices == 0 then
-        return false
-    end
-
-    for _, index in ipairs(indices) do
-        if Ores.namesList[index] == name then
-            return true
-        end
-    end
-
-    return false
+    return set[name] == true
 end
 
-function Ores.checkSelection()
-    local selection = Ores.selection
-    if not selection then
-        return
+local scanCache = {}
+
+-- Scans only the block cells around the player instead of every child of Workspace.Mine.
+function Ores.nearest(position, radius)
+    local limit = radius or Config.oreRange
+    local center = Blocks.toBlock(position)
+    local now = os.clock()
+
+    if scanCache.cell == center and now - scanCache.time < 0.3
+        and (scanCache.best == nil or scanCache.best.Parent) then
+        return scanCache.best
     end
-
-    local indices = selection.getSelected()
-    local parts = {}
-
-    for _, index in ipairs(indices) do
-        table.insert(parts, tostring(index))
-    end
-
-    table.sort(parts)
-    local key = table.concat(parts, ",")
-
-    if key ~= selectionKey then
-        selectionKey = key
-        Ores.invalidate()
-    end
-end
-
-local function formatReasons(reasons)
-    local parts = {}
-
-    for reason, count in pairs(reasons) do
-        table.insert(parts, ("%s=%d"):format(reason, count))
-    end
-
-    table.sort(parts)
-    return table.concat(parts, " ")
-end
-
-function Ores.refresh()
-    cache = {}
-    cacheTime = os.clock()
 
     local mine = workspace:FindFirstChild(Config.mineName)
     if not mine then
-        logWarn("mine not found")
-        return
+        return nil
     end
 
-    local blocks = mine:GetChildren()
-    local reasons = {}
+    local reach = math.ceil(limit / 7)
+    local selected = Ores.selectedSet()
+    local best, bestScore
 
-    for _, block in ipairs(blocks) do
-        local name = typeOf(block)
-        local reason = Mining.valid(block)
+    for dx = -reach, reach do
+        for dy = -reach, reach do
+            for dz = -reach, reach do
+                local cell = center + Vector3.new(dx, dy, dz)
+                local block = mine:FindFirstChild(vec3ToString(cell))
 
-        if not reason and not Ores.isSelected(name or "") then
-            reason = "notSelected"
-        end
+                if block then
+                    local untilIgnore = ignored[block]
+                    local distance = (block.Position - position).Magnitude
 
-        if reason then
-            reasons[reason] = (reasons[reason] or 0) + 1
-        else
-            table.insert(cache, block)
-        end
-    end
+                    if distance <= limit and (not untilIgnore or untilIgnore <= now) then
+                        local name = typeOf(block)
 
-    logPrint(("ores: blocks=%d cached=%d %s"):format(#blocks, #cache, formatReasons(reasons)))
+                        if name and (not selected or selected[name]) and Mining.valid(block) == nil then
+                            local score = Ores.price(name) * 1000 - distance
 
-    if #cache == 0 and os.clock() - lastWarning > 10 then
-        lastWarning = os.clock()
-        warn(("[ores] 0 targets, blocks=%d, reasons: %s"):format(#blocks, formatReasons(reasons)))
-    end
-end
-
-function Ores.nearest(position, maxDistance)
-    if os.clock() - cacheTime > Config.oreCacheTime then
-        Ores.refresh()
-    end
-
-    local limit = maxDistance or Config.oreRange
-    local best, bestDistance, bestScore
-    local now = os.clock()
-    local playerBlock = Predictor.toBlock(position)
-
-    for _, block in ipairs(cache) do
-        local untilIgnore = ignored[block]
-
-        if (not untilIgnore or untilIgnore <= now) and block.Parent then
-            local name = typeOf(block)
-
-            if name and Ores.isSelected(name) and Mining.valid(block) == nil then
-                local distance = (block.Position - position).Magnitude
-
-                if distance <= limit then
-                    local blockPosition = block:GetAttribute(Game.attrMinePosition)
-                    local price = Ores.price(name)
-                    local depth = blockPosition and math.max(0, blockPosition.Y - playerBlock.Y) or 0
-                    local score = price
-                        + depth * Config.depthWeight
-                        + Predictor.hash(blockPosition or block.Position) / 1000
-
-                    if not best or score > bestScore then
-                        best, bestDistance, bestScore = block, distance, score
+                            if not bestScore or score > bestScore then
+                                best, bestScore = block, score
+                            end
+                        end
                     end
                 end
             end
         end
     end
 
-    return best, bestDistance
+    scanCache.time = now
+    scanCache.cell = center
+    scanCache.best = best
+    return best
 end
 
 function Ores.ignore(block)
     ignored[block] = os.clock() + 5
+    scanCache.time = 0
+    scanCache.best = nil
 end
 
-function Ores.invalidate()
-    cacheTime = 0
+function Ores.count()
+    local set = Ores.selectedSet()
+    if not set then
+        return #Ores.names()
+    end
+
+    local total = 0
+
+    for _ in pairs(set) do
+        total += 1
+    end
+
+    return total
 end
 
 ---------------------------------------------------------------------------
@@ -1560,24 +1208,49 @@ function Loot.container()
     return workspace:FindFirstChild("TargetFilter") or workspace:FindFirstChild("Drops")
 end
 
+local partCache = setmetatable({}, { __mode = "k" })
+local ownerCache = setmetatable({}, { __mode = "k" })
+
 function Loot.part(drop)
+    local cached = partCache[drop]
+    if cached and cached.Parent then
+        return cached
+    end
+
+    local part
+
     if drop:IsA("BasePart") then
-        return drop
-    end
-
-    for _, child in ipairs(drop:GetChildren()) do
-        if child:IsA("BasePart") then
-            return child
+        part = drop
+    else
+        for _, child in ipairs(drop:GetChildren()) do
+            if child:IsA("BasePart") then
+                part = child
+                break
+            end
         end
+
+        part = part or drop:FindFirstChildWhichIsA("BasePart", true)
     end
 
-    return drop:FindFirstChildWhichIsA("BasePart", true)
+    partCache[drop] = part
+    return part
 end
 
 function Loot.playerValue(drop)
+    local cached = ownerCache[drop]
+    if cached ~= nil then
+        return cached
+    end
+
     local dropScript = drop:FindFirstChild("DropScript", true)
     local playerValue = dropScript and dropScript:FindFirstChild("Player")
-    return playerValue and playerValue.Value
+    local value = playerValue and playerValue.Value
+
+    if value ~= nil then
+        ownerCache[drop] = value
+    end
+
+    return value
 end
 
 function Loot.mine(drop)
@@ -1647,27 +1320,9 @@ function Loot.remove(drop)
     end
 end
 
-function Loot.nearest(position)
-    local best, bestDistance
-
-    for _, drop in ipairs(Loot.pending) do
-        if drop.Parent then
-            local part = Loot.part(drop)
-            if part then
-                local distance = (part.Position - position).Magnitude
-                if not bestDistance or distance < bestDistance then
-                    best, bestDistance = drop, distance
-                end
-            end
-        end
-    end
-
-    return best, bestDistance
-end
-
--- Collects only drops that are close to the player. Never chases a drop across the map:
--- one teleport per cluster, maximum Config.lootMoves moves per call.
-function Loot.collectNearby(character, radius)
+-- Loot has priority over mining: teleports straight to every own selected drop,
+-- waits for the touch, then returns. No radius limit, no grouping.
+function Loot.collectAll(character)
     Loot.sync(true)
 
     local root = character.PrimaryPart
@@ -1675,48 +1330,32 @@ function Loot.collectNearby(character, radius)
         return 0
     end
 
-    local limit = radius or Config.lootCollectRadius
+    table.sort(Loot.pending, function(a, b)
+        return Ores.price(Loot.name(a)) > Ores.price(Loot.name(b))
+    end)
+
     local picked = 0
-    local moves = 0
-    local idle = 0
+    local index = 1
 
-    while true do
-        local count = #Loot.pending
-        if count == 0 then
-            break
-        end
+    while index <= #Loot.pending do
+        local drop = Loot.pending[index]
 
-        local drop, distance = Loot.nearest(root.Position)
-        if not drop or not distance or distance > limit then
-            break
-        end
+        if not drop.Parent then
+            Loot.remove(drop)
+        else
+            local part = Loot.part(drop)
 
-        if distance > Config.lootGroupRadius then
-            if moves >= Config.lootMoves then
-                break
+            if part then
+                Movement.jump(character, part.Position)
+                task.wait(Config.lootDwell)
             end
 
-            local part = Loot.part(drop)
-            if not part then
+            if not drop.Parent then
                 Loot.remove(drop)
                 picked += 1
             else
-                Movement.to(character, part.Position)
-                moves += 1
+                index += 1
             end
-        end
-
-        task.wait(Config.lootDwell)
-        Loot.sync(true)
-
-        if #Loot.pending >= count then
-            idle += 1
-            if idle >= 2 or moves >= Config.lootMoves then
-                break
-            end
-        else
-            picked += count - #Loot.pending
-            idle = 0
         end
     end
 
@@ -1772,47 +1411,47 @@ local FarmMode = Mode.new("Farm", function(self)
         return
     end
 
-    local root = character.PrimaryPart
-    if not root then
+    if not character.PrimaryPart then
         return
     end
 
-    Ores.checkSelection()
+    -- 1. Loot first: teleport to every own drop immediately.
+    Loot.sync(true)
 
-    Loot.sync()
+    if Loot.count() > 0 then
+        Loot.collectAll(character)
 
-    if Loot.count() >= Config.lootBatch then
-        Loot.collectNearby(character, Config.lootCollectRadius)
-    end
-
-    local function mine(block, label)
-        if not block or not block.Parent then
-            return false
-        end
-        if not Mining.inRange(character, block) then
-            return false
-        end
-
-        local pickaxe = Mining.prepare(character)
-        if not pickaxe then
-            logWarn("no pickaxe")
-            return false
-        end
-
-        -- Do not start a new block right after a teleport: the server treats a
-        -- position change plus BlockEvent in the same tick as suspicious.
+        -- Do not fire BlockEvent in the same tick as a loot teleport.
         if Movement.lastMoveAt then
             local elapsed = os.clock() - Movement.lastMoveAt
+
             if elapsed < Config.moveCooldown then
                 task.wait(Config.moveCooldown - elapsed)
             end
         end
+    end
 
-        if not self.enabled then
+    if not self.enabled then
+        return
+    end
+
+    local root = character.PrimaryPart
+
+    local function mine(block)
+        if not block or not block.Parent then
             return false
         end
 
-        logPrint(("%s %s (%s)"):format(label, block.Name, tostring(typeOf(block))))
+        if not Mining.inRange(character, block) then
+            return false
+        end
+
+        if not Mining.prepare(character) then
+            logWarn("no pickaxe")
+            return false
+        end
+
+        logPrint(("mine %s (%s)"):format(block.Name, tostring(typeOf(block))))
 
         Movement.hold(character)
         local ok, result = pcall(Mining.mine, character, block)
@@ -1822,44 +1461,31 @@ local FarmMode = Mode.new("Farm", function(self)
             return false
         end
 
-        Ores.invalidate()
         task.wait(Config.lootSpawnWait)
         return true
     end
 
-    -- Mine only what is already in reach. No teleport to the ore.
+    -- 2. Mine the best selected block already in reach. No movement.
     local ore = Ores.nearest(root.Position, Mining.reach())
+
     if ore then
-        if not mine(ore, "ore") then
+        if not mine(ore) then
             Ores.ignore(ore)
         end
         return
     end
 
-    -- Nothing reachable: dig straight down, one block at a time.
-    local below = Predictor.blockBelow(root.Position)
+    -- 3. Nothing reachable: dig straight down, one block at a time.
+    local below = Blocks.below(root.Position)
+
     if not below then
-        -- shaft is open under the feet, gravity takes the character down
         Movement.waitLanded(character)
-        task.wait(0.15)
         return
     end
 
-    local label = "dig"
-    if Config.surfaceDig and Mining.surface(character) then
-        label = "surface"
-    elseif not Ores.isSelected(typeOf(below) or "") then
-        label = "clear"
+    if mine(below) then
+        Movement.waitLanded(character)
     end
-
-    if not mine(below, label) then
-        Ores.ignore(below)
-        return
-    end
-
-    -- The block under the feet is gone: let the character fall into the new
-    -- cell and land before the next BlockEvent.
-    Movement.waitLanded(character)
 end, Movement.cancel)
 
 ---------------------------------------------------------------------------
@@ -1972,12 +1598,7 @@ function Ui.stats()
     local handle, handleName, handleSource = Mining.handleInfo(pickaxe)
     local player = Players.LocalPlayer
 
-    local selected = 0
-    for _, name in ipairs(Ores.names()) do
-        if Ores.isSelected(name) then
-            selected += 1
-        end
-    end
+    local selected = Ores.count()
 
     return {
         pickaxe = ("%s | %s | tier %s | base %.2fs (%s)"):format(
@@ -2004,7 +1625,7 @@ function Ui.stats()
         state = ("ores %d | loot %d | depth %s | mine %s"):format(
             selected,
             Loot.count(),
-            tostring(Predictor.toBlock(character.PrimaryPart.Position).Y),
+            tostring(Blocks.toBlock(character.PrimaryPart.Position).Y),
             workspace:FindFirstChild(Config.mineName) and "ok" or "missing"
         ),
     }
@@ -2060,15 +1681,6 @@ function Ui.create()
         desc = "teleport instead of tween",
         callback = function(state)
             Config.instantMove = state
-        end,
-    })
-
-    movePanel:AddToggle({
-        title = "Dig down",
-        desc = "dig the block below when no selected ore is near",
-        checked = Config.shaftDig,
-        callback = function(state)
-            Config.shaftDig = state
         end,
     })
 
@@ -2297,7 +1909,6 @@ task.spawn(function()
     end
 
     local detected = pickaxe and Mining.detect(pickaxe)
-    local info = detected and detected.pickaxeInfo
     local handle, handleName, handleSource = Mining.handleInfo(pickaxe)
     print(("[main] player world=%s toolspeed=%s pickaxe=%s base=%s (%s) handle=%s (%s)"):format(
         tostring(Players.LocalPlayer:GetAttribute(Game.attrWorldId)),
