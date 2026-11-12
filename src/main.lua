@@ -23,18 +23,16 @@ local Config = {
 
     mineName = "Mine",
     oreRange = 160,
-    oreCacheTime = 1,
+    oreCacheTime = 2,
     depthWeight = 8,
     shaftDig = true,
     lootDwell = 0.12,
     lootAttempts = 2,
     lootSpawnWait = 0.35,
+    lootSyncInterval = 0.5,
 
     surfaceY = -1,
     surfaceDig = true,
-    minCellY = 0,
-    minSolidNeighbors = 3,
-    safeSearchRadius = 3,
 
 
     blockEvent = "BlockEvent",
@@ -415,94 +413,6 @@ function Predictor.blockBelow(worldPosition)
 end
 
 ---------------------------------------------------------------------------
--- Position (keep the character inside the mine cavity)
----------------------------------------------------------------------------
-
-local Position = {}
-
-function Position.mine()
-    return workspace:FindFirstChild(Config.mineName)
-end
-
-function Position.empty(cell, mine)
-    return mine:FindFirstChild(vec3ToString(cell)) == nil
-end
-
-function Position.solidCount(cell, mine)
-    local count = 0
-
-    for _, key in ipairs(offsetOrder) do
-        local offset = blockOffsets[key]
-        if offset and mine:FindFirstChild(vec3ToString(cell + offset)) then
-            count += 1
-        end
-    end
-
-    return count
-end
-
-function Position.safe(cell, mine)
-    if cell.Y < Config.minCellY then
-        return false
-    end
-    if not Position.empty(cell, mine) then
-        return false
-    end
-    return Position.solidCount(cell, mine) >= Config.minSolidNeighbors
-end
-
-function Position.nearestSafe(worldPosition, radius)
-    local mine = Position.mine()
-    if not mine then
-        return nil
-    end
-
-    local origin = Predictor.toBlock(worldPosition)
-    local best, bestDistance
-
-    for dx = -radius, radius do
-        for dy = -radius, radius do
-            for dz = -radius, radius do
-                local cell = origin + Vector3.new(dx, dy, dz)
-                if Position.safe(cell, mine) then
-                    local distance = (cell - origin).Magnitude
-                    if not bestDistance or distance < bestDistance then
-                        best, bestDistance = cell, distance
-                    end
-                end
-            end
-        end
-    end
-
-    return best
-end
-
-function Position.enforce(character)
-    local root = character and character.PrimaryPart
-    local mine = Position.mine()
-    if not root or not mine then
-        return false
-    end
-
-    local cell = Predictor.toBlock(root.Position)
-    if cell.Y <= Config.surfaceY then
-        return true
-    end
-
-    if Position.safe(cell, mine) then
-        return true
-    end
-
-    local safe = Position.nearestSafe(root.Position, Config.safeSearchRadius)
-    if not safe then
-        return false
-    end
-
-    character:PivotTo(CFrame.new(Predictor.worldOf(safe)))
-    return true
-end
-
----------------------------------------------------------------------------
 -- Mining
 ---------------------------------------------------------------------------
 
@@ -664,7 +574,7 @@ function Mining.besideLiquid(block)
     return false
 end
 
-function Mining.why(block)
+function Mining.valid(block)
     if not block.Parent then
         return "parent"
     end
@@ -698,6 +608,15 @@ function Mining.why(block)
         return "dug"
     end
 
+    return nil
+end
+
+function Mining.why(block)
+    local reason = Mining.valid(block)
+    if reason then
+        return reason
+    end
+
     if Mining.besideLiquid(block) then
         return "liquid"
     end
@@ -725,24 +644,15 @@ function Mining.surface(character)
     return Predictor.toBlock(root.Position).Y <= Config.surfaceY
 end
 
-function Mining.mine(character, block, skipCell)
+function Mining.mine(character, block)
     local reason = Mining.why(block)
     if reason then
         logWarn(("skip %s: %s"):format(block.Name, reason))
         return false
     end
 
-    if not skipCell then
-        Position.enforce(character)
-    end
-
     if not Mining.inRange(character, block) then
         logWarn("out of range " .. block.Name)
-        return false
-    end
-
-    if not skipCell and not Mining.inCell(character) then
-        logWarn("not between blocks " .. block.Name)
         return false
     end
 
@@ -783,72 +693,6 @@ function Mining.mine(character, block, skipCell)
     return true
 end
 
-local overlapParams = OverlapParams.new()
-overlapParams.FilterType = Enum.RaycastFilterType.Include
-
-function Mining.inCell(character)
-    local root = character and character.PrimaryPart
-    local mine = workspace:FindFirstChild(Config.mineName)
-    if not root or not mine then
-        return false
-    end
-
-    local cell = Predictor.toBlock(root.Position)
-    if not Position.safe(cell, mine) then
-        return false
-    end
-
-    overlapParams.FilterDescendantsInstances = { mine }
-    local parts = workspace:GetPartBoundsInBox(
-        CFrame.new(root.Position),
-        Vector3.new(1, 1, 1),
-        overlapParams
-    )
-
-    return #parts == 0
-end
-
-function Mining.solidNeighbors(blockPosition, mine)
-    local count = 0
-
-    for _, key in ipairs(offsetOrder) do
-        local offset = blockOffsets[key]
-        if offset and mine:FindFirstChild(vec3ToString(blockPosition + offset)) then
-            count += 1
-        end
-    end
-
-    return count
-end
-
-function Mining.approach(block)
-    local position = block:GetAttribute(Game.attrMinePosition)
-    local mine = workspace:FindFirstChild(Config.mineName)
-    if not position or not mine then
-        return nil
-    end
-
-    local best, bestCount
-
-    for _, key in ipairs(offsetOrder) do
-        local offset = blockOffsets[key]
-        local cell = offset and position + offset
-
-        if cell and Position.safe(cell, mine) then
-            local count = Mining.solidNeighbors(cell, mine)
-            if not bestCount or count > bestCount then
-                best, bestCount = cell, count
-            end
-        end
-    end
-
-    if not best then
-        return nil
-    end
-
-    return Predictor.worldOf(best)
-end
-
 ---------------------------------------------------------------------------
 -- Ores
 ---------------------------------------------------------------------------
@@ -858,8 +702,9 @@ local Ores = {}
 local cache = {}
 local cacheTime = 0
 local lastWarning = 0
-local selected = {}
 local ignored = {}
+local namesCache
+local selectionKey
 
 function Ores.price(name)
     local info = resourceInfo(name)
@@ -870,13 +715,15 @@ function Ores.price(name)
 end
 
 function Ores.names()
+    if namesCache then
+        return namesCache
+    end
+
     local names = {}
-    local seen = {}
 
     if Game.Resources then
         for name, info in pairs(Game.Resources) do
-            if type(info) == "table" and info.Natural and not seen[name] then
-                seen[name] = true
+            if type(info) == "table" and info.Natural then
                 table.insert(names, name)
             end
         end
@@ -886,50 +733,65 @@ function Ores.names()
         return Ores.price(a) > Ores.price(b)
     end)
 
+    namesCache = names
     return names
 end
 
 function Ores.bindSelection(selection, names)
     Ores.selection = selection
     Ores.namesList = names
-end
-
-local function currentNames()
-    local selection = Ores.selection
-    if selection and Ores.namesList then
-        local indices = selection.getSelected()
-        if #indices > 0 then
-            local names = {}
-            for _, index in ipairs(indices) do
-                local name = Ores.namesList[index]
-                if name then
-                    table.insert(names, name)
-                end
-            end
-            return names
-        end
-    end
-    return selected
+    Ores.invalidate()
 end
 
 function Ores.isSelected(name)
-    local names = currentNames()
-    if #names == 0 then
+    local selection = Ores.selection
+    if not selection then
         return true
     end
-    for _, entry in ipairs(names) do
-        if entry == name then
+
+    local indices = selection.getSelected()
+    if #indices == 0 then
+        return false
+    end
+
+    for _, index in ipairs(indices) do
+        if Ores.namesList[index] == name then
             return true
         end
     end
+
     return false
+end
+
+function Ores.checkSelection()
+    local selection = Ores.selection
+    if not selection then
+        return
+    end
+
+    local indices = selection.getSelected()
+    local parts = {}
+
+    for _, index in ipairs(indices) do
+        table.insert(parts, tostring(index))
+    end
+
+    table.sort(parts)
+    local key = table.concat(parts, ",")
+
+    if key ~= selectionKey then
+        selectionKey = key
+        Ores.invalidate()
+    end
 end
 
 local function formatReasons(reasons)
     local parts = {}
+
     for reason, count in pairs(reasons) do
         table.insert(parts, ("%s=%d"):format(reason, count))
     end
+
     table.sort(parts)
     return table.concat(parts, " ")
 end
@@ -949,7 +811,7 @@ function Ores.refresh()
 
     for _, block in ipairs(blocks) do
         local name = typeOf(block)
-        local reason = Mining.why(block)
+        local reason = Mining.valid(block)
 
         if not reason and not Ores.isSelected(name or "") then
             reason = "notSelected"
@@ -981,21 +843,24 @@ function Ores.nearest(position)
 
     for _, block in ipairs(cache) do
         local untilIgnore = ignored[block]
-        if not untilIgnore or untilIgnore <= now then
-            local distance = (block.Position - position).Magnitude
-            if distance <= Config.oreRange then
-                local blockPosition = block:GetAttribute(Game.attrMinePosition)
-                local price = Ores.price(typeOf(block))
-                local depth = 0
 
-                if blockPosition then
-                    depth = math.max(0, blockPosition.Y - playerBlock.Y)
-                end
+        if (not untilIgnore or untilIgnore <= now) and block.Parent then
+            local name = typeOf(block)
 
-                local score = price + depth * Config.depthWeight + Predictor.hash(blockPosition or block.Position) / 1000
+            if name and Ores.isSelected(name) and Mining.valid(block) == nil then
+                local distance = (block.Position - position).Magnitude
 
-                if not best or score > bestScore then
-                    best, bestDistance, bestScore = block, distance, score
+                if distance <= Config.oreRange then
+                    local blockPosition = block:GetAttribute(Game.attrMinePosition)
+                    local price = Ores.price(name)
+                    local depth = blockPosition and math.max(0, blockPosition.Y - playerBlock.Y) or 0
+                    local score = price
+                        + depth * Config.depthWeight
+                        + Predictor.hash(blockPosition or block.Position) / 1000
+
+                    if not best or score > bestScore then
+                        best, bestDistance, bestScore = block, distance, score
+                    end
                 end
             end
         end
@@ -1019,6 +884,7 @@ end
 local Loot = {
     pending = {},
     pendingSet = {},
+    lastSync = 0,
 }
 
 function Loot.container()
@@ -1066,7 +932,12 @@ function Loot.count()
     return #Loot.pending
 end
 
-function Loot.sync()
+function Loot.sync(force)
+    if not force and os.clock() - Loot.lastSync < Config.lootSyncInterval then
+        return
+    end
+    Loot.lastSync = os.clock()
+
     local container = Loot.container()
     if not container then
         Loot.pending = {}
@@ -1215,138 +1086,81 @@ local FarmMode = Mode.new("Farm", function(self)
         return
     end
 
-    Loot.sync()
+    Ores.checkSelection()
 
-    local function collectLoot()
-        for _ = 1, 6 do
-            if Loot.count() == 0 then
-                return true
-            end
-            Loot.collectAll(character)
-            if Loot.count() == 0 then
-                return true
-            end
-            task.wait(0.1)
-        end
-        return Loot.count() == 0
-    end
+    Loot.sync(true)
 
     if Loot.count() > 0 then
-        collectLoot()
+        for _ = 1, 3 do
+            Loot.collectAll(character)
+            if Loot.count() == 0 then
+                break
+            end
+            task.wait(0.05)
+        end
+
         if Loot.count() > 0 then
             logPrint("waiting for loot " .. Loot.count())
-            task.wait(0.1)
+            task.wait(0.05)
             return
         end
     end
 
-    if Config.surfaceDig and Mining.surface(character) then
-        local target = Predictor.blockBelow(root.Position)
-        if target and Mining.prepare(character) then
-            logPrint("surface break " .. target.Name)
-            Movement.hold(character)
-            local ok = pcall(Mining.mine, character, target, true)
-            Movement.releaseHold()
-            if ok then
-                task.wait(Config.lootSpawnWait)
-                Loot.sync()
-                Loot.collectAll(character)
-            end
-        else
-            task.wait(0.2)
+    local function mineBlock(block, label)
+        if not block or not block.Parent then
+            return false
         end
+        if not Mining.prepare(character) then
+            logWarn("no pickaxe")
+            return false
+        end
+
+        logPrint(label .. " " .. block.Name .. " (" .. tostring(typeOf(block)) .. ")")
+
+        Movement.to(character, block.Position)
+
+        if not self.enabled then
+            return false
+        end
+
+        Movement.hold(character)
+        local ok, result = pcall(Mining.mine, character, block)
+        Movement.releaseHold()
+
+        if ok and result then
+            Ores.invalidate()
+            task.wait(Config.lootSpawnWait)
+            Loot.sync(true)
+            Loot.collectAll(character)
+            return true
+        end
+
+        return false
+    end
+
+    if Config.surfaceDig and Mining.surface(character) then
+        mineBlock(Predictor.blockBelow(root.Position), "surface")
         return
     end
 
     local shaftBlock = Predictor.blockBelow(root.Position)
     if shaftBlock and not Ores.isSelected(typeOf(shaftBlock) or "") then
-        if Mining.prepare(character) then
-            logPrint("clear path " .. shaftBlock.Name .. " (" .. tostring(typeOf(shaftBlock)) .. ")")
-            Movement.hold(character)
-            local ok = pcall(Mining.mine, character, shaftBlock, true)
-            Movement.releaseHold()
-            if ok then
-                task.wait(Config.lootSpawnWait)
-                Loot.sync()
-                Loot.collectAll(character)
-            end
+        mineBlock(shaftBlock, "clear path")
+        return
+    end
+
+    local ore = Ores.nearest(root.Position)
+    if ore then
+        if not mineBlock(ore, "target") then
+            Ores.ignore(ore)
         end
         return
     end
 
-    local ore, oreDistance = Ores.nearest(root.Position)
-
-    local function DigOnlyDown()
-        if not Config.shaftDig then
-            return false
-        end
-
-        local below = Predictor.blockBelow(root.Position)
-        if not below or not Mining.prepare(character) then
-            return false
-        end
-
-        logPrint("dig down " .. below.Name)
-        Movement.hold(character)
-        local dug = pcall(Mining.mine, character, below, true)
-        Movement.releaseHold()
-        return dug
-    end
-
-    if not ore then
-        if not DigOnlyDown() then
-            task.wait(0.2)
-        end
-        return
-    end
-
-    if not Mining.prepare(character) then
-        logWarn("no pickaxe")
-        task.wait(0.3)
-        return
-    end
-
-    logPrint(("target %s type=%s dist=%.1f price=%d"):format(
-        ore.Name,
-        tostring(typeOf(ore)),
-        oreDistance,
-        Ores.price(typeOf(ore))
-    ))
-
-    local stand = Mining.approach(ore)
-    if not stand then
-        logWarn("no empty cell next to " .. ore.Name .. ", digging down")
-        Ores.ignore(ore)
-        DigOnlyDown()
-        return
-    end
-
-    Movement.to(character, stand)
-
-    if not self.enabled then
-        return
-    end
-
-    if not Mining.inCell(character) then
-        logWarn("not in a cell, skipping " .. ore.Name)
-        Ores.ignore(ore)
-        return
-    end
-
-    Movement.hold(character)
-    local mined, result = pcall(Mining.mine, character, ore)
-    Movement.releaseHold()
-
-    if not mined then
-        logWarn("mine error: " .. tostring(result))
-        Ores.ignore(ore)
-    elseif result then
-        Ores.invalidate()
-        task.wait(Config.lootSpawnWait)
-        Loot.sync()
-        Loot.collectAll(character)
+    if Config.shaftDig then
+        mineBlock(shaftBlock, "dig down")
     else
-        Ores.ignore(ore)
+        task.wait(0.1)
     end
 end, Movement.cancel)
 
@@ -1452,6 +1266,55 @@ function Ui.load()
     return loadstring(game:HttpGet("https://raw.githubusercontent.com/cueshut/saves/main/compact"))()
 end
 
+function Ui.stats()
+    local character = Character.get()
+    local pickaxe = Character.getPickaxe(character)
+    local info = pickaxe and Mining.pickaxeInfo(pickaxe)
+    local handle, handleName = pickaxe and Mining.handleInfo(pickaxe)
+    local player = Players.LocalPlayer
+
+    local selected = 0
+    for _, name in ipairs(Ores.names()) do
+        if Ores.isSelected(name) then
+            selected += 1
+        end
+    end
+
+    return {
+        pickaxe = ("%s | tier %s | base %ss"):format(
+            pickaxe and pickaxe.Name or "none",
+            tostring(info and info.Tier or "?"),
+            tostring(info and info.BaseMineTime or Mining.baseMineTime)
+        ),
+        handle = ("%s | speed %s | luck %s | double %s"):format(
+            tostring(handleName or "?"),
+            tostring(handle and handle.SpeedModifier or 0),
+            tostring(handle and handle.LuckModifier or 0),
+            tostring(handle and handle.DoubleDropChanceModifier or 0)
+        ),
+        player = ("world %s | toolspeed %s | luck %s | double %s"):format(
+            tostring(player:GetAttribute(Game.attrWorldId)),
+            tostring(player:GetAttribute("ToolSpeedModifier")),
+            tostring(player:GetAttribute("Luck")),
+            tostring(player:GetAttribute("DoubleDropChance"))
+        ),
+        state = ("ores %d | loot %d | depth %s | mine %s"):format(
+            selected,
+            Loot.count(),
+            tostring(Predictor.toBlock(character.PrimaryPart.Position).Y),
+            workspace:FindFirstChild(Config.mineName) and "ok" or "missing"
+        ),
+    }
+end
+
+function Ui.printStats()
+    local stats = Ui.stats()
+    print("[em2] pickaxe: " .. stats.pickaxe)
+    print("[em2] handle: " .. stats.handle)
+    print("[em2] player: " .. stats.player)
+    print("[em2] state: " .. stats.state)
+end
+
 function Ui.create()
     local library = Ui.load()
     local window = library.init("nazar mining 2", "v1.1.0", "NM2_MAIN")
@@ -1531,14 +1394,47 @@ function Ui.create()
     selection.setSelected(defaults)
     Ores.bindSelection(selection, names)
 
-    local debugPanel = main:AddSeperator("Debug")
-    debugPanel:AddToggle({
+    local debugTab = window:AddTab("Debug", "stats and logs")
+    local statsPanel = debugTab:AddSeperator("Stats")
+
+    local pickaxeInput = statsPanel:AddTextInput({ title = "Pickaxe" })
+    local handleInput = statsPanel:AddTextInput({ title = "Handle" })
+    local playerInput = statsPanel:AddTextInput({ title = "Player" })
+    local stateInput = statsPanel:AddTextInput({ title = "State" })
+
+    local logPanel = debugTab:AddSeperator("Logs")
+    logPanel:AddToggle({
         title = "Verbose logs",
         desc = "print ore reasons and mining steps",
         callback = function(state)
             Log.enabled = state
         end,
     })
+
+    logPanel:AddButton({
+        title = "Print stats",
+        callback = function()
+            Ui.printStats()
+        end,
+    })
+
+    task.spawn(function()
+        while true do
+            task.wait(2)
+
+            local ok = pcall(function()
+                local stats = Ui.stats()
+                pickaxeInput.setText(stats.pickaxe)
+                handleInput.setText(stats.handle)
+                playerInput.setText(stats.player)
+                stateInput.setText(stats.state)
+            end)
+
+            if not ok then
+                break
+            end
+        end
+    end)
 
     modeDropdown.setSelected(1)
 

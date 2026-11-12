@@ -188,19 +188,12 @@ silently skipping every deep block.
 Excluded ores are not skipped when they block the shaft: if the block directly below is not in
 the ore selection, Farm clears it (`clear path`) before choosing a distant selected ore.
 
-## Staying inside the cavity
+## Digging position
 
-`Position` keeps the character inside the mine:
-
-- `Position.safe(cell)` = cell is empty (no block at those coordinates), `cell.Y >= minCellY` (0)
-  and at least `minSolidNeighbors` (3) of the 6 neighbours are solid.
-- `Position.nearestSafe(worldPos, radius)` scans a cube of blocks around the position and returns
-  the closest safe cell.
-- `Position.enforce(character)` snaps the character to `Predictor.worldOf(safeCell)` if the
-  current cell is not safe. The surface (`Y <= surfaceY`) is the only exception.
-- `Mining.approach` only returns safe cells; `Mining.inCell` reuses the same rule.
-- Loot pickup does not filter by distance: every own selected drop is attempted. It moves to the nearest safe cell around the drop (tween or instant according to `Movement`
-  settings), falling back to the drop position if none is found.
+The bot always moves into the centre of the block it mines (`Movement.to(block.Position)`),
+holds `HumanoidRootPart` anchored during `BlockEvent`/`BlockMinedEvent`, then releases. No
+neighbour-cell heuristics and no `GetPartBoundsInBox` checks are used anymore: they were the main
+source of freezes and of the bot leaving the shaft.
 
 ## Loot priority
 
