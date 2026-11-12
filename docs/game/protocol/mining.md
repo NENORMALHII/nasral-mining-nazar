@@ -93,6 +93,24 @@ so teleporting to the block centre was unnecessary and caused `BlockMinedEvent` 
   `BlockEvent`, so mining never starts in the same tick as a position change.
 - `HumanoidRootPart` is anchored only during the `BlockEvent`/`BlockMinedEvent` window.
 
+## Surface shafts
+
+While the player is on the surface (`Blocks.toBlock(root.Position).Y < surfaceDepth = 2`),
+Farm does not dig a fresh hole blindly:
+
+1. `Surface.choose(position)` scans columns in a `±8` block square around the player.
+2. `Surface.depth(mine, cell)` counts empty cells from `y = 0` down to the first solid block,
+   capped at `surfaceMaxDepth = 12`.
+3. The deepest column with `depth >= surfaceMinDepth = 2` wins; ties are broken by distance.
+4. The result is stored in `Surface.remembered` and re-validated on every call, so a mine reset
+   or a filled hole invalidates it.
+5. If the player is not above the remembered column, `Movement.jump` moves them once to
+   `Surface.standPoint(shaft)` — the empty cell above `y = 0`. The character then falls into the
+   shaft and normal digging continues.
+
+Negative scans are cached for 1 s per block cell, so a surface without pits does not rescan the
+area every tick.
+
 ## Client modes
 
 - `FarmMode` — loot first, then the best selected block in reach, otherwise dig straight down.

@@ -47,7 +47,7 @@ legacy/                   old scripts kept for reference
 
 - Luau, simple and minimal. No globals, no speculative abstractions.
 - `pcall` around every long-running loop.
-- Cross-cutting code as local module tables: `Config`, `Ping`, `Log`, `Game`, `Mode`, `Character`, `Movement`, `Blocks`, `Mining`, `Ores`, `Loot`, `Ui`.
+- Cross-cutting code as local module tables: `Config`, `Ping`, `Log`, `Game`, `Mode`, `Character`, `Movement`, `Blocks`, `Surface`, `Mining`, `Ores`, `Loot`, `Ui`.
 - Lua files `snake_case.lua`, docs `kebab-case.md`, dumps lowercase.
 - UI only through `vendor/uilib`. Load it with `readfile`, fall back to the upstream URL.
 - Paths in scripts are relative to the repo root.

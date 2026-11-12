@@ -35,6 +35,11 @@ local Config = {
 
     mineReachMargin = 4,
     moveCooldown = 0.5,
+
+    surfaceDepth = 2,
+    surfaceScanRadius = 8,
+    surfaceMaxDepth = 12,
+    surfaceMinDepth = 2,
     moveSettleTime = 0.25,
     moveSettleEpsilon = 0.2,
 
@@ -489,6 +494,14 @@ function Blocks.toBlock(position)
     )
 end
 
+function Blocks.worldOf(cell)
+    return Vector3.new(
+        BASE_X + 7 * cell.X,
+        BASE_ALTITUDE - 7 * cell.Y,
+        BASE_Z + 7 * cell.Z
+    )
+end
+
 function Blocks.below(worldPosition)
     local mine = workspace:FindFirstChild(Config.mineName)
     if not mine then
@@ -497,6 +510,93 @@ function Blocks.below(worldPosition)
 
     local cell = Blocks.toBlock(worldPosition) + Vector3.new(0, 1, 0)
     return mine:FindFirstChild(vec3ToString(cell))
+end
+
+---------------------------------------------------------------------------
+-- Surface shafts
+---------------------------------------------------------------------------
+
+local Surface = {
+    remembered = nil,
+    lastCell = nil,
+    lastScan = 0,
+}
+
+-- Number of empty cells from the top layer down to the first solid block.
+function Surface.depth(mine, cell)
+    local depth = 0
+
+    for y = 0, Config.surfaceMaxDepth - 1 do
+        local block = mine:FindFirstChild(vec3ToString(Vector3.new(cell.X, y, cell.Z)))
+        if block then
+            return depth
+        end
+        depth += 1
+    end
+
+    return depth
+end
+
+-- Remembers the deepest open column around the player. The remembered shaft is
+-- re-validated on every call, so a mine reset or a filled hole invalidates it.
+function Surface.choose(position)
+    local mine = workspace:FindFirstChild(Config.mineName)
+    if not mine then
+        return nil
+    end
+
+    if Surface.remembered then
+        local depth = Surface.depth(mine, Surface.remembered.cell)
+
+        if depth >= Config.surfaceMinDepth then
+            Surface.remembered.depth = depth
+            return Surface.remembered
+        end
+
+        Surface.remembered = nil
+    end
+
+    local center = Blocks.toBlock(position)
+
+    if Surface.lastCell == center and os.clock() - Surface.lastScan < 1 then
+        return nil
+    end
+
+    Surface.lastCell = center
+    Surface.lastScan = os.clock()
+
+    local radius = Config.surfaceScanRadius
+    local best, bestDepth, bestDistance
+
+    for dx = -radius, radius do
+        for dz = -radius, radius do
+            local cell = Vector3.new(center.X + dx, 0, center.Z + dz)
+            local depth = Surface.depth(mine, cell)
+
+            if depth >= Config.surfaceMinDepth then
+                local distance = (Blocks.worldOf(cell) - position).Magnitude
+
+                if not bestDepth
+                    or depth > bestDepth
+                    or (depth == bestDepth and distance < bestDistance) then
+                    best, bestDepth, bestDistance = cell, depth, distance
+                end
+            end
+        end
+    end
+
+    if not best then
+        return nil
+    end
+
+    Surface.remembered = { cell = best, depth = bestDepth }
+    logPrint(("surface shaft %s depth=%d"):format(vec3ToString(best), bestDepth))
+    return Surface.remembered
+end
+
+-- World position of the empty cell directly above a shaft column.
+function Surface.standPoint(shaft)
+    return Blocks.worldOf(shaft.cell + Vector3.new(0, -1, 0))
 end
 
 ---------------------------------------------------------------------------
@@ -1420,14 +1520,14 @@ local FarmMode = Mode.new("Farm", function(self)
 
     if Loot.count() > 0 then
         Loot.collectAll(character)
+    end
 
-        -- Do not fire BlockEvent in the same tick as a loot teleport.
-        if Movement.lastMoveAt then
-            local elapsed = os.clock() - Movement.lastMoveAt
+    -- Do not fire BlockEvent in the same tick as any teleport.
+    if Movement.lastMoveAt then
+        local elapsed = os.clock() - Movement.lastMoveAt
 
-            if elapsed < Config.moveCooldown then
-                task.wait(Config.moveCooldown - elapsed)
-            end
+        if elapsed < Config.moveCooldown then
+            task.wait(Config.moveCooldown - elapsed)
         end
     end
 
@@ -1465,7 +1565,30 @@ local FarmMode = Mode.new("Farm", function(self)
         return true
     end
 
-    -- 2. Mine the best selected block already in reach. No movement.
+    -- 2. On the surface: pick the deepest existing shaft and reuse it.
+    if Blocks.toBlock(root.Position).Y < Config.surfaceDepth then
+        local shaft = Surface.choose(root.Position)
+
+        if shaft then
+            local cell = Blocks.toBlock(root.Position)
+
+            if cell.X ~= shaft.cell.X or cell.Z ~= shaft.cell.Z then
+                Movement.jump(character, Surface.standPoint(shaft))
+                return
+            end
+
+            local below = Blocks.below(root.Position)
+
+            if below and not mine(below) then
+                Ores.ignore(below)
+            end
+
+            Movement.waitLanded(character)
+            return
+        end
+    end
+
+    -- 3. Mine the best selected block already in reach. No movement.
     local ore = Ores.nearest(root.Position, Mining.reach())
 
     if ore then
@@ -1475,7 +1598,7 @@ local FarmMode = Mode.new("Farm", function(self)
         return
     end
 
-    -- 3. Nothing reachable: dig straight down, one block at a time.
+    -- 4. Nothing reachable: dig straight down, one block at a time.
     local below = Blocks.below(root.Position)
 
     if not below then
