@@ -16,6 +16,8 @@ local Config = {
     moveStopDistance = 2.5,
 
     mineTimeSafety = 0.05,
+    mineJitterMin = 0.02,
+    mineJitterMax = 0.09,
     mineRejectGrace = 0.6,
 
     mushroomDelay = 0.35,
@@ -455,37 +457,87 @@ function Mining.pickaxeInfo(pickaxe)
         return nil
     end
 
-    local className = pickaxe:GetAttribute("ToolClass") or pickaxe.Name
-    return Game.Pickaxes[className]
+    local attrName = (Game.Constants and Game.Constants.ATTR_TOOL_TYPE) or "ToolClass"
+    local candidates = {
+        pickaxe:GetAttribute(attrName),
+        pickaxe.Name,
+    }
+
+    for _, value in pairs(pickaxe:GetAttributes()) do
+        table.insert(candidates, value)
+    end
+
+    for _, descendant in ipairs(pickaxe:GetDescendants()) do
+        if descendant:IsA("StringValue") then
+            table.insert(candidates, descendant.Value)
+        end
+    end
+
+    for _, value in ipairs(candidates) do
+        if type(value) == "string" and Game.Pickaxes[value] then
+            return Game.Pickaxes[value], value
+        end
+    end
+
+    local head = pickaxe:FindFirstChild("Head")
+    if head and head:IsA("BasePart") then
+        for name, info in pairs(Game.Pickaxes) do
+            if info.Material == head.Material then
+                local color = info.Color
+                if typeof(color) == "BrickColor" then
+                    color = color.Color
+                end
+                if color and (color - head.Color).Magnitude < 0.05 then
+                    return info, name
+                end
+            end
+        end
+    end
+
+    return nil
 end
 
 function Mining.handleName(pickaxe)
-    if not pickaxe then
+    if not pickaxe or not Game.Handles then
         return nil
     end
 
     local attrName = (Game.Constants and Game.Constants.ATTR_TOOL_WOOD_MATERIAL) or "WoodMaterial"
-    local name = pickaxe:GetAttribute(attrName)
+    local candidates = {
+        pickaxe:GetAttribute(attrName),
+        pickaxe:GetAttribute("Handle"),
+        pickaxe:GetAttribute("Wood"),
+        pickaxe.Name,
+    }
 
-    if type(name) ~= "string" then
-        name = pickaxe:GetAttribute("Handle") or pickaxe:GetAttribute("Wood")
-    end
-
-    if type(name) == "string" then
-        return name
+    for _, value in pairs(pickaxe:GetAttributes()) do
+        table.insert(candidates, value)
     end
 
     for _, descendant in ipairs(pickaxe:GetDescendants()) do
         local lower = descendant.Name:lower()
         if descendant:IsA("StringValue") and (lower:find("wood") or lower:find("handle")) then
-            return descendant.Value
+            table.insert(candidates, descendant.Value)
         end
     end
 
-    if Game.Handles then
-        for handle in pairs(Game.Handles) do
-            if pickaxe.Name:find(handle, 1, true) then
-                return handle
+    for _, value in ipairs(candidates) do
+        if type(value) == "string" and Game.Handles[value] then
+            return value
+        end
+    end
+
+    for handleName, info in pairs(Game.Handles) do
+        if pickaxe.Name:find(handleName, 1, true) then
+            return handleName
+        end
+    end
+
+    local handlePart = pickaxe:FindFirstChild("Handle")
+    if handlePart and handlePart:IsA("BasePart") then
+        for handleName, info in pairs(Game.Handles) do
+            if info.Color and (info.Color - handlePart.Color).Magnitude < 0.05 then
+                return handleName
             end
         end
     end
@@ -530,15 +582,16 @@ function Mining.prepare(character)
         Mining.rebound = false
         Mining.bind(pickaxe)
 
-        local info = Mining.pickaxeInfo(pickaxe)
+        local info, pickaxeName = Mining.pickaxeInfo(pickaxe)
         if info and type(info.BaseMineTime) == "number" then
             Mining.baseMineTime = info.BaseMineTime
         end
 
         local _, handleName = Mining.handleInfo(pickaxe)
         Mining.handle = handleName
-        logPrint(("pickaxe %s base=%.2f handle=%s"):format(
+        logPrint(("pickaxe %s class=%s base=%.2f handle=%s"):format(
             pickaxe.Name,
+            tostring(pickaxeName),
             Mining.baseMineTime,
             tostring(handleName)
         ))
@@ -576,7 +629,8 @@ function Mining.waitTime(block)
         ping = math.min(value, 0.5)
     end
 
-    return Mining.mineTime(block) + Config.mineTimeSafety + ping * 2
+    local jitter = math.random() * (Config.mineJitterMax - Config.mineJitterMin) + Config.mineJitterMin
+    return Mining.mineTime(block) + Config.mineTimeSafety + ping * 2 + jitter
 end
 
 function Mining.maxDistance()
@@ -629,7 +683,7 @@ function Mining.valid(block)
 
     local world = block:GetAttribute(Game.attrWorldId)
     local playerWorld = Players.LocalPlayer:GetAttribute(Game.attrWorldId)
-    if playerWorld ~= nil and tostring(world) ~= tostring(playerWorld) then
+    if tostring(world) ~= tostring(playerWorld) then
         return "world"
     end
 
@@ -694,9 +748,14 @@ function Mining.mine(character, block)
         return false
     end
 
-    logPrint(("mine %s type=%s wait=%.2f"):format(
+    local modifier = resourceInfo(typeOf(block))
+    modifier = modifier and modifier.MineTimeModifier or 1
+    logPrint(("mine %s type=%s base=%.2f toolspeed=%s mod=%.2f wait=%.2f"):format(
         block.Name,
         tostring(typeOf(block)),
+        Mining.baseMineTime,
+        tostring(Players.LocalPlayer:GetAttribute("ToolSpeedModifier")),
+        modifier,
         Mining.waitTime(block)
     ))
 
@@ -715,7 +774,7 @@ function Mining.mine(character, block)
     end
 
     if block.Parent then
-        blockEvent:FireServer(block.Name, { dug = false })
+        blockEvent:FireServer(vec3ToString(position), { dug = false })
         logWarn("server rejected " .. block.Name .. " (" .. tostring(typeOf(block)) .. ")")
         return false
     end

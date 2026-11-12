@@ -19,7 +19,8 @@ docs/game/
 
 | File | Script path |
 |---|---|
-| `minescript.lua` | `Workspace.<player>.Pick.MineScript` |
+| `minescript.lua` | `Workspace.<player>.Pick.MineScript` (Lynx) |
+| `local-pickaxe-mining.lua` | same script, Delta decompile, confirms protocol |
 | `mining-mine.lua` | `ReplicatedStorage.Modules.Mining.Mine` |
 | `mining-types.lua` | `ReplicatedStorage.Modules.Mining.Types` |
 | `commonutils.lua` | `ReplicatedStorage.Modules.CommonUtils` |

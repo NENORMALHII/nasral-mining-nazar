@@ -213,3 +213,40 @@ Farm does not mine while any own selected drop exists:
 2. `collectLoot` runs up to 6 rounds of `Loot.collectAll`, 0.1 s apart.
 3. If `Loot.count()` is still above zero, the tick ends and mining waits; the next tick retries.
 4. Mining resumes only when `Loot.count() == 0`.
+
+## Pickaxe and handle detection
+
+`Mining.pickaxeInfo` tries, in order:
+
+1. attribute `ToolClass` (`Constants.ATTR_TOOL_TYPE`);
+2. tool name;
+3. any tool attribute value that matches a key in `Tools.Pickaxes`;
+4. any `StringValue` descendant value that matches a key;
+5. `Head` part material + color matching a pickaxe definition.
+
+`Mining.handleName` tries:
+
+1. attribute `WoodMaterial`;
+2. attributes `Handle`, `Wood`;
+3. any attribute or `StringValue` value matching a key in `Tools.ToolHandles`;
+4. handle name contained in the tool name;
+5. `Handle` part color matching a handle definition.
+
+Mine time remains `BaseMineTime * (100 - ToolSpeedModifier) / 100 * MineTimeModifier`, then
+`+ 0.05 + ping * 2 + random(0.02..0.09)`. Handles are not added again: the server already folds
+their buffs into `ToolSpeedModifier`.
+
+## Cross-check: Delta decompile
+
+`decompiled/local-pickaxe-mining.lua` is the same `MineScript` decompiled by Delta. It confirms:
+
+- start `BlockEvent:FireServer(block.Name, { dug = true })`;
+- finish `BlockMinedEvent:FireServer({ blockName = vec3_tostring(MinePosition) })`;
+- cancel `BlockEvent:FireServer(vec3_tostring(MinePosition), { dug = false })` — the cancel argument
+  is `MinePosition`, not `block.Name`;
+- mine time `base * (100 - ToolSpeedModifier)/100 * MineTimeModifier`, with client fallback base `10`
+  until the first `UpdatePickaxe`;
+- `MaxDistance` is read once on equip;
+- no extra validation beyond type, range, `MinePosition`, world id, `Dug`, liquid.
+
+The bot sends the cancel with `MinePosition` and compares `WorldId` strictly (`tostring` both sides).
