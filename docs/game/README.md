@@ -30,6 +30,7 @@ docs/game/
 | `tools-toolhandles.lua` | `ReplicatedStorage.Modules.Tools.ToolHandles` |
 | `forge-client.lua` | `PlayerGui.Forge.Container.Content.ForgeClient` |
 | `fuel-data.lua` | `ReplicatedStorage.Scripts.FuelData` |
+| `inventory-backpack.lua` | `ReplicatedStorage.Modules.Inventory.Backpack` (Delta) |
 
 ## protocol/
 

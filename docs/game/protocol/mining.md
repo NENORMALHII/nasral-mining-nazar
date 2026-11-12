@@ -214,7 +214,7 @@ Farm does not mine while any own selected drop exists:
 3. If `Loot.count()` is still above zero, the tick ends and mining waits; the next tick retries.
 4. Mining resumes only when `Loot.count() == 0`.
 
-## Pickaxe and handle detection
+## Pickaxe and handle detection (current)
 
 `Mining.pickaxeInfo` tries, in order:
 
@@ -250,3 +250,49 @@ their buffs into `ToolSpeedModifier`.
 - no extra validation beyond type, range, `MinePosition`, world id, `Dug`, liquid.
 
 The bot sends the cancel with `MinePosition` and compares `WorldId` strictly (`tostring` both sides).
+
+
+## Stat sources
+
+Only two numbers change the mine wait:
+
+- `BaseMineTime` — sent by the server in `UpdatePickaxe` (`Players.<player>.Backpack.Pick.UpdatePickaxe`).
+  Never call `FireServer` on it. Client fallback before the first event is `10`.
+- `ToolSpeedModifier` — attribute of `LocalPlayer`, already includes pickaxe tier, handle buffs and upgrades.
+
+The pickaxe tool instance is named `Pick`, not `Stone Pickaxe`. The real type and handle are in
+attributes listed by `Modules.Inventory.Backpack`:
+
+```lua
+local v_u_7 = {
+    v_u_3.ATTR_ITEM_COUNT,
+    v_u_3.ATTR_TOOL_MATERIAL,        -- pickaxe head material
+    v_u_3.ATTR_TOOL_WOOD_MATERIAL,   -- handle material
+    v_u_3.ATTR_TOOL_RESOURCE_TYPE,
+}
+```
+
+Detection order in `src/main.lua`:
+
+| Value | Sources |
+|---|---|
+| pickaxe | `ATTR_TOOL_MATERIAL` (fuzzy), tool name, `Head` part material + color, tooltip text |
+| handle | `ATTR_TOOL_WOOD_MATERIAL` only (fuzzy), tooltip text, `Handle` part color + material |
+
+Attribute matching normalizes names: lowercase, drops `pickaxe`, `pick`, `axe`, `wood`, `wooden`,
+`handle`, removes punctuation. So `Material = "Stone"` maps to `Stone Pickaxe` and
+`WoodMaterial = "Oak Wood"` maps to `Oak`.
+
+Important: `Stone` is both a legitimate handle and the head material of `Stone Pickaxe`. A blind
+scan of every tool attribute therefore misidentifies the handle. Handles are read only from
+`ATTR_TOOL_WOOD_MATERIAL` (plus tooltip and part color), never from `Material`.
+
+Tooltip fallback: `Mining.tooltipText` reads `Tool.ToolTip`, tries the game's
+`TooltipBuilder`/`Backpack.Tooltip`/`NativeTooltip` modules, and scans visible `Tooltip` frames.
+Any returned table/string is flattened and searched for a `Tools.Pickaxes` key and for
+`"<handle> handle"`/`"<handle> wood"` phrases. Results are cached per tool signature.
+
+Base time preference: server `UpdatePickaxe` value, then `Tools.Pickaxes[key].BaseMineTime`,
+then `Config.defaultMineTime`. The bot forces one unequip/equip after binding so the server event
+is received, waits up to 6 heartbeats, and logs
+`pickaxe ready base=... source=server|table|default handle=...`.

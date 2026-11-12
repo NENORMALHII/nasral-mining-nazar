@@ -99,14 +99,28 @@ end
 
 local Game = {}
 
-pcall(function()
-    local modules = ReplicatedStorage:WaitForChild("Modules")
-    Game.Resources = require(modules:WaitForChild("Resources"))
-    Game.Mine = require(modules:WaitForChild("Mining"):WaitForChild("Mine"))
-    Game.Constants = require(modules:WaitForChild("Constants"))
-    Game.Pickaxes = require(modules:WaitForChild("Tools"):WaitForChild("Pickaxes"))
-    Game.Handles = require(modules:WaitForChild("Tools"):WaitForChild("ToolHandles"))
-end)
+local function loadModule(...)
+    local path = { ... }
+
+    local ok, module = pcall(function()
+        local current = ReplicatedStorage
+        for _, name in ipairs(path) do
+            current = current:WaitForChild(name)
+        end
+        return require(current)
+    end)
+
+    if ok then
+        return module
+    end
+    return nil
+end
+
+Game.Resources = loadModule("Modules", "Resources")
+Game.Mine = loadModule("Modules", "Mining", "Mine")
+Game.Constants = loadModule("Modules", "Constants")
+Game.Pickaxes = loadModule("Modules", "Tools", "Pickaxes")
+Game.Handles = loadModule("Modules", "Tools", "ToolHandles")
 
 Game.attrMinePosition = (Game.Constants and Game.Constants.ATTR_MINE_POSITION) or "MinePosition"
 Game.attrWorldId = (Game.Constants and Game.Constants.ATTR_WORLD_ID) or "WorldId"
@@ -452,118 +466,529 @@ local Mining = {
     baseMineTime = Config.defaultMineTime,
 }
 
-function Mining.pickaxeInfo(pickaxe)
-    if not Game.Pickaxes or not pickaxe then
+local function colorOf(value)
+    local kind = typeof(value)
+
+    if kind == "BrickColor" then
+        return value.Color
+    end
+
+    if kind == "Color3" then
+        return value
+    end
+
+    return nil
+end
+
+local function colorMatches(a, b)
+    local left = colorOf(a)
+    local right = colorOf(b)
+    return left ~= nil and right ~= nil and (left - right).Magnitude < 0.08
+end
+
+local function normalizeName(value)
+    if type(value) ~= "string" then
         return nil
     end
 
-    local attrName = (Game.Constants and Game.Constants.ATTR_TOOL_TYPE) or "ToolClass"
-    local candidates = {
-        pickaxe:GetAttribute(attrName),
-        pickaxe.Name,
-    }
+    local text = value:lower()
 
-    for _, value in pairs(pickaxe:GetAttributes()) do
-        table.insert(candidates, value)
+    for _, word in ipairs({ "pickaxe", "pick", "axe", "wooden", "wood", "handle" }) do
+        text = text:gsub(word, "")
     end
 
-    for _, descendant in ipairs(pickaxe:GetDescendants()) do
-        if descendant:IsA("StringValue") then
-            table.insert(candidates, descendant.Value)
+    text = text:gsub("[^%a%d]", "")
+
+    if text == "" then
+        return nil
+    end
+
+    return text
+end
+
+local function escapePattern(text)
+    return (text:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0"))
+end
+
+local function matchTable(map, value)
+    if not map or type(value) ~= "string" or value == "" then
+        return nil
+    end
+
+    if map[value] then
+        return value
+    end
+
+    local target = normalizeName(value)
+    if not target then
+        return nil
+    end
+
+    for key in pairs(map) do
+        if normalizeName(key) == target then
+            return key
         end
     end
 
-    for _, value in ipairs(candidates) do
-        if type(value) == "string" and Game.Pickaxes[value] then
-            return Game.Pickaxes[value], value
+    for key in pairs(map) do
+        local normalized = normalizeName(key)
+
+        if normalized and #normalized > 2 then
+            if normalized:find(target, 1, true) or target:find(normalized, 1, true) then
+                return key
+            end
         end
     end
 
+    return nil
+end
+
+local function attrList(constant, fallback)
+    local names = {}
+
+    if type(constant) == "string" and constant ~= "" then
+        table.insert(names, constant)
+    end
+
+    for _, name in ipairs(fallback) do
+        if not table.find(names, name) then
+            table.insert(names, name)
+        end
+    end
+
+    return names
+end
+
+Mining.pickaxeAttrs = attrList(
+    Game.Constants and Game.Constants.ATTR_TOOL_MATERIAL,
+    { "Material", "Pickaxe", "PickaxeType", "ToolType", "ToolClass" }
+)
+
+Mining.handleAttrs = attrList(
+    Game.Constants and Game.Constants.ATTR_TOOL_WOOD_MATERIAL,
+    { "WoodMaterial", "Handle", "Wood" }
+)
+
+local function attributeEntries(pickaxe, names)
+    local entries = {}
+
+    for _, name in ipairs(names) do
+        local value = pickaxe:GetAttribute(name)
+        if value ~= nil then
+            table.insert(entries, { name = name, value = value })
+        end
+    end
+
+    return entries
+end
+
+local function headPart(pickaxe)
     local head = pickaxe:FindFirstChild("Head")
     if head and head:IsA("BasePart") then
-        for name, info in pairs(Game.Pickaxes) do
-            if info.Material == head.Material then
-                local color = info.Color
-                if typeof(color) == "BrickColor" then
-                    color = color.Color
-                end
-                if color and (color - head.Color).Magnitude < 0.05 then
-                    return info, name
-                end
-            end
+        return head
+    end
+
+    for _, child in ipairs(pickaxe:GetChildren()) do
+        if child:IsA("BasePart") and child.Name ~= "Handle" then
+            return child
         end
     end
 
     return nil
 end
 
-function Mining.handleName(pickaxe)
-    if not pickaxe or not Game.Handles then
-        return nil
+local function findChildPath(root, names)
+    local current = root
+
+    for _, name in ipairs(names) do
+        if not current then
+            return nil
+        end
+        current = current:FindFirstChild(name)
     end
 
-    local attrName = (Game.Constants and Game.Constants.ATTR_TOOL_WOOD_MATERIAL) or "WoodMaterial"
-    local candidates = {
-        pickaxe:GetAttribute(attrName),
-        pickaxe:GetAttribute("Handle"),
-        pickaxe:GetAttribute("Wood"),
-        pickaxe.Name,
-    }
+    return current
+end
 
-    for _, value in pairs(pickaxe:GetAttributes()) do
-        table.insert(candidates, value)
+local function tooltipModules()
+    local scripts = Players.LocalPlayer:FindFirstChild("PlayerScripts")
+    if not scripts then
+        return {}
     end
 
-    for _, descendant in ipairs(pickaxe:GetDescendants()) do
-        local lower = descendant.Name:lower()
-        if descendant:IsA("StringValue") and (lower:find("wood") or lower:find("handle")) then
-            table.insert(candidates, descendant.Value)
+    local modules = {}
+
+    for _, path in ipairs({
+        { "Modules", "Gui", "TooltipBuilder" },
+        { "Modules", "Gui", "Backpack", "Tooltip" },
+        { "Modules", "Gui", "NativeTooltip" },
+    }) do
+        local module = findChildPath(scripts, path)
+        if module and module:IsA("ModuleScript") then
+            table.insert(modules, module)
         end
     end
 
-    for _, value in ipairs(candidates) do
-        if type(value) == "string" and Game.Handles[value] then
-            return value
-        end
+    return modules
+end
+
+local function textOf(instance)
+    local ok, text = pcall(function()
+        return instance.Text
+    end)
+
+    if ok and type(text) == "string" and text ~= "" then
+        return text
     end
 
-    for handleName, info in pairs(Game.Handles) do
-        if pickaxe.Name:find(handleName, 1, true) then
-            return handleName
-        end
-    end
+    ok, text = pcall(function()
+        return instance.ContentText
+    end)
 
-    local handlePart = pickaxe:FindFirstChild("Handle")
-    if handlePart and handlePart:IsA("BasePart") then
-        for handleName, info in pairs(Game.Handles) do
-            if info.Color and (info.Color - handlePart.Color).Magnitude < 0.05 then
-                return handleName
-            end
-        end
+    if ok and type(text) == "string" and text ~= "" then
+        return text
     end
 
     return nil
 end
 
-function Mining.handleInfo(pickaxe)
-    local name = Mining.handleName(pickaxe)
-    if name and Game.Handles and Game.Handles[name] then
-        return Game.Handles[name], name
-    end
-    return nil, name
-end
-
-function Mining.bind(pickaxe)
-    local remote = pickaxe:FindFirstChild(Config.pickaxeRemote)
-    if not remote then
+local function collectText(value, out, depth)
+    if depth > 8 or #out > 120 then
         return
     end
 
-    remote.OnClientEvent:Connect(function(data)
-        if typeof(data) == "table" and type(data.BaseMineTime) == "number" then
-            Mining.baseMineTime = data.BaseMineTime
+    local kind = typeof(value)
+
+    if kind == "string" then
+        if value ~= "" then
+            table.insert(out, value)
+        end
+        return
+    end
+
+    if kind == "number" then
+        table.insert(out, tostring(value))
+        return
+    end
+
+    if kind == "Instance" then
+        local text = textOf(value)
+        if text then
+            table.insert(out, text)
+        end
+
+        if value:IsA("GuiObject") then
+            for _, descendant in ipairs(value:GetDescendants()) do
+                local childText = textOf(descendant)
+                if childText then
+                    table.insert(out, childText)
+                end
+            end
+        end
+        return
+    end
+
+    if kind == "table" then
+        for key, item in pairs(value) do
+            if type(key) == "string" then
+                table.insert(out, key)
+            end
+            collectText(item, out, depth + 1)
+        end
+    end
+end
+
+local function tooltipText(pickaxe)
+    local chunks = {}
+
+    pcall(function()
+        local toolTip = pickaxe.ToolTip
+        if type(toolTip) == "string" and toolTip ~= "" then
+            table.insert(chunks, toolTip)
         end
     end)
+
+    pcall(function()
+        for _, module in ipairs(tooltipModules()) do
+            local ok, built = pcall(require, module)
+            if not ok or type(built) ~= "table" then
+                continue
+            end
+
+            for key, fn in pairs(built) do
+                if type(fn) ~= "function" or type(key) ~= "string" then
+                    continue
+                end
+
+                local lower = key:lower()
+                if not (lower:find("build") or lower:find("content") or lower:find("lines")) then
+                    continue
+                end
+
+                local okCall, result = pcall(fn, pickaxe)
+                if not okCall or result == nil then
+                    okCall, result = pcall(fn, pickaxe, 1)
+                end
+                if not okCall or result == nil then
+                    okCall, result = pcall(fn, { Tool = pickaxe }, 1)
+                end
+
+                if okCall and result ~= nil then
+                    collectText(result, chunks, 0)
+                end
+            end
+        end
+    end)
+
+    pcall(function()
+        local gui = Players.LocalPlayer:FindFirstChild("PlayerGui")
+        if not gui then
+            return
+        end
+
+        for _, object in ipairs(gui:GetDescendants()) do
+            if object.Name == "Tooltip" and object:IsA("GuiObject") and object.Visible then
+                for _, descendant in ipairs(object:GetDescendants()) do
+                    local text = textOf(descendant)
+                    if text then
+                        table.insert(chunks, text)
+                    end
+                end
+            end
+        end
+    end)
+
+    return table.concat(chunks, "\n")
+end
+
+local function pickaxeFromText(text)
+    if not Game.Pickaxes or text == "" then
+        return nil
+    end
+
+    local lower = text:lower()
+
+    for key in pairs(Game.Pickaxes) do
+        if lower:find(key:lower(), 1, true) then
+            return key
+        end
+    end
+
+    return nil
+end
+
+local function handleFromText(text)
+    if not Game.Handles or text == "" then
+        return nil
+    end
+
+    local lower = text:lower()
+
+    for key in pairs(Game.Pickaxes or {}) do
+        lower = lower:gsub(escapePattern(key:lower()), "")
+    end
+
+    for key in pairs(Game.Handles) do
+        local needle = key:lower()
+        if lower:find(needle .. " handle", 1, true)
+            or lower:find("handle " .. needle, 1, true)
+            or lower:find(needle .. " wood", 1, true)
+            or lower:find("wood " .. needle, 1, true) then
+            return key
+        end
+    end
+
+    for key in pairs(Game.Handles) do
+        local pattern = "%f[%a]" .. escapePattern(key:lower()) .. "%f[%A]"
+        if lower:find(pattern) then
+            return key
+        end
+    end
+
+    return nil
+end
+
+local function resolvePickaxe(pickaxe, text)
+    local entries = attributeEntries(pickaxe, Mining.pickaxeAttrs)
+    table.insert(entries, { name = "Name", value = pickaxe.Name })
+
+    for _, entry in ipairs(entries) do
+        local key = matchTable(Game.Pickaxes, entry.value)
+        if key then
+            return Game.Pickaxes[key], key, entry.name
+        end
+    end
+
+    local head = headPart(pickaxe)
+    if head and Game.Pickaxes then
+        for key, info in pairs(Game.Pickaxes) do
+            if info.Material == head.Material and colorMatches(info.Color, head.Color) then
+                return info, key, "head"
+            end
+        end
+    end
+
+    local textKey = pickaxeFromText(text)
+    if textKey then
+        return Game.Pickaxes[textKey], textKey, "tooltip"
+    end
+
+    return nil
+end
+
+local function resolveHandle(pickaxe, text)
+    for _, entry in ipairs(attributeEntries(pickaxe, Mining.handleAttrs)) do
+        local key = matchTable(Game.Handles, entry.value)
+        if key then
+            return key, entry.name
+        end
+    end
+
+    local textKey = handleFromText(text)
+    if textKey then
+        return textKey, "tooltip"
+    end
+
+    local handlePart = pickaxe:FindFirstChild("Handle")
+    if handlePart and handlePart:IsA("BasePart") and Game.Handles then
+        for key, info in pairs(Game.Handles) do
+            if colorMatches(info.Color, handlePart.Color) then
+                if info.Material == nil or info.Material == handlePart.Material then
+                    return key, "handle-part"
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+local detectCache = setmetatable({}, { __mode = "k" })
+
+function Mining.signature(pickaxe)
+    local parts = { pickaxe.Name }
+    local attributes = pickaxe:GetAttributes()
+    local keys = {}
+
+    for key in pairs(attributes) do
+        table.insert(keys, key)
+    end
+
+    table.sort(keys)
+
+    for _, key in ipairs(keys) do
+        table.insert(parts, key .. "=" .. tostring(attributes[key]))
+    end
+
+    return table.concat(parts, "|")
+end
+
+function Mining.detect(pickaxe)
+    if not pickaxe then
+        return nil
+    end
+
+    local signature = Mining.signature(pickaxe)
+    local cached = detectCache[pickaxe]
+
+    if cached and cached.signature == signature then
+        return cached
+    end
+
+    local result = {
+        signature = signature,
+        tooltip = tooltipText(pickaxe),
+    }
+
+    result.pickaxeInfo, result.pickaxeName, result.pickaxeSource = resolvePickaxe(pickaxe, result.tooltip)
+    result.handleName, result.handleSource = resolveHandle(pickaxe, result.tooltip)
+
+    detectCache[pickaxe] = result
+    return result
+end
+
+function Mining.handleInfo(pickaxe)
+    local detected = Mining.detect(pickaxe)
+    if not detected then
+        return nil
+    end
+
+    local name = detected.handleName
+    if name and Game.Handles and Game.Handles[name] then
+        return Game.Handles[name], name, detected.handleSource
+    end
+
+    return nil, name, detected.handleSource
+end
+
+function Mining.describe(pickaxe)
+    if not pickaxe then
+        return "none"
+    end
+
+    local parts = {}
+    local attributes = pickaxe:GetAttributes()
+    local keys = {}
+
+    for key in pairs(attributes) do
+        table.insert(keys, key)
+    end
+
+    table.sort(keys)
+
+    for _, key in ipairs(keys) do
+        table.insert(parts, key .. "=" .. tostring(attributes[key]))
+    end
+
+    return table.concat(parts, " ")
+end
+
+function Mining.refreshBase()
+    local source = "default"
+    local base = Config.defaultMineTime
+
+    if type(Mining.serverBase) == "number" and Mining.serverBase > 0 then
+        base = Mining.serverBase
+        source = "server"
+    elseif type(Mining.tableBase) == "number" and Mining.tableBase > 0 then
+        base = Mining.tableBase
+        source = "table"
+    end
+
+    Mining.baseMineTime = base
+    Mining.baseSource = source
+end
+
+Mining.bound = setmetatable({}, { __mode = "k" })
+
+function Mining.bind(pickaxe)
+    local remote = pickaxe:FindFirstChild(Config.pickaxeRemote)
+    if not remote or Mining.bound[pickaxe] then
+        return
+    end
+
+    Mining.bound[pickaxe] = true
+
+    remote.OnClientEvent:Connect(function(data)
+        if typeof(data) == "table" and type(data.BaseMineTime) == "number" then
+            Mining.serverBase = data.BaseMineTime
+            Mining.refreshBase()
+            logPrint(("update pickaxe base=%.2f source=server"):format(data.BaseMineTime))
+        end
+    end)
+end
+
+function Mining.waitServerBase()
+    local deadline = os.clock() + 0.5
+
+    while os.clock() < deadline do
+        if type(Mining.serverBase) == "number" and Mining.serverBase > 0 then
+            return true
+        end
+        RunService.Heartbeat:Wait()
+    end
+
+    return false
 end
 
 function Mining.prepare(character)
@@ -577,24 +1002,35 @@ function Mining.prepare(character)
         return nil
     end
 
-    if Mining.pickaxe ~= pickaxe then
+    local detected = Mining.detect(pickaxe)
+    local toolChanged = Mining.pickaxe ~= pickaxe
+    local statsChanged = toolChanged or Mining.statsSignature ~= detected.signature
+
+    if toolChanged then
         Mining.pickaxe = pickaxe
         Mining.rebound = false
+        Mining.serverBase = nil
         Mining.bind(pickaxe)
+    end
 
-        local info, pickaxeName = Mining.pickaxeInfo(pickaxe)
-        if info and type(info.BaseMineTime) == "number" then
-            Mining.baseMineTime = info.BaseMineTime
-        end
+    if statsChanged then
+        Mining.statsSignature = detected.signature
+        Mining.tableBase = detected.pickaxeInfo and detected.pickaxeInfo.BaseMineTime or nil
+        Mining.pickaxeName = detected.pickaxeName
+        Mining.pickaxeSource = detected.pickaxeSource
+        Mining.handle = detected.handleName
+        Mining.handleSource = detected.handleSource
+        Mining.refreshBase()
 
-        local _, handleName = Mining.handleInfo(pickaxe)
-        Mining.handle = handleName
-        logPrint(("pickaxe %s class=%s base=%.2f handle=%s"):format(
+        logPrint(("pickaxe %s (%s) base=%.2f source=%s handle=%s (%s)"):format(
             pickaxe.Name,
-            tostring(pickaxeName),
+            tostring(Mining.pickaxeName),
             Mining.baseMineTime,
-            tostring(handleName)
+            tostring(Mining.baseSource),
+            tostring(Mining.handle),
+            tostring(Mining.handleSource)
         ))
+        logPrint("tool attributes: " .. Mining.describe(pickaxe))
     end
 
     if pickaxe.Parent ~= character then
@@ -608,6 +1044,16 @@ function Mining.prepare(character)
     end
 
     Mining.rebound = true
+
+    if toolChanged then
+        Mining.waitServerBase()
+        Mining.refreshBase()
+        logPrint(("pickaxe ready base=%.2f source=%s handle=%s"):format(
+            Mining.baseMineTime,
+            tostring(Mining.baseSource),
+            tostring(Mining.handle)
+        ))
+    end
 
     return pickaxe
 end
@@ -1358,8 +1804,9 @@ end
 function Ui.stats()
     local character = Character.get()
     local pickaxe = Character.getPickaxe(character)
-    local info = pickaxe and Mining.pickaxeInfo(pickaxe)
-    local handle, handleName = pickaxe and Mining.handleInfo(pickaxe)
+    local detected = pickaxe and Mining.detect(pickaxe)
+    local info = detected and detected.pickaxeInfo
+    local handle, handleName, handleSource = Mining.handleInfo(pickaxe)
     local player = Players.LocalPlayer
 
     local selected = 0
@@ -1370,14 +1817,18 @@ function Ui.stats()
     end
 
     return {
-        pickaxe = ("%s | tier %s | base %ss"):format(
+        pickaxe = ("%s | %s | tier %s | base %.2fs (%s)"):format(
             pickaxe and pickaxe.Name or "none",
+            tostring(Mining.pickaxeName or "?"),
             tostring(info and info.Tier or "?"),
-            tostring(info and info.BaseMineTime or Mining.baseMineTime)
+            Mining.baseMineTime,
+            tostring(Mining.baseSource or "?")
         ),
-        handle = ("%s | speed %s | luck %s | double %s"):format(
+        handle = ("%s (%s) | speed %s | move %s | luck %s | double %s"):format(
             tostring(handleName or "?"),
+            tostring(handleSource or "?"),
             tostring(handle and handle.SpeedModifier or 0),
+            tostring(handle and handle.MoveSpeedModifier or 0),
             tostring(handle and handle.LuckModifier or 0),
             tostring(handle and handle.DoubleDropChanceModifier or 0)
         ),
@@ -1682,15 +2133,19 @@ task.spawn(function()
         ))
     end
 
-    local info = pickaxe and Mining.pickaxeInfo(pickaxe)
-    local handle, handleName = pickaxe and Mining.handleInfo(pickaxe)
-    print(("[main] player world=%s toolspeed=%s pickaxe_tier=%s base=%s handle=%s"):format(
+    local detected = pickaxe and Mining.detect(pickaxe)
+    local info = detected and detected.pickaxeInfo
+    local handle, handleName, handleSource = Mining.handleInfo(pickaxe)
+    print(("[main] player world=%s toolspeed=%s pickaxe=%s base=%s (%s) handle=%s (%s)"):format(
         tostring(Players.LocalPlayer:GetAttribute(Game.attrWorldId)),
         tostring(Players.LocalPlayer:GetAttribute("ToolSpeedModifier")),
-        tostring(info and info.Tier),
-        tostring(info and info.BaseMineTime),
-        tostring(handleName)
+        tostring(detected and detected.pickaxeName),
+        tostring(Mining.baseMineTime),
+        tostring(Mining.baseSource),
+        tostring(handleName),
+        tostring(handleSource)
     ))
+    print("[main] tool attributes: " .. Mining.describe(pickaxe))
     if handle then
         print(("[main] handle speed=%s luck=%s double=%s"):format(
             tostring(handle.SpeedModifier),
