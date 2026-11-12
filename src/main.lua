@@ -15,14 +15,17 @@ local Config = {
     tweenSpeed = 120,
     moveStopDistance = 2.5,
 
-    mineTimeSafety = 0.18,
-    mineJitterMin = 0.05,
-    mineJitterMax = 0.15,
-    minePreSwingMin = 0.04,
-    minePreSwingMax = 0.12,
-    mineSwingMin = 0.02,
-    mineSwingMax = 0.08,
-    mineRejectGrace = 0.6,
+    mineWaitForServer = 1.5,
+
+    mineSafetyBase = 0.15,
+    mineSafetyPingMult = 1.5,
+    mineJitterMin = 0.03,
+    mineJitterMax = 0.12,
+    minePreSwingMin = 0.03,
+    minePreSwingMax = 0.10,
+    mineSwingMin = 0.01,
+    mineSwingMax = 0.05,
+    mineRejectGrace = 0.8,
 
     mushroomDelay = 0.35,
     mushroomIgnore = 5,
@@ -46,6 +49,42 @@ local Config = {
     pickaxeRemote = "UpdatePickaxe",
     defaultMineTime = 4,
 }
+
+---------------------------------------------------------------------------
+-- Ping tracker (rolling min for stable safety buffer)
+---------------------------------------------------------------------------
+
+local Ping = {
+    samples = {},
+    maxSamples = 8,
+    minPing = 0,
+}
+
+function Ping.sample()
+    local ok, value = pcall(function()
+        return Players.LocalPlayer:GetNetworkPing()
+    end)
+    if not ok or type(value) ~= "number" then
+        return Ping.minPing
+    end
+
+    value = math.max(0, math.min(value, 2))
+
+    table.insert(Ping.samples, value)
+    while #Ping.samples > Ping.maxSamples do
+        table.remove(Ping.samples, 1)
+    end
+
+    local min = math.huge
+    for _, v in ipairs(Ping.samples) do
+        if v < min then
+            min = v
+        end
+    end
+
+    Ping.minPing = min == math.huge and 0 or min
+    return Ping.minPing
+end
 
 ---------------------------------------------------------------------------
 -- Log
@@ -982,19 +1021,6 @@ function Mining.bind(pickaxe)
     end)
 end
 
-function Mining.waitServerBase()
-    local deadline = os.clock() + 0.5
-
-    while os.clock() < deadline do
-        if type(Mining.serverBase) == "number" and Mining.serverBase > 0 then
-            return true
-        end
-        RunService.Heartbeat:Wait()
-    end
-
-    return false
-end
-
 function Mining.prepare(character)
     local pickaxe = Character.getPickaxe(character)
     if not pickaxe then
@@ -1037,6 +1063,24 @@ function Mining.prepare(character)
         logPrint("tool attributes: " .. Mining.describe(pickaxe))
     end
 
+    -- Wait for server-authoritative BaseMineTime before first mine with this tool.
+    -- The server sends it via UpdatePickaxe.OnClientEvent when the tool equips.
+    if toolChanged and type(Mining.serverBase) ~= "number" then
+        local deadline = os.clock() + Config.mineWaitForServer
+        while os.clock() < deadline do
+            if type(Mining.serverBase) == "number" and Mining.serverBase > 0 then
+                break
+            end
+            RunService.Heartbeat:Wait()
+        end
+        Mining.refreshBase()
+        logPrint(("pickaxe ready base=%.2f source=%s handle=%s"):format(
+            Mining.baseMineTime,
+            tostring(Mining.baseSource),
+            tostring(Mining.handle)
+        ))
+    end
+
     if pickaxe.Parent ~= character then
         humanoid:EquipTool(pickaxe)
         task.wait(0.1)
@@ -1049,16 +1093,6 @@ function Mining.prepare(character)
 
     Mining.rebound = true
 
-    if toolChanged then
-        Mining.waitServerBase()
-        Mining.refreshBase()
-        logPrint(("pickaxe ready base=%.2f source=%s handle=%s"):format(
-            Mining.baseMineTime,
-            tostring(Mining.baseSource),
-            tostring(Mining.handle)
-        ))
-    end
-
     return pickaxe
 end
 
@@ -1067,21 +1101,17 @@ function Mining.mineTime(block)
     local modifier = info and info.MineTimeModifier or 1
     local speed = Players.LocalPlayer:GetAttribute("ToolSpeedModifier") or 0
 
-    return math.max(Mining.baseMineTime * ((100 - speed) / 100) * modifier, 0.05)
+    return math.max(Mining.baseMineTime * ((100 - speed) / 100) * modifier, 0.1)
 end
 
 function Mining.waitTime(block)
-    local ping = 0
-    local ok, value = pcall(function()
-        return Players.LocalPlayer:GetNetworkPing()
-    end)
-    if ok and type(value) == "number" then
-        ping = math.min(value, 0.5)
-    end
+    local ping = Ping.sample()
 
+    local baseMine = Mining.mineTime(block)
     local jitter = math.random() * (Config.mineJitterMax - Config.mineJitterMin) + Config.mineJitterMin
-    local baseWait = Mining.mineTime(block) + Config.mineTimeSafety + ping + jitter
-    return baseWait
+
+    local safety = Config.mineSafetyBase + ping * Config.mineSafetyPingMult
+    return baseMine + safety + jitter
 end
 
 function Mining.preSwingDelay()
@@ -1209,15 +1239,26 @@ function Mining.mine(character, block)
 
     local modifier = resourceInfo(typeOf(block))
     modifier = modifier and modifier.MineTimeModifier or 1
-    local waitTime = Mining.waitTime(block)
+
+    local speedAttr = Players.LocalPlayer:GetAttribute("ToolSpeedModifier") or 0
+    local baseMine = Mining.mineTime(block)
+    local ping = Ping.sample()
+    local jitter = math.random() * (Config.mineJitterMax - Config.mineJitterMin) + Config.mineJitterMin
+    local safety = Config.mineSafetyBase + ping * Config.mineSafetyPingMult
+    local waitTime = baseMine + safety + jitter
     local preSwing = Mining.preSwingDelay()
     local swing = Mining.swingDelay()
-    logPrint(("mine %s type=%s base=%.2f toolspeed=%s mod=%.2f wait=%.2f preSwing=%.2f swing=%.2f"):format(
+
+    logPrint(("mine %s type=%s base=%.2f speed=%s mod=%.2f ping=%.3f mine=%.3f safety=%.3f jitter=%.3f wait=%.3f preSwing=%.3f swing=%.3f"):format(
         block.Name,
         tostring(typeOf(block)),
         Mining.baseMineTime,
-        tostring(Players.LocalPlayer:GetAttribute("ToolSpeedModifier")),
+        tostring(speedAttr),
         modifier,
+        ping,
+        baseMine,
+        safety,
+        jitter,
         waitTime,
         preSwing,
         swing
@@ -1230,6 +1271,7 @@ function Mining.mine(character, block)
     end
 
     blockEvent:FireServer(block.Name, { dug = true })
+
     task.wait(swing)
     task.wait(waitTime)
 
@@ -1241,12 +1283,17 @@ function Mining.mine(character, block)
 
     local deadline = os.clock() + Config.mineRejectGrace
     while block.Parent and os.clock() < deadline do
-        task.wait(0.03)
+        task.wait(0.02)
     end
 
     if block.Parent then
         blockEvent:FireServer(vec3ToString(position), { dug = false })
-        logWarn("server rejected " .. block.Name .. " (" .. tostring(typeOf(block)) .. ")")
+        logWarn(("server rejected %s type=%s base=%.2f wait=%.3f"):format(
+            block.Name,
+            tostring(typeOf(block)),
+            Mining.baseMineTime,
+            waitTime
+        ))
         return false
     end
 

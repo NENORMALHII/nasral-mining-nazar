@@ -138,16 +138,36 @@ From `docs/game/data/player-stats.txt` (LocalPlayer attributes):
 Wait time (bot formula, updated for server tolerance):
 
 ```lua
-mineTime = BaseMineTime * (100 - ToolSpeedModifier) / 100 * MineTimeModifier
-preSwing = random(0.04 .. 0.12)   -- delay before BlockEvent (human reaction)
-swing    = random(0.02 .. 0.08)   -- delay after BlockEvent (swing animation)
-jitter   = random(0.05 .. 0.15)   -- per-block variance
-safety   = 0.18                   -- fixed buffer
-ping     = GetNetworkPing()       -- RTT, capped at 0.5
-waitTime = mineTime + safety + ping + jitter
+mineTime   = BaseMineTime * (100 - ToolSpeedModifier) / 100 * MineTimeModifier
+preSwing   = random(0.03 .. 0.10)  -- before BlockEvent (human reaction)
+swing      = random(0.01 .. 0.05)  -- after BlockEvent (animation wind-up)
+jitter     = random(0.03 .. 0.12)  -- per-block variance
+safety     = 0.15 + ping * 1.5     -- ping-dependent buffer
+ping       = GetNetworkPing()      -- RTT, rolling 8-sample min
+waitTime   = mineTime + safety + jitter
 ```
 
 Total time from `BlockEvent` to `BlockMinedEvent`: `preSwing + swing + waitTime`.
+
+Characteristic acquisition order:
+
+1. `BaseMineTime` — server-authoritative from `UpdatePickaxe.OnClientEvent`. Bot waits up to
+   `mineWaitForServer` (1.5 s) after equipping a new tool for the event. Falls back to
+   `Tools.Pickaxes[key].BaseMineTime`, then `Config.defaultMineTime`.
+2. `ToolSpeedModifier` — re-read from `LocalPlayer` attributes on every mine (buffs change it).
+3. `MineTimeModifier` — from `Resources[typeOf(block)]`.
+4. Handle buffs are NOT added to mine time — the server already folds them into `ToolSpeedModifier`.
+
+Why rejections happen and how the new algorithm addresses them:
+
+| Cause | Fix |
+|---|---|
+| `BlockMinedEvent` too early after `BlockEvent` | `waitTime = mineTime + safety + jitter` always exceeds server-expected time |
+| Network lag spikes | `safety` scales with rolling min ping (`0.15 + ping * 1.5`) |
+| Predictable timing | `preSwing` + `swing` + `jitter` add human-like micro-delays |
+| Stale `BaseMineTime` from table | Server value waits on equip, takes priority over table |
+| Stale `ToolSpeedModifier` | Re-read from player attributes every mine |
+| Cancel sent too late | `mineRejectGrace` increased to 0.8 s, poll interval 0.02 s |
 
 The client fires `BlockEvent`, waits `preSwing + swing + waitTime`, then fires `BlockMinedEvent`.
 Server validates that elapsed time >= expected `mineTime` (with its own tolerance).
