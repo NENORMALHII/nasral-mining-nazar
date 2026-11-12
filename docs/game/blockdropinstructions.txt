@@ -1,1 +1,1 @@
-Drops of blocks are located in workspace.TargetFilter, the fodler contains {BlockName}_Drop, and int this model a Part which is named {BlockName} or just use :IsA(part) it contains DropScript and that scripts child is StringValue named Player, so Player.Value - player who broken the block
+Drops of blocks are located in workspace.TargetFilter, the fodler contains {BlockName}_Drop, and in this model a Part which is named {BlockName} or just use :IsA(part) it contains DropScript and that scripts child is StringValue named Player, so Player.Value - player who broken the block
