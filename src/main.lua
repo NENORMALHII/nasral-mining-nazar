@@ -37,8 +37,8 @@ local Config = {
     moveCooldown = 0.5,
 
     surfaceDepth = 2,
-    surfaceScanRadius = 8,
-    surfaceMaxDepth = 12,
+    surfaceScanRadius = 6,
+    surfaceMaxDepth = 10,
     surfaceMinDepth = 2,
     moveSettleTime = 0.25,
     moveSettleEpsilon = 0.2,
@@ -522,33 +522,38 @@ local Surface = {
     lastScan = 0,
 }
 
--- Number of empty cells from the top layer down to the first solid block.
-function Surface.depth(mine, cell)
+-- Counts empty cells from topY down to the first solid block.
+-- hasBottom is false when the column never hits a block: that is outside the
+-- generated mine (void / unloaded area), not a shaft.
+function Surface.depth(mine, cell, topY)
     local depth = 0
 
-    for y = 0, Config.surfaceMaxDepth - 1 do
+    for y = topY, topY + Config.surfaceMaxDepth - 1 do
         local block = mine:FindFirstChild(vec3ToString(Vector3.new(cell.X, y, cell.Z)))
         if block then
-            return depth
+            return depth, true
         end
         depth += 1
     end
 
-    return depth
+    return depth, false
 end
 
--- Remembers the deepest open column around the player. The remembered shaft is
--- re-validated on every call, so a mine reset or a filled hole invalidates it.
 function Surface.choose(position)
     local mine = workspace:FindFirstChild(Config.mineName)
     if not mine then
         return nil
     end
 
-    if Surface.remembered then
-        local depth = Surface.depth(mine, Surface.remembered.cell)
+    local center = Blocks.toBlock(position)
+    local topY = center.Y
 
-        if depth >= Config.surfaceMinDepth then
+    if Surface.remembered then
+        local cell = Vector3.new(Surface.remembered.cell.X, topY, Surface.remembered.cell.Z)
+        local depth, hasBottom = Surface.depth(mine, cell, topY)
+
+        if hasBottom and depth >= Config.surfaceMinDepth then
+            Surface.remembered.cell = cell
             Surface.remembered.depth = depth
             return Surface.remembered
         end
@@ -556,9 +561,7 @@ function Surface.choose(position)
         Surface.remembered = nil
     end
 
-    local center = Blocks.toBlock(position)
-
-    if Surface.lastCell == center and os.clock() - Surface.lastScan < 1 then
+    if Surface.lastCell == center and os.clock() - Surface.lastScan < 2 then
         return nil
     end
 
@@ -570,10 +573,10 @@ function Surface.choose(position)
 
     for dx = -radius, radius do
         for dz = -radius, radius do
-            local cell = Vector3.new(center.X + dx, 0, center.Z + dz)
-            local depth = Surface.depth(mine, cell)
+            local cell = Vector3.new(center.X + dx, topY, center.Z + dz)
+            local depth, hasBottom = Surface.depth(mine, cell, topY)
 
-            if depth >= Config.surfaceMinDepth then
+            if hasBottom and depth >= Config.surfaceMinDepth then
                 local distance = (Blocks.worldOf(cell) - position).Magnitude
 
                 if not bestDepth
@@ -594,10 +597,10 @@ function Surface.choose(position)
     return Surface.remembered
 end
 
--- World position of the empty cell directly above a shaft column.
 function Surface.standPoint(shaft)
-    return Blocks.worldOf(shaft.cell + Vector3.new(0, -1, 0))
+    return Blocks.worldOf(shaft.cell)
 end
+
 
 ---------------------------------------------------------------------------
 -- Mining
@@ -1584,6 +1587,14 @@ local FarmMode = Mode.new("Farm", function(self)
             end
 
             Movement.waitLanded(character)
+
+            -- Landed on something that is not a mine block: the remembered
+            -- shaft is a dead end, forget it instead of idling here forever.
+            local humanoid = character:FindFirstChildOfClass("Humanoid")
+            if not below and humanoid and humanoid.FloorMaterial ~= Enum.Material.Air then
+                Surface.remembered = nil
+            end
+
             return
         end
     end

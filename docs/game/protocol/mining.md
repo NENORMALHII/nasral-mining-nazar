@@ -98,17 +98,23 @@ so teleporting to the block centre was unnecessary and caused `BlockMinedEvent` 
 While the player is on the surface (`Blocks.toBlock(root.Position).Y < surfaceDepth = 2`),
 Farm does not dig a fresh hole blindly:
 
-1. `Surface.choose(position)` scans columns in a `±8` block square around the player.
-2. `Surface.depth(mine, cell)` counts empty cells from `y = 0` down to the first solid block,
-   capped at `surfaceMaxDepth = 12`.
-3. The deepest column with `depth >= surfaceMinDepth = 2` wins; ties are broken by distance.
-4. The result is stored in `Surface.remembered` and re-validated on every call, so a mine reset
+1. `Surface.choose(position)` scans columns in a `±6` block square around the player.
+2. `Surface.depth(mine, cell, topY)` counts empty cells from the player's own block cell `topY`
+   down to the first solid block, capped at `surfaceMaxDepth = 10`. Using the player cell instead
+   of a hard-coded `y = 0` keeps the scan correct at any mine altitude.
+3. A column is a valid shaft only when it hits a solid block inside the cap. Columns that stay
+   empty are outside the generated mine (void or unloaded) and are rejected — this was the reason
+   the bot jumped to the map edge and idled.
+4. The deepest valid column with `depth >= surfaceMinDepth = 2` wins; ties are broken by distance.
+   Depth is counted from the player's own cell, so a normal surface column has depth 1 and a
+   one-block hole already has depth 2.
+5. The result is stored in `Surface.remembered` and re-validated on every call, so a mine reset
    or a filled hole invalidates it.
-5. If the player is not above the remembered column, `Movement.jump` moves them once to
-   `Surface.standPoint(shaft)` — the empty cell above `y = 0`. The character then falls into the
-   shaft and normal digging continues.
+6. If the player is not above the remembered column, `Movement.jump` moves them once to
+   `Surface.standPoint(shaft)` — the same block cell, at the player's current Y. The character
+   then falls into the shaft and normal digging continues.
 
-Negative scans are cached for 1 s per block cell, so a surface without pits does not rescan the
+Negative scans are cached for 2 s per block cell, so a surface without pits does not rescan the
 area every tick.
 
 ## Client modes
