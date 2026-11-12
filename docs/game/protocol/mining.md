@@ -110,9 +110,19 @@ Farm does not dig a fresh hole blindly:
    one-block hole already has depth 2.
 5. The result is stored in `Surface.remembered` and re-validated on every call, so a mine reset
    or a filled hole invalidates it.
-6. If the player is not above the remembered column, `Movement.jump` moves them once to
-   `Surface.standPoint(shaft)` — the same block cell, at the player's current Y. The character
-   then falls into the shaft and normal digging continues.
+6. If the player is not above the chosen column, `Movement.jump` moves them to the mouth cell at
+   the player's own block Y (`Blocks.worldOf`). The jump is skipped when a block occupies that
+   cell — a cached mouth can be stale — and such a pit is dropped instead.
+7. A pit that can never be dug out is dropped: either the floor block under the mouth fails
+   `Mining.why` (`dug` by another player, `blocked` type, `liquid` neighbour, `bedrock`), or the
+   character stands on geometry that is not a mine block. `Surface.drop(cell)` deletes the cache
+   entry, bans the `X,Z` key for `surfacePitBan = 12` s and resets the 2 s scan throttle, so the
+   next tick re-scans and aims at another pit. `Surface.choose` skips banned columns in all three
+   branches (remembered, current-column cache, full scan). Without the ban the scan re-found the
+   same unusable pit from `Surface.pitCache` and the bot idled at its mouth.
+
+Transient failures keep the pit: a `mine` failure with `Mining.why(below) == nil` means no
+pickaxe, out of range or a server rejection, so the bot retries the same mouth next tick.
 
 Negative scans are cached for 2 s per block cell, so a surface without pits does not rescan the
 area every tick.

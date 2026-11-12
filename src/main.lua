@@ -40,6 +40,7 @@ local Config = {
     surfaceScanRadius = 6,
     surfaceMaxDepth = 10,
     surfaceMinDepth = 2,
+    surfacePitBan = 12,
     moveSettleTime = 0.25,
     moveSettleEpsilon = 0.2,
 
@@ -521,6 +522,7 @@ local Surface = {
     lastCell = nil,
     lastScan = 0,
     pitCache = {},
+    banned = {},
 }
 
 -- Counts empty cells from topY down to the first solid block.
@@ -561,40 +563,70 @@ function Surface.cacheSet(key, pit)
     Surface.pitCache[key] = { pit = pit, time = os.clock() }
 end
 
+-- Pits we are not allowed to dig out (floor claimed by another player, liquid-adjacent,
+-- blocked type, or no floor at all) are dropped from the cache and skipped for
+-- surfacePitBan seconds. Without the ban the next scan re-finds the same pit and the
+-- bot stands at its mouth forever.
+function Surface.drop(cell)
+    local key = Surface.key(cell)
+    Surface.pitCache[key] = nil
+    Surface.banned[key] = os.clock() + Config.surfacePitBan
+
+    if Surface.remembered and Surface.key(Surface.remembered.cell) == key then
+        Surface.remembered = nil
+    end
+
+    Surface.lastScan = 0
+end
+
+function Surface.isBanned(key, now)
+    local untilTime = Surface.banned[key]
+    return untilTime ~= nil and untilTime > now
+end
+
 function Surface.choose(position)
     local mine = workspace:FindFirstChild(Config.mineName)
     if not mine then
         return nil
     end
 
+    local now = os.clock()
     local center = Blocks.toBlock(position)
     local topY = center.Y
 
     -- 1. Try remembered pit first (same X,Z)
     if Surface.remembered then
         local key = Surface.key(Surface.remembered.cell)
-        local cached = Surface.cacheGet(key)
-        if cached then
-            return cached
+
+        if Surface.isBanned(key, now) then
+            Surface.remembered = nil
+        else
+            local cached = Surface.cacheGet(key)
+            if cached then
+                return cached
+            end
         end
 
-        local cell = Vector3.new(Surface.remembered.cell.X, topY, Surface.remembered.cell.Z)
-        local depth, hasBottom = Surface.depth(mine, cell, topY)
+        if Surface.remembered then
+            local cell = Vector3.new(Surface.remembered.cell.X, topY, Surface.remembered.cell.Z)
+            local depth, hasBottom = Surface.depth(mine, cell, topY)
 
-        if hasBottom and depth >= Config.surfaceMinDepth then
-            Surface.remembered.cell = cell
-            Surface.remembered.depth = depth
-            Surface.cacheSet(key, Surface.remembered)
-            return Surface.remembered
+            if hasBottom and depth >= Config.surfaceMinDepth then
+                Surface.remembered.cell = cell
+                Surface.remembered.depth = depth
+                Surface.cacheSet(key, Surface.remembered)
+                return Surface.remembered
+            end
+
+            Surface.remembered = nil
         end
-
-        Surface.remembered = nil
     end
 
     -- 2. Check cache for current column
     local currentKey = Surface.key(center)
     local cached = Surface.cacheGet(currentKey)
-    if cached then
+
+    if cached and not Surface.isBanned(currentKey, now) then
         return cached
     end
 
@@ -613,29 +645,32 @@ function Surface.choose(position)
         for dz = -radius, radius do
             local cell = Vector3.new(center.X + dx, topY, center.Z + dz)
             local key = Surface.key(cell)
-            local cachedPit = Surface.cacheGet(key)
 
-            if cachedPit then
-                if not bestDepth
-                    or cachedPit.depth > bestDepth
-                    or (cachedPit.depth == bestDepth and (Blocks.worldOf(cell) - position).Magnitude < bestDistance) then
-                    best, bestDepth, bestDistance = cell, cachedPit.depth, (Blocks.worldOf(cell) - position).Magnitude
-                end
-                continue
-            end
+            if not Surface.isBanned(key, now) then
+                local cachedPit = Surface.cacheGet(key)
 
-            local depth, hasBottom = Surface.depth(mine, cell, topY)
-
-            if hasBottom and depth >= Config.surfaceMinDepth then
-                local distance = (Blocks.worldOf(cell) - position).Magnitude
-
-                if not bestDepth
-                    or depth > bestDepth
-                    or (depth == bestDepth and distance < bestDistance) then
-                    best, bestDepth, bestDistance = cell, depth, distance
+                if cachedPit then
+                    if not bestDepth
+                        or cachedPit.depth > bestDepth
+                        or (cachedPit.depth == bestDepth and (Blocks.worldOf(cell) - position).Magnitude < bestDistance) then
+                        best, bestDepth, bestDistance = cell, cachedPit.depth, (Blocks.worldOf(cell) - position).Magnitude
+                    end
+                    continue
                 end
 
-                Surface.cacheSet(key, { cell = cell, depth = depth })
+                local depth, hasBottom = Surface.depth(mine, cell, topY)
+
+                if hasBottom and depth >= Config.surfaceMinDepth then
+                    local distance = (Blocks.worldOf(cell) - position).Magnitude
+
+                    if not bestDepth
+                        or depth > bestDepth
+                        or (depth == bestDepth and distance < bestDistance) then
+                        best, bestDepth, bestDistance = cell, depth, distance
+                    end
+
+                    Surface.cacheSet(key, { cell = cell, depth = depth })
+                end
             end
         end
     end
@@ -648,10 +683,6 @@ function Surface.choose(position)
     Surface.cacheSet(Surface.key(best), Surface.remembered)
     logPrint(("surface shaft %s depth=%d"):format(vec3ToString(best), bestDepth))
     return Surface.remembered
-end
-
-function Surface.standPoint(shaft)
-    return Blocks.worldOf(shaft.cell)
 end
 
 
@@ -1621,34 +1652,59 @@ local FarmMode = Mode.new("Farm", function(self)
         return true
     end
 
-    -- 2. On the surface: pick the deepest existing shaft and reuse it.
-    if Blocks.toBlock(root.Position).Y < Config.surfaceDepth then
+    -- 2. On the surface: reuse an existing shaft and keep moving until the character
+    -- really stands over its mouth.
+    local cell = Blocks.toBlock(root.Position)
+
+    if cell.Y < Config.surfaceDepth then
         local shaft = Surface.choose(root.Position)
 
         if shaft then
-            local cell = Blocks.toBlock(root.Position)
-
             if cell.X ~= shaft.cell.X or cell.Z ~= shaft.cell.Z then
-                Movement.jump(character, Surface.standPoint(shaft))
+                local mouth = Vector3.new(shaft.cell.X, cell.Y, shaft.cell.Z)
+                local field = workspace:FindFirstChild(Config.mineName)
+
+                -- The cached mouth can be stale: only jump when that cell is really empty.
+                if not field or not field:FindFirstChild(vec3ToString(mouth)) then
+                    Movement.jump(character, Blocks.worldOf(mouth))
+                    return
+                end
+
+                Surface.drop(mouth)
+            else
+                local below = Blocks.below(root.Position)
+
+                if below then
+                    if mine(below) then
+                        Movement.waitLanded(character)
+                        return
+                    end
+
+                    Ores.ignore(below)
+
+                    -- A floor we are never allowed to dig makes this pit a dead end: drop it
+                    -- so the next tick aims at another one instead of idling at this mouth.
+                    local reason = Mining.why(below)
+
+                    if reason then
+                        logWarn(("pit %s unusable: %s"):format(vec3ToString(shaft.cell), reason))
+                        Surface.drop(shaft.cell)
+                    end
+
+                    return
+                end
+
+                -- Nothing under the feet: falling into the shaft is progress, standing on
+                -- geometry that is not a mine block is a dead end.
+                local humanoid = character:FindFirstChildOfClass("Humanoid")
+
+                if humanoid and humanoid.FloorMaterial ~= Enum.Material.Air then
+                    Surface.drop(shaft.cell)
+                end
+
+                Movement.waitLanded(character)
                 return
             end
-
-            local below = Blocks.below(root.Position)
-
-            if below and not mine(below) then
-                Ores.ignore(below)
-            end
-
-            Movement.waitLanded(character)
-
-            -- Landed on something that is not a mine block: the remembered
-            -- shaft is a dead end, forget it instead of idling here forever.
-            local humanoid = character:FindFirstChildOfClass("Humanoid")
-            if not below and humanoid and humanoid.FloorMaterial ~= Enum.Material.Air then
-                Surface.remembered = nil
-            end
-
-            return
         end
     end
 
