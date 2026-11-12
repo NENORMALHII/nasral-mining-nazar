@@ -1859,7 +1859,7 @@ function Ui.create()
     local library = Ui.load()
     local window = library.init("nazar mining 2", "v1.1.0", "NM2_MAIN")
 
-    local main, _ = window:AddTab("Main", "white-hat tests")
+    local main, _ = window:AddTab("Main", "артем сын ебланки")
 
     local modePanel = main:AddSeperator("Mode")
     local enabled = false
