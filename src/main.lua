@@ -49,6 +49,10 @@ local Config = {
     lootSpawnWait = 0.3,
     lootSyncInterval = 0.4,
 
+    sellRemote = "SellResourceFunction",
+    sellCapacity = 200,
+    sellCooldown = 1,
+
     blockEvent = "BlockEvent",
     minedEvent = "BlockMinedEvent",
     pickaxeRemote = "UpdatePickaxe",
@@ -1345,6 +1349,114 @@ function Ores.count()
 end
 
 ---------------------------------------------------------------------------
+-- Auto sell (ReplicatedStorage.SellResourceFunction)
+---------------------------------------------------------------------------
+
+local Sell = {
+    enabled = false,
+    selection = nil,
+    namesList = nil,
+    lastRun = 0,
+}
+
+function Sell.bindSelection(selection, names)
+    Sell.selection = selection
+    Sell.namesList = names
+end
+
+function Sell.selectedSet()
+    local set = {}
+    if not Sell.selection then
+        return set
+    end
+
+    for _, index in ipairs(Sell.selection.getSelected() or {}) do
+        local name = Sell.namesList[index]
+        if name then
+            set[name] = true
+        end
+    end
+
+    return set
+end
+
+-- Resource counts are read from LocalPlayer attributes (one attribute per resource).
+function Sell.count(name)
+    local value = Players.LocalPlayer:GetAttribute(name)
+    return type(value) == "number" and value or 0
+end
+
+-- used, capacity. The Inventory GUI label shows "used / capacity"; fall back to
+-- the attribute total against Config.sellCapacity when the label is absent.
+function Sell.usage()
+    local playerGui = Players.LocalPlayer:FindFirstChild("PlayerGui")
+    local inventory = playerGui and playerGui:FindFirstChild("Inventory")
+    local toggle = inventory and inventory:FindFirstChild("ToggleButton")
+    local label = toggle and toggle:FindFirstChild("InventoryUsed")
+
+    if label then
+        local numbers = {}
+        for number in label.Text:gmatch("%d+") do
+            table.insert(numbers, tonumber(number))
+        end
+        if #numbers >= 2 then
+            return numbers[1], numbers[2]
+        end
+    end
+
+    local total = 0
+    for _, name in ipairs(Ores.names()) do
+        total += Sell.count(name)
+    end
+    return total, Config.sellCapacity
+end
+
+function Sell.isFull()
+    local used, capacity = Sell.usage()
+    return capacity > 0 and used >= capacity
+end
+
+function Sell.run(force)
+    if not force then
+        if not Sell.enabled or not Sell.isFull() then
+            return 0
+        end
+        if os.clock() - Sell.lastRun < Config.sellCooldown then
+            return 0
+        end
+    end
+    Sell.lastRun = os.clock()
+
+    local remote = ReplicatedStorage:FindFirstChild(Config.sellRemote)
+    if not remote then
+        logWarn("sell remote not found")
+        return 0
+    end
+
+    local selected = Sell.selectedSet()
+    local sold = 0
+
+    for _, name in ipairs(Sell.namesList or {}) do
+        if selected[name] then
+            local count = Sell.count(name)
+            if count > 0 then
+                local ok = pcall(function()
+                    remote:InvokeServer(name, count)
+                end)
+                if ok then
+                    sold += count
+                    logPrint(("sold %s x%d"):format(name, count))
+                else
+                    logWarn("sell failed " .. name)
+                end
+            end
+        end
+    end
+
+    return sold
+end
+
+---------------------------------------------------------------------------
 -- Loot (workspace.TargetFilter/{BlockName}_Drop)
 ---------------------------------------------------------------------------
 
@@ -1605,6 +1717,8 @@ local FarmMode = Mode.new("Farm", function(self)
     if not character.PrimaryPart then
         return
     end
+
+    Sell.run()
 
     -- 1. Loot first: teleport to every own drop immediately.
     Loot.sync(true)
@@ -1946,6 +2060,33 @@ function Ui.create()
 
     selection.setSelected(defaults)
     Ores.bindSelection(selection, names)
+
+    local sellTab = window:AddTab("Auto sell", "sell resources when the backpack is full")
+    local sellPanel = sellTab:AddSeperator("Auto sell")
+
+    sellPanel:AddToggle({
+        title = "Enabled",
+        desc = "sell selected resources when the backpack is full",
+        callback = function(state)
+            Sell.enabled = state
+        end,
+    })
+
+    local sellSelection = sellPanel:AddSelection({
+        title = "Resources to sell",
+        options = names,
+        default = {},
+    })
+
+    sellSelection.setSelected({})
+    Sell.bindSelection(sellSelection, names)
+
+    sellPanel:AddButton({
+        title = "Sell now",
+        callback = function()
+            logPrint("manual sell total " .. Sell.run(true))
+        end,
+    })
 
     local debugTab = window:AddTab("Debug", "stats and logs")
     local statsPanel = debugTab:AddSeperator("Stats")
