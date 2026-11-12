@@ -17,8 +17,8 @@ local Config = {
 
     mineWaitForServer = 1.5,
 
-    mineSafetyBase = 0.15,
-    mineSafetyPingMult = 1.5,
+    mineSafetyBase = 0.08,
+    mineSafetyPingMult = 1.0,
     mineJitterMin = 0.03,
     mineJitterMax = 0.12,
     minePreSwingMin = 0.03,

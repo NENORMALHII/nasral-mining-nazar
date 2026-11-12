@@ -158,7 +158,7 @@ mineTime   = BaseMineTime * (100 - ToolSpeedModifier) / 100 * MineTimeModifier
 preSwing   = random(0.03 .. 0.10)  -- before BlockEvent (human reaction)
 swing      = random(0.01 .. 0.05)  -- after BlockEvent (animation wind-up)
 jitter     = random(0.03 .. 0.12)  -- per-block variance
-safety     = 0.15 + ping * 1.5     -- ping-dependent buffer
+safety     = 0.08 + ping * 1.0     -- ping-dependent buffer
 ping       = GetNetworkPing()      -- RTT, rolling 8-sample min
 waitTime   = mineTime + safety + jitter
 ```
@@ -179,7 +179,7 @@ Why rejections happen and how the new algorithm addresses them:
 | Cause | Fix |
 |---|---|
 | `BlockMinedEvent` too early after `BlockEvent` | `waitTime = mineTime + safety + jitter` always exceeds server-expected time |
-| Network lag spikes | `safety` scales with rolling min ping (`0.15 + ping * 1.5`) |
+| Network lag spikes | `safety` scales with rolling min ping (`0.08 + ping * 1.0`) |
 | Predictable timing | `preSwing` + `swing` + `jitter` add human-like micro-delays |
 | Stale `BaseMineTime` from table | Server value waits on equip, takes priority over table |
 | Stale `ToolSpeedModifier` | Re-read from player attributes every mine |
