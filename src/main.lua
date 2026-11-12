@@ -1592,6 +1592,47 @@ end
 -- Farm mode
 ---------------------------------------------------------------------------
 
+-- Escape for the dig-straight-down case: the block under the bot is one we refuse
+-- to dig (liquid neighbour, Oil/Lava/Grass/Void, someone else's Dug). Pick the
+-- richest neighbouring column whose own cell is empty and whose floor is diggable,
+-- so the next down-dig has a different block under it.
+local function stepAside(character, root)
+    local mine = workspace:FindFirstChild(Config.mineName)
+    if not mine then
+        return
+    end
+
+    local cell = Blocks.toBlock(root.Position)
+    local best, bestPrice
+
+    for _, offset in pairs(blockOffsets) do
+        if offset.Y == 0 then
+            local side = cell + Vector3.new(offset.X, 0, offset.Z)
+            local floor = mine:FindFirstChild(vec3ToString(side + Vector3.new(0, 1, 0)))
+
+            if floor
+                and Mining.why(floor) == nil
+                and not mine:FindFirstChild(vec3ToString(side)) then
+                local price = Ores.price(typeOf(floor) or "")
+
+                if not best or price > bestPrice then
+                    best, bestPrice = side, price
+                end
+            end
+        end
+    end
+
+    if not best then
+        logWarn("down-block undiggable, no side escape")
+        task.wait(1)
+        return
+    end
+
+    local world = Blocks.worldOf(best)
+    logPrint(("step aside -> %s"):format(vec3ToString(best)))
+    Movement.jump(character, Vector3.new(world.X, root.Position.Y, world.Z))
+end
+
 local FarmMode = Mode.new("Farm", function(self)
     local character = Character.get()
     if not self.enabled then
@@ -1728,6 +1769,11 @@ local FarmMode = Mode.new("Farm", function(self)
 
     if mine(below) then
         Movement.waitLanded(character)
+        return
+    end
+
+    if below.Parent and Mining.why(below) then
+        stepAside(character, root)
     end
 end, Movement.cancel)
 
