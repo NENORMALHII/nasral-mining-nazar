@@ -44,6 +44,7 @@ local Config = {
     fieldRadius = 14,
     emptyMineLift = 20,
     emptyMineWait = 2,
+    teleportLift = 3.5,
     moveSettleTime = 0.25,
     moveSettleEpsilon = 0.2,
 
@@ -346,6 +347,17 @@ function Movement.release()
         Movement.tween = nil
     end
 
+    -- Kill leftover velocity before the root is unanchored, otherwise the
+    -- character keeps tween momentum and tumbles on landing.
+    local root = Movement.root or Movement.holdRoot
+
+    if root and root.Parent then
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end)
+    end
+
     safeAnchor(Movement.holdRoot, false)
     Movement.holdRoot = nil
 
@@ -430,6 +442,12 @@ function Movement.to(character, position, speed)
 
     if Config.instantMove then
         character:PivotTo(CFrame.new(position))
+
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end)
+
         Character.platformStand(character, false)
         Movement.lastMoveAt = os.clock()
         Movement.settle(character)
@@ -1470,6 +1488,30 @@ local Sell = {
     lastRun = 0,
 }
 
+-- Sellable resources: mined ores (Natural) plus mushrooms (MushroomResource).
+-- Mushrooms have BasePrice but neither Natural nor AppearsInShop, so the farm
+-- ore list does not contain them; without this they can never be selected.
+function Sell.names()
+    local names = {}
+
+    if Game.Resources then
+        for name, info in pairs(Game.Resources) do
+            if type(info) == "table"
+                and (info.Natural or info.MushroomResource)
+                and info.BasePrice
+                and not info.Unobtainable then
+                table.insert(names, name)
+            end
+        end
+    end
+
+    table.sort(names, function(a, b)
+        return Ores.price(a) > Ores.price(b)
+    end)
+
+    return names
+end
+
 function Sell.bindSelection(selection, names)
     Sell.selection = selection
     Sell.namesList = names
@@ -1899,7 +1941,9 @@ function Loot.collectAll(character)
             local part = Loot.part(drop)
 
             if part then
-                Movement.jump(character, part.Position)
+                -- Root sits ~3.5 studs above the drop so the body is not embedded
+                -- in the floor, which made the character tumble after the jump.
+                Movement.jump(character, part.Position + Vector3.new(0, Config.teleportLift, 0))
                 task.wait(Config.lootDwell)
             end
 
@@ -2095,7 +2139,7 @@ local FarmMode = Mode.new("Farm", function(self)
     if cell.Y < Config.surfaceDepth then
         if not Surface.atField(root.Position) then
             logPrint("surface: move to field centre")
-            Movement.jump(character, Config.fieldCenter)
+            Movement.jump(character, Config.fieldCenter + Vector3.new(0, Config.teleportLift, 0))
             return
         end
 
@@ -2108,7 +2152,7 @@ local FarmMode = Mode.new("Farm", function(self)
 
                 -- Only jump into a mouth that is really empty.
                 if mine and not mine:FindFirstChild(vec3ToString(mouth)) then
-                    Movement.jump(character, Blocks.worldOf(mouth))
+                    Movement.jump(character, Blocks.worldOf(mouth) + Vector3.new(0, Config.teleportLift, 0))
                     return
                 end
             else
@@ -2394,14 +2438,15 @@ function Ui.create()
         end,
     })
 
+    local sellNames = Sell.names()
     local sellSelection = sellPanel:AddSelection({
         title = "Resources to sell",
-        options = names,
+        options = sellNames,
         default = {},
     })
 
     sellSelection.setSelected({})
-    Sell.bindSelection(sellSelection, names)
+    Sell.bindSelection(sellSelection, sellNames)
 
     sellPanel:AddButton({
         title = "Sell now",

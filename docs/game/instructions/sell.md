@@ -68,8 +68,11 @@ Diagnostics (throttled to one line per 10 s for repeated states):
 - `autosell: no resources selected` / `autosell: selected resources have zero count`;
 - `inventory: InventoriesClient ready`, or a distinct warning for each load failure.
 
-The Auto sell list is built from `Ores.names()`, i.e. `Resources` entries with
-`Natural = true` only. Smelted bars, planks and sticks are not in the list, so a
+The Auto sell list is built by `Sell.names()`: every `Resources` entry with a
+`BasePrice` that is either `Natural = true` (mined ores) or
+`MushroomResource = true` (`Red Shroom`, `Brown Shroom`, `Soul Shroom`,
+`Witchcap`, `Magmaspore`). The farm ore list (`Ores.names()`) stays `Natural`
+only. Smelted bars, planks and sticks are still not in the sell list, so a
 backpack full of them keeps `used` at max while every run sells `units=0`.
 
 `Sell.run()` without `force` still requires the Auto sell toggle and respects

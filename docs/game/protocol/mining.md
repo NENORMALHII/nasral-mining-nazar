@@ -96,6 +96,11 @@ so teleporting to the block centre was unnecessary and caused `BlockMinedEvent` 
   moves all use the same method.
 - Every move sets `Movement.lastMoveAt`; Farm waits `moveCooldown` (0.5 s) before the next
   `BlockEvent`, so mining never starts in the same tick as a position change.
+- Stability: `Movement.release` zeroes `AssemblyLinearVelocity`/`AssemblyAngularVelocity`
+  before un-anchoring, so tween momentum does not carry into the humanoid. Targets that come
+  from block/part centres (loot drops, field centre, pit mouth) are lifted by
+  `Config.teleportLift = 3.5`, otherwise the root spawns inside the floor and the character
+  tumbles on release.
 - `HumanoidRootPart` is anchored during tweens, during the `BlockEvent`/`BlockMinedEvent`
   window, and while the `Mine` container has no blocks at all (see the empty-field rule below).
 - Empty field (`Mine` has zero children): there is nothing to dig and no ground, so digging down
