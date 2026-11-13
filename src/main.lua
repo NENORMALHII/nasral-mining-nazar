@@ -1826,6 +1826,15 @@ local FarmMode = Mode.new("Farm", function(self)
     local below = Blocks.below(root.Position)
 
     if not below then
+        -- Check if mine is empty (no blocks at all)
+        local mine = workspace:FindFirstChild(Config.mineName)
+        if mine and #mine:GetChildren() == 0 then
+            -- Mine is empty, place character higher to avoid falling forever
+            Movement.jump(character, Vector3.new(root.Position.X, root.Position.Y + 10, root.Position.Z))
+            logPrint("mine empty, moved up")
+            return
+        end
+        
         Movement.waitLanded(character)
         return
     end
