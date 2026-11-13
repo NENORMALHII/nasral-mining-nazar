@@ -1360,7 +1360,16 @@ end
 local Inventory = {
     client = nil,
     lastTry = 0,
+    lastError = nil,
 }
+
+-- Log each distinct failure once instead of every 5 s retry.
+local function inventoryWarn(text)
+    if Inventory.lastError ~= text then
+        Inventory.lastError = text
+        logWarn(text)
+    end
+end
 
 function Inventory.getClient()
     if Inventory.client then
@@ -1374,6 +1383,7 @@ function Inventory.getClient()
 
     local loader = loadModule("Modules", "PlayerScriptLoader")
     if not loader then
+        inventoryWarn("inventory: PlayerScriptLoader not found")
         return nil
     end
 
@@ -1381,21 +1391,26 @@ function Inventory.getClient()
         return loader:WaitForPlayerScripts()
     end)
     if not ok or not scripts then
+        inventoryWarn("inventory: WaitForPlayerScripts failed: " .. tostring(scripts))
         return nil
     end
 
     local modules = scripts:FindFirstChild("Modules")
     local module = modules and modules:FindFirstChild("InventoriesClient")
     if not module then
+        inventoryWarn("inventory: PlayerScripts.Modules.InventoriesClient not found")
         return nil
     end
 
     local okModule, client = pcall(require, module)
     if not okModule or type(client) ~= "table" then
+        inventoryWarn("inventory: require InventoriesClient failed: " .. tostring(client))
         return nil
     end
 
     Inventory.client = client
+    Inventory.lastError = nil
+    logPrint("inventory: InventoriesClient ready")
     return client
 end
 
@@ -1550,11 +1565,58 @@ function Sell.selectedCount()
     return count
 end
 
--- Called after loot pickups and block breaks: compares used vs max and runs the
--- sell when full. Logs the trigger so it is clear why the remote fired (or not).
+-- Throttled diagnostics: same noise level not repeated more than every 10 s.
+function Sell.diag(key, text)
+    local now = os.clock()
+
+    if Sell.lastDiagKey == key and now - (Sell.lastDiag or 0) < 10 then
+        return
+    end
+
+    Sell.lastDiagKey = key
+    Sell.lastDiag = now
+    logPrint(text)
+end
+
+-- The sell remote refuses to work while the player is underground, so move to
+-- the surface above the field centre first and wait for the landing.
+function Sell.toSurface(character)
+    local root = character and character.PrimaryPart
+    if not root then
+        return false
+    end
+
+    local cell = Blocks.toBlock(root.Position)
+    if cell.Y < Config.surfaceDepth then
+        return true
+    end
+
+    local target = Vector3.new(
+        Config.fieldCenter.X,
+        Config.fieldCenter.Y + Config.emptyMineLift,
+        Config.fieldCenter.Z
+    )
+
+    logPrint(("autosell: leaving depth %d for the surface"):format(cell.Y))
+    Movement.jump(character, target)
+    Movement.waitLanded(character, Config.emptyMineWait)
+    return true
+end
+
+-- Independent watcher entry point: compares used vs max and runs the sell when
+-- full. Works even when no mode is running. Every skip reason is logged.
 function Sell.try(origin)
     local used, capacity, source = Sell.usage()
-    if not (capacity > 0 and used >= capacity) then
+
+    if not capacity or capacity <= 0 then
+        Sell.diag("nocap", ("autosell %s: no capacity used=%s src=%s"):format(
+            origin, tostring(used), tostring(source)))
+        return 0
+    end
+
+    if used < capacity then
+        Sell.diag("notfull", ("autosell %s: not full used=%d/%d src=%s"):format(
+            origin, used, capacity, tostring(source)))
         return 0
     end
 
@@ -1562,8 +1624,19 @@ function Sell.try(origin)
         return 0
     end
 
+    -- Never teleport out of an active BlockEvent/BlockMinedEvent window.
+    if Movement.holdRoot then
+        Sell.diag("busy", ("autosell %s: mining in progress, retry later"):format(origin))
+        return 0
+    end
+
     logPrint(("autosell trigger %s used=%d/%d src=%s enabled=%s"):format(
         origin, used, capacity, tostring(source), tostring(Sell.enabled)))
+
+    if Sell.enabled and not Sell.toSurface(Character.get()) then
+        Sell.diag("nosurface", "autosell: no character to move to the surface")
+        return 0
+    end
 
     return Sell.run(false, origin)
 end
@@ -1571,6 +1644,7 @@ end
 function Sell.run(force, origin)
     if not force then
         if not Sell.enabled then
+            Sell.diag("off", ("autosell %s: toggle off, sell skipped"):format(tostring(origin)))
             return 0
         end
         if not Sell.isFull() then
@@ -1593,12 +1667,31 @@ function Sell.run(force, origin)
     local used, capacity, source = Sell.usage()
     local nSelected = Sell.selectedCount()
 
-    logPrint(("sell run (%s) names=%d selected=%d used=%d/%d src=%s"):format(
+    local candidates, units = 0, 0
+
+    for _, name in ipairs(Sell.namesList or {}) do
+        if selected[name] then
+            local count = Sell.count(name)
+            if count > 0 then
+                candidates += 1
+                units += count
+            end
+        end
+    end
+
+    logPrint(("sell run (%s) names=%d selected=%d with=%d units=%d used=%d/%d src=%s"):format(
         tostring(origin or (force and "manual") or "auto"),
-        #(Sell.namesList or {}), nSelected, used, capacity, tostring(source)))
+        #(Sell.namesList or {}), nSelected, candidates, units,
+        used, capacity, tostring(source)))
+
+    if source ~= "client" then
+        logWarn("sell: inventory source=" .. tostring(source) .. ", per-resource counts may be 0")
+    end
 
     if nSelected == 0 then
         logWarn("autosell: no resources selected")
+    elseif candidates == 0 then
+        logWarn("autosell: selected resources have zero count")
     end
 
     for _, name in ipairs(Sell.namesList or {}) do
@@ -1784,9 +1877,6 @@ function Loot.collectAll(character)
             if not drop.Parent then
                 Loot.remove(drop)
                 picked += 1
-
-                -- Free space as soon as the pickup fills the inventory.
-                Sell.try("loot")
             else
                 index += 1
             end
@@ -1890,8 +1980,6 @@ local FarmMode = Mode.new("Farm", function(self)
         return
     end
 
-    Sell.try("tick")
-
     -- 1. Loot first: teleport to every own drop immediately.
     Loot.sync(true)
 
@@ -1939,9 +2027,6 @@ local FarmMode = Mode.new("Farm", function(self)
         end
 
         task.wait(Config.lootSpawnWait)
-
-        -- A broken block adds loot to the inventory: sell right away when full.
-        Sell.try("block")
         return true
     end
 
@@ -2267,6 +2352,7 @@ function Ui.create()
         desc = "sell selected resources when the backpack is full",
         callback = function(state)
             Sell.enabled = state
+            logPrint("autosell toggle " .. (state and "on" or "off"))
         end,
     })
 
@@ -2441,6 +2527,17 @@ if ok and window then
 else
     warn("[main] ui failed: " .. tostring(window))
 end
+
+-- Auto sell must work even when no mode is running: check every second.
+task.spawn(function()
+    while true do
+        local ok, err = pcall(Sell.try, "watch")
+        if not ok then
+            logWarn("autosell watch error: " .. tostring(err))
+        end
+        task.wait(1)
+    end
+end)
 
 local hotkeys = {
     [Enum.KeyCode.F1] = FarmMode,

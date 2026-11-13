@@ -148,8 +148,8 @@ Drops are `workspace.TargetFilter/{BlockName}_Drop` models with `DropScript.Play
 2. teleports to each drop with `Movement.jump`;
 3. waits `lootDwell` for the touch;
 4. removes collected drops and moves to the next;
-5. after every pickup calls `Sell.try("loot")`, and `Sell.try("block")` also runs after every
-   broken block, so the backpack is drained as soon as it is full.
+5. auto sell is independent of this loop: a 1 s watcher calls `Sell.try("watch")` even when
+   no mode is running.
 
 No radius limit, no batching: the character always goes to its own loot before mining again.
 

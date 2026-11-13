@@ -35,17 +35,35 @@ end
 
 ## When auto sell runs
 
-`Sell.try(origin)` compares used vs max and runs the sell when full. Triggers:
+`Sell.try(origin)` compares used vs max and runs the sell when full. It is fully
+independent from the farming modes:
 
-- `"tick"` — start of every Farm tick;
-- `"loot"` — right after each successful loot pickup;
-- `"block"` — right after a block breaks (`Mining.mine` returned `true`);
+- `"watch"` — background loop every 1 s, runs whether Farm/Mushroom is on or off;
 - `"manual"` — the "Sell now" button, forced and logged as `manual sell total`.
 
-Every trigger writes `autosell trigger <origin> used=U/M src=<source> enabled=<bool>`,
-and every actual run writes
-`sell run (<origin>) names=N selected=S used=U/M src=<source>`.
-If nothing is selected it also warns `autosell: no resources selected`.
+The remote refuses to work while the player is underground. Before firing it,
+`Sell.toSurface` checks `Blocks.toBlock(root.Position).Y`: if the player is below
+`Config.surfaceDepth`, it jumps to
+`fieldCenter + (0, emptyMineLift, 0)`, waits `emptyMineWait` for the landing and
+logs `autosell: leaving depth N for the surface`. If a mine is currently in its
+`BlockEvent`/`BlockMinedEvent` window (`Movement.holdRoot` is set), the sell is
+deferred to the next watcher tick instead of interrupting it.
+
+Diagnostics (throttled to one line per 10 s for repeated states):
+
+- `autosell toggle on|off` — toggle changed;
+- `autosell <origin>: not full used=U/M src=<source>`;
+- `autosell <origin>: no capacity ...`;
+- `autosell <origin>: toggle off, sell skipped`;
+- `autosell trigger <origin> used=U/M src=<source> enabled=<bool>`;
+- `sell run (<origin>) names=N selected=S with=C units=U used=U/M src=<source>`;
+- `sell: inventory source=<src>, per-resource counts may be 0`;
+- `autosell: no resources selected` / `autosell: selected resources have zero count`;
+- `inventory: InventoriesClient ready`, or a distinct warning for each load failure.
+
+The Auto sell list is built from `Ores.names()`, i.e. `Resources` entries with
+`Natural = true` only. Smelted bars, planks and sticks are not in the list, so a
+backpack full of them keeps `used` at max while every run sells `units=0`.
 
 `Sell.run()` without `force` still requires the Auto sell toggle and respects
 `sellCooldown = 1`.
