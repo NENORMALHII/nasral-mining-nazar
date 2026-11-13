@@ -1754,6 +1754,11 @@ function Loot.collectAll(character)
             if not drop.Parent then
                 Loot.remove(drop)
                 picked += 1
+
+                -- Free space as soon as the pickup fills the inventory.
+                if Sell.isFull() then
+                    Sell.run()
+                end
             else
                 index += 1
             end

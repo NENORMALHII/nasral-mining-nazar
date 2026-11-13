@@ -33,6 +33,15 @@ end
 `Sell.count` falls back to Backpack stacks and `LocalPlayer` attributes only if
 `InventoriesClient` is not loaded yet.
 
+## When auto sell runs
+
+- at the start of every Farm tick (`Sell.run()`);
+- right after each successful loot pickup: `Sell.isFull()` compares
+  `Inventory.usage()` used vs max, then `Sell.run()` sells the selected resources.
+
+`Sell.run()` without `force` still requires the Auto sell toggle and respects
+`sellCooldown = 1`. The "Sell now" button forces a run.
+
 ## Failure seen before the fix
 
 Logs `manual sell total 0` and `sell: names=22 selected=20, used=232/525`
