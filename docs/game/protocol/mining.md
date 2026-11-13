@@ -143,12 +143,26 @@ the surface (`Blocks.toBlock(root.Position).Y < surfaceDepth = 2`):
 3. `Surface.depth(mine, x, z, topY)` counts empty cells from the player's own layer down to the
    first solid block, capped at `surfaceMaxDepth = 10`. If no floor is found the column is
    outside the generated mine and is ignored.
-4. `Surface.find` scans a `±6` block square, picks the deepest column with
-   `depth >= surfaceMinDepth = 2`, ties by distance. A normal surface column has depth 1; a
-   one-block hole already has depth 2.
-5. If the player is not above the pit, `Movement.jump` moves them to the mouth — the same block
+4. `Surface.scan` is the single pit finder used by both the surface entry and the reset:
+   it scans a `±6` block square, keeps only columns with `depth >= minDepth` that also pass
+   `Surface.safe`, picks the deepest, ties by distance.
+5. `Surface.safe(mine, cell, depth)` is the teleport guard. A cell is accepted only when:
+   - the cell itself is empty;
+   - the floor block at `cell.Y + depth` exists in `Workspace.Mine`;
+   - `Surface.sides` finds at least `surfaceSideMin = 4` solid mine blocks among the 8
+     horizontal directions at the floor level.
+
+   `Surface.sides` is the side "raycast": 8 block probes in `Surface.dirs`
+   (4 straight + 4 diagonal). It rejects map edges, floating single columns and isolated
+   holes, so a teleport target is always inside the generated mine.
+6. `Surface.find(position)` runs the scan on the player's own layer with
+   `surfaceMinDepth = 2` (normal surface column has depth 1; a one-block hole already
+   has depth 2). `Surface.resetPoint()` runs the same scan on the fixed surface layer
+   `y = -1` around the field centre with `minDepth = 1`, then returns
+   `Blocks.worldOf(cell) + teleportLift`.
+7. If the player is not above the pit, `Movement.jump` moves them to the mouth — the same block
    cell at the player's current Y — and the tick ends. The next tick the character drops in.
-6. Above the mouth, the bot mines the block under the feet and waits to land. If there is no
+8. Above the mouth, the bot mines the block under the feet and waits to land. If there is no
    block under the feet it simply falls.
 
 No pit cache, no remembered pit and no ban list: the surface scan is one small loop and the

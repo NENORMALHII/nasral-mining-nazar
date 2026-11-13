@@ -41,6 +41,7 @@ local Config = {
     surfaceScanRadius = 6,
     surfaceMaxDepth = 10,
     surfaceMinDepth = 2,
+    surfaceSideMin = 4,
     fieldCenter = Vector3.new(89.5, 7998.5, -21.5),
     fieldRadius = 14,
     emptyMineLift = 20,
@@ -628,6 +629,14 @@ end
 
 local Surface = {}
 
+-- Eight horizontal directions used to probe the sides of a pit/target cell.
+Surface.dirs = {
+    Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0),
+    Vector3.new(0, 0, 1), Vector3.new(0, 0, -1),
+    Vector3.new(1, 0, 1), Vector3.new(1, 0, -1),
+    Vector3.new(-1, 0, 1), Vector3.new(-1, 0, -1),
+}
+
 -- Depth of an open column: number of empty cells from topY down to the first
 -- solid block. nil means no floor inside surfaceMaxDepth, i.e. outside the mine.
 function Surface.depth(mine, x, z, topY)
@@ -648,8 +657,68 @@ function Surface.atField(position)
     return dx * dx + dz * dz <= Config.fieldRadius * Config.fieldRadius
 end
 
--- Deepest valid pit around the player. Returns a block cell on the player's
--- own layer, which is also the cell to stand in before dropping down.
+-- Solid mine blocks in the 8 horizontal directions at the floor level.
+function Surface.sides(mine, cell, floorY)
+    local solid = 0
+
+    for _, dir in ipairs(Surface.dirs) do
+        local side = Vector3.new(cell.X + dir.X, floorY, cell.Z + dir.Z)
+        if mine:FindFirstChild(vec3ToString(side)) then
+            solid += 1
+        end
+    end
+
+    return solid
+end
+
+-- A pit cell is safe only when it is empty, has a solid floor and is surrounded
+-- by mine blocks. The side probe rejects map edges and floating single columns.
+function Surface.safe(mine, cell, depth)
+    if mine:FindFirstChild(vec3ToString(cell)) then
+        return false
+    end
+
+    local floorY = cell.Y + depth
+
+    if not mine:FindFirstChild(vec3ToString(Vector3.new(cell.X, floorY, cell.Z))) then
+        return false
+    end
+
+    return Surface.sides(mine, cell, floorY) >= Config.surfaceSideMin
+end
+
+-- Deepest safe pit around `center` on layer `topY`. One implementation for both
+-- the normal surface entry and the post-rejection reset.
+function Surface.scan(mine, center, topY, minDepth)
+    local best, bestDepth, bestDistance
+    local radius = Config.surfaceScanRadius
+
+    for dx = -radius, radius do
+        for dz = -radius, radius do
+            local cell = Vector3.new(center.X + dx, topY, center.Z + dz)
+            local depth = Surface.depth(mine, cell.X, cell.Z, topY)
+
+            if depth and depth >= minDepth and Surface.safe(mine, cell, depth) then
+                local distance = dx * dx + dz * dz
+
+                if not bestDepth
+                    or depth > bestDepth
+                    or (depth == bestDepth and distance < bestDistance) then
+                    best, bestDepth, bestDistance = cell, depth, distance
+                end
+            end
+        end
+    end
+
+    if best then
+        logPrint(("pit %s depth=%d sides=%d"):format(
+            vec3ToString(best), bestDepth, Surface.sides(mine, best, best.Y + bestDepth)))
+    end
+
+    return best
+end
+
+-- Cell to stand in before dropping down, on the player's own layer.
 function Surface.find(position)
     local mine = workspace:FindFirstChild(Config.mineName)
     if not mine then
@@ -658,88 +727,24 @@ function Surface.find(position)
 
     Blocks.calibrate()
 
-    local center = Blocks.toBlock(position)
-    local topY = center.Y
-    local best, bestDepth, bestDistance
-    local radius = Config.surfaceScanRadius
-
-    for dx = -radius, radius do
-        for dz = -radius, radius do
-            local x, z = center.X + dx, center.Z + dz
-            local depth = Surface.depth(mine, x, z, topY)
-
-            if depth and depth >= Config.surfaceMinDepth then
-                local distance = dx * dx + dz * dz
-
-                if not bestDepth
-                    or depth > bestDepth
-                    or (depth == bestDepth and distance < bestDistance) then
-                    best = Vector3.new(x, topY, z)
-                    bestDepth = depth
-                    bestDistance = distance
-                end
-            end
-        end
-    end
-
-    if not best then
-        return nil
-    end
-
-    logPrint(("surface pit %s depth=%d"):format(vec3ToString(best), bestDepth))
-    return best
+    local cell = Blocks.toBlock(position)
+    return Surface.scan(mine, cell, cell.Y, Config.surfaceMinDepth)
 end
 
--- Reset target after a rejection streak. Scans the fixed surface layer (y = -1,
--- the empty cell above the ground block) around the field centre only, so it can
--- never land outside the generated mine. Returns a world position whose cell is
--- empty and which has a solid floor below, plus a tiny lift.
+-- Reset target after a rejection streak: the same scan on the fixed surface
+-- layer around the field centre, so it can never leave the generated mine.
 function Surface.resetPoint()
     local mine = workspace:FindFirstChild(Config.mineName)
     if not mine then
         return nil
     end
 
-    local center = Blocks.toBlock(Config.fieldCenter)
-    local topY = -1
-    local best, bestDepth, bestDistance
-    local radius = Config.surfaceScanRadius
-
-    for dx = -radius, radius do
-        for dz = -radius, radius do
-            local x, z = center.X + dx, center.Z + dz
-            local depth = Surface.depth(mine, x, z, topY)
-
-            if depth and depth >= 1 then
-                local distance = dx * dx + dz * dz
-
-                if not bestDepth
-                    or depth > bestDepth
-                    or (depth == bestDepth and distance < bestDistance) then
-                    best = Vector3.new(x, topY, z)
-                    bestDepth = depth
-                    bestDistance = distance
-                end
-            end
-        end
-    end
-
-    if not best then
+    local cell = Surface.scan(mine, Blocks.toBlock(Config.fieldCenter), -1, 1)
+    if not cell then
         return nil
     end
 
-    -- Validate once more right before the teleport: the cell must stay empty and
-    -- the floor below must still be a mine block.
-    if mine:FindFirstChild(vec3ToString(best)) then
-        return nil
-    end
-
-    if not mine:FindFirstChild(vec3ToString(best + Vector3.new(0, 1, 0))) then
-        return nil
-    end
-
-    logPrint(("reset point %s depth=%d"):format(vec3ToString(best), bestDepth))
-    return Blocks.worldOf(best) + Vector3.new(0, Config.teleportLift, 0)
+    return Blocks.worldOf(cell) + Vector3.new(0, Config.teleportLift, 0)
 end
 
 ---------------------------------------------------------------------------
