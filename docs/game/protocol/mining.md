@@ -57,6 +57,27 @@ Server side is not in the place dump, so server checks below are inferred.
 - `IsBlockBesideLiquid` checks 6 offsets, skipping the one with `offset.Y == 1` (below the block).
 - `ConvertWorldPosToBlock` uses `Mine.WorldspaceOffset = (-31, -16, -98.5)`, which differs from `Util.GetWorldCoords`; in the live game `block.Position` is authoritative.
 
+## Block index and origin
+
+Two client-side speedups in `src/main.lua`:
+
+- `Index` — one dictionary `name -> block`, built from a single `Mine:GetChildren()` and
+  kept in sync with `ChildAdded`/`ChildRemoved`. Every lookup that used to call
+  `mine:FindFirstChild(vec3ToString(cell))` now uses `Index.at(cell)`; this removes the
+  child walk and most of the string formatting cost in the 7x7x7 scans.
+- `Blocks.origin` — one world point derived from a block with `MinePosition`:
+  `origin = block.Position - (7*mp.X, -7*mp.Y, 7*mp.Z)`. `Blocks.toBlock` and
+  `Blocks.worldOf` are a single subtraction/addition around that origin (no `BASE_*`
+  constants and no `offset` correction pass). `Blocks.standPoint(cell)` returns the cell
+  centre `+0.5` Y so the root is never on a cell boundary.
+
+`Blocks.calibrate()` cannot reset the origin to a guess: if the first radius query
+(`workspace:GetPartBoundsInRadius` around the field centre) finds nothing or the two
+nearest blocks disagree, the old origin is kept, `calibrated` stays `false` and the
+measurement is retried after the 5 s gate. A `WorldId` change forces a re-measure.
+`Blocks.liquidNeighbours(cell)` is the single Oil/Lava neighbour check shared by
+`Mining.besideLiquid` and Farm.
+
 `ReplicatedStorage.Modules.Constants`:
 
 - `ATTR_WORLD_ID = "WorldId"`, `ATTR_MINE_POSITION = "MinePosition"`.
@@ -73,11 +94,14 @@ Empty selection means nothing is selected.
 There is no seed hashing and no depth heuristic. `Ores.nearest(position, radius)`:
 
 - converts the player position to block coordinates (`Blocks.toBlock`);
-- scans only the `±ceil(radius/7)` cube around the player with
-  `mine:FindFirstChild("x,y,z")`, instead of iterating every child of `Workspace.Mine`;
+- scans only the `±ceil(radius/7)` cube around the player with `Index.at(cell)`, instead
+  of iterating every child of `Workspace.Mine`;
 - skips blocks that are not selected, invalid (world, `Dug`, `MinePosition`) or out of range;
-- score: `BasePrice * 1000 - distance`, so the most valuable block wins and distance breaks ties;
-- `Ores.ignore(block)` skips a failed block for 5 s.
+- collects the cheap candidates, sorts them by `BasePrice * 1000 - distance`, then calls
+  the expensive `Mining.why` lazily only until one candidate passes (liquid checks no
+  longer waste a full tick per rejected ore);
+- `Ores.ignore(block)` skips a failed block for 5 s; `ignored` uses weak keys so destroyed
+  blocks are not retained.
 
 Radius is `Mining.reach() = Pick.MaxDistance - 4` (21 studs).
 
@@ -100,10 +124,10 @@ so teleporting to the block centre was unnecessary and caused `BlockMinedEvent` 
 - Every move sets `Movement.lastMoveAt`; Farm waits `moveCooldown` (0.5 s) before the next
   `BlockEvent`, so mining never starts in the same tick as a position change.
 - Stability: `Movement.release` zeroes `AssemblyLinearVelocity`/`AssemblyAngularVelocity`
-  before un-anchoring, so tween momentum does not carry into the humanoid. Targets that come
-  from block/part centres (loot drops, field centre, pit mouth) are lifted by
-  `Config.teleportLift = 3.5`, otherwise the root spawns inside the floor and the character
-  tumbles on release.
+  before un-anchoring, so tween momentum does not carry into the humanoid. Block targets use
+  `Blocks.standPoint(cell)` (cell centre `+0.5` Y), never a cell boundary: a `+3.5` lift is
+  exactly half a cell and `rawBlock` rounds it to the neighbouring cell. Loot drop parts
+  (not cells) still use the old `Config.teleportLift = 3.5` lift.
 - `HumanoidRootPart` is anchored during tweens, during the `BlockEvent`/`BlockMinedEvent`
   window, and while the `Mine` container has no blocks at all (see the empty-field rule below).
 - Empty field (`Mine` has zero children): there is nothing to dig and no ground, so digging down
@@ -116,16 +140,20 @@ so teleporting to the block centre was unnecessary and caused `BlockMinedEvent` 
   succeed. Farm then jumps one column sideways, keeping the current height, into the richest
   neighbouring cell that is empty at our level and has a diggable floor block below it.
   Without this the loop re-attempted the same undiggable block every `loopDelay` and idled.
-  If no neighbour qualifies it logs `down-block undiggable, no side escape` and waits 1 s.
+  If no neighbour qualifies it logs `down-block undiggable, no side escape (N)` and waits
+  1 s; after `Config.maxSideFails = 3` consecutive failures it sets
+  `Mining.resetRequested = true` (`side escape failed too often, requesting surface reset`)
+  instead of looping forever.
 - Liquid escape (`escapeLiquid` in `src/main.lua`): when the bot is fully stuck in liquid,
   i.e. at least `Config.liquidStuckCount = 4` of the 5 horizontal neighbours are
   `LiquidResource` (Oil/Lava), sidestepping cannot help. Farm raises the search one block
-  above the stuck cell (`cell + (0, -1, 0)`), shuffles the 8 horizontal block directions,
-  and walks each one up to `Config.liquidSearchRange = 16` blocks until it finds a block
-  with `Mining.why(block) == nil`. Blocks at the liquid level and below are never mined.
-  On a hit it logs `liquid escape -> x,y,z (Type)` and teleports on top of that block
-  (`Blocks.worldOf(cell) + teleportLift`); the next Farm tick digs it as the block under
-  the feet.
+  above the stuck cell (`cell + (0, -1, 0)`), then searches by increasing distance
+  (outer loop `1..liquidSearchRange = 16`, inner loop over the shuffled 8 directions), so
+  the nearest mineable block wins instead of the first direction that happens to hit.
+  Blocks at the liquid level and below are never mined. On a hit it logs
+  `liquid escape -> x,y,z (Type)`, checks that the cell above the block is empty and
+  teleports into that cell with `Blocks.standPoint`; the next Farm tick digs it as the
+  block under the feet.
 
 ## Surface pits
 
@@ -136,37 +164,39 @@ the surface (`Blocks.toBlock(root.Position).Y < surfaceDepth = 2`):
    `Movement.jump` moves them there once and the tick ends. Pit detection only runs inside the
    field.
 2. Block names are built from `MinePosition`, which can be shifted from the world formula by a
-   constant. `Blocks.calibrate()` measures that shift once: it finds the two blocks nearest to
-   the field centre, computes `offset = MinePosition - rawBlock(block.Position)` for both, and
-   accepts it only when both agree. `Blocks.toBlock` adds the offset, `Blocks.worldOf` subtracts
-   it, so every name lookup is exact. Unstable offsets are rejected (kept at zero).
-3. `Surface.depth(mine, x, z, topY)` counts empty cells from the player's own layer down to the
-   first solid block, capped at `surfaceMaxDepth = 10`. If no floor is found the column is
+   constant. `Blocks.calibrate()` measures `Blocks.origin` once (see "Block index and origin")
+   and keeps the previous origin until a stable new one is found.
+3. `Surface.depth(mine, x, z, topY)` counts empty cells from `topY` down to the first solid
+   block via `Index.at`, capped at `surfaceMaxDepth = 10`. If no floor is found the column is
    outside the generated mine and is ignored.
 4. `Surface.scan` is the single pit finder used by both the surface entry and the reset:
-   it scans a `±6` block square, keeps only columns with `depth >= minDepth` that also pass
-   `Surface.safe`, picks the deepest, ties by distance.
+   it scans a `±6` block square, collects every column with `depth >= minDepth`, sorts by
+   depth (deepest first, ties by distance), then runs the star check only until the first
+   valid candidate.
 5. `Surface.safe(mine, cell, depth)` is the teleport guard. A cell is accepted only when:
    - the cell itself is empty;
    - the floor block at `cell.Y + depth` exists in `Workspace.Mine`;
-   - `Surface.sides` finds at least `surfaceSideMin = 4` solid mine blocks among the 8
-     horizontal directions at the floor level.
+   - `Surface.star` hits solid mine blocks in **all 8** horizontal directions.
 
-   `Surface.sides` is the side "raycast": 8 block probes in `Surface.dirs`
-   (4 straight + 4 diagonal). It rejects map edges, floating single columns and isolated
-   holes, so a teleport target is always inside the generated mine.
-6. `Surface.find(position)` runs the scan on the player's own layer with
-   `surfaceMinDepth = 2` (normal surface column has depth 1; a one-block hole already
-   has depth 2). `Surface.resetPoint()` runs the same scan on the fixed surface layer
-   `y = -1` around the field centre with `minDepth = 1`, then returns
-   `Blocks.worldOf(cell) + teleportLift`.
-7. If the player is not above the pit, `Movement.jump` moves them to the mouth — the same block
-   cell at the player's current Y — and the tick ends. The next tick the character drops in.
-8. Above the mouth, the bot mines the block under the feet and waits to land. If there is no
+   `Surface.star` is the side "raycast" in a star pattern: for each of the 8 directions in
+   `Surface.dirs` (4 straight + 4 diagonal) it walks outward up to
+   `surfaceProbeDepth = 6` blocks at the floor level until a solid block is met, and counts
+   the directions that hit. Requiring 8/8 rejects map edges, floating single columns and
+   holes that are not surrounded by generated terrain, so a teleport target is always
+   inside the generated mine.
+6. The surface layer is the constant `y = -1` for both entry and reset, not the player's
+   rounded root cell, so the chosen pit does not move when the root rounds differently.
+7. `Surface.find(position)` runs the scan with `surfaceMinDepth = 2` (normal surface column
+   has depth 1; a one-block hole already has depth 2) and caches the result in
+   `Surface.pit`. Each tick only a cheap validity check runs (`depth >= 2` still true);
+   a full rescan happens when that fails or after a reset (`Surface.pit = nil`).
+   `Surface.resetPoint()` runs the same scan around the field centre with `minDepth = 1`
+   and returns `Blocks.standPoint(cell)` (cell centre `+0.5` Y).
+8. If the player is not above the pit, `Movement.jump` moves them to the mouth — the pit
+   cell itself, which is validated as empty — using `Blocks.standPoint(pit)`. The next tick
+   the character drops in.
+9. Above the mouth, the bot mines the block under the feet and waits to land. If there is no
    block under the feet it simply falls.
-
-No pit cache, no remembered pit and no ban list: the surface scan is one small loop and the
-normal dig-down path handles anything the pit cannot.
 
 ## Client modes
 
@@ -247,13 +277,13 @@ zeroed by any successful break. The log line carries `streak=N`. At
 `Config.maxRejects = 5` the bot sets `Mining.resetRequested`; on the next Farm tick it:
 
 1. clears cached mapping and scan state: `Blocks.calibrated = false`,
-   `Blocks.lastCalibrate = 0`, `Blocks.offset = Vector3.zero`, `Ores.clearCache()`
-   (scan cell, cached target, ignore timers), then recalibrates;
+   `Blocks.lastCalibrate = 0`, `Surface.pit = nil`, `Ores.clearCache()` (scan cell,
+   cached target, ignore timers), then recalibrates. The previous `Blocks.origin` is
+   kept until a stable new one is found;
 2. calls `Surface.resetPoint()`: scans only the fixed surface layer `y = -1` within
    `surfaceScanRadius` of the field centre, accepts a cell only when `Surface.depth`
-   says depth >= 1 (cell empty, solid floor below), re-checks both the empty cell and
-   the floor block in `Workspace.Mine`, and returns
-   `Blocks.worldOf(cell) + teleportLift`;
+   says depth >= 1 (cell empty, solid floor below), re-checks the cell/floor and the 8-ray
+   star, then returns `Blocks.standPoint(cell)`;
 3. logs `reset point x,y,z depth=N` and `mining reset: teleport to ..., caches cleared`,
    jumps there and waits for the landing.
 
@@ -358,3 +388,18 @@ Base time preference: server `UpdatePickaxe` value, then `Tools.Pickaxes[key].Ba
 then `Config.defaultMineTime`. The bot forces one unequip/equip after binding so the server event
 is received, waits up to 6 heartbeats, and logs
 `pickaxe ready base=... source=server|table|default handle=...`.
+
+## Performance notes
+
+- `Index` removes `FindFirstChild` child walks from every block scan; only `Index.at` remains.
+- `typeOf` is cached in a weak table (`block -> type`) and `Mining.maxDistance` is cached per
+  pickaxe, so the hot scans do not re-read attributes or `MaxDistance`.
+- `ignored` and `mushroomIgnored` use weak keys, so destroyed blocks are not retained.
+- `Surface.scan` sorts candidates once and runs the 8-ray star check lazily; `Surface.pit` is
+  reused until the cheap validity check fails or a reset clears it.
+- `Ores.nearest` collects candidates cheaply, sorts by score and calls `Mining.why` only until
+  the first candidate passes.
+- `Movement.cancel` was removed: `Movement.release` is the single cleanup function.
+- StreamingEnabled caveat: if `workspace.StreamingEnabled` is true, a missing client block does
+  not mean the block is missing on the server. `Surface.depth` would report "no floor" and the
+  star check would see a map edge where there is none. The bot assumes streaming is off.
