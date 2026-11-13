@@ -127,14 +127,19 @@ so teleporting to the block centre was unnecessary and caused `BlockMinedEvent` 
   the character anchored, and re-checks every `Config.emptyMineWait` seconds. The jump only fires
   again when the character is more than 4 studs from that point, so the loop no longer teleports
   and falls every tick. `Movement.releaseHold()` runs on the first tick that sees blocks again.
-- Side escape (`stepAside` in `src/main.lua`): if the block under the feet fails `Mining.why`
-  (liquid neighbour, `Oil/Lava/Grass/Void`, another player's `Dug`), digging down can never
-  succeed. Farm then searches ring by ring outwards (radius `1..Config.sideSearchRadius = 10`)
-  for a cell that is empty at the current layer and whose floor block passes `Mining.why`.
-  Inside each ring the richest floor wins. The search stops at the first ring with a
-  candidate, logs `step aside r=N -> x,y,z` and teleports to `Blocks.standPoint(cell)` —
-  the cell centre, so `Blocks.below()` on the next tick still points at the validated floor
-  and not at a boundary-rounded neighbour. If no candidate exists inside the radius it logs
+- Liquid floor is special-cased: when `Mining.why(below)` is `liquid` or `blocked`, Farm
+  never even attempts `mine(below)` (the block borders liquid and cannot break) and does not
+  mine any lower ore either. It logs `floor blocked (<reason>), forcing side escape` and
+  immediately runs the side escape.
+- Side escape (`stepAside` in `src/main.lua`) is selection-independent: the ore selection is
+  ignored, any resource is allowed when escaping. Farm searches ring by ring outwards
+  (radius `1..Config.sideSearchRadius = 10`). For each ring it first tries the current layer
+  (`dy = 0`), then one block UP (`dy = -1`); the floor below that up-cell is the
+  current-layer side block, so this moves sideways or up, never down. Inside each ring the
+  richest floor wins. The first ring with a candidate logs `step aside r=N [up] -> x,y,z`
+  and teleports to `Blocks.standPoint(cell)` — the cell centre, so `Blocks.below()` on the
+  next tick still points at the validated floor and not at a boundary-rounded neighbour.
+  If no candidate exists inside the radius it logs
   `down-block undiggable, no side escape within N` and waits 1 s, then retries.
 - Liquid escape (`escapeLiquid` in `src/main.lua`): when the bot is fully stuck in liquid,
   i.e. at least `Config.liquidStuckCount = 4` of the 5 horizontal neighbours are

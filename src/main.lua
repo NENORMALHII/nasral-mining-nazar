@@ -2398,24 +2398,25 @@ local function stepAside(character, root)
 
     local cell = Blocks.toBlock(root.Position)
 
-    -- Expand ring by ring: a single ring of 4 neighbours can be all liquid or
-    -- all undiggable, so keep looking outwards until a column is found.
-    for radius = 1, Config.sideSearchRadius do
+    -- Selection-independent: escape may use any adjacent resource, selected or
+    -- not. `dy` = 0 stays on the current layer, `dy = -1` moves one block UP
+    -- (the floor below that cell is the current-layer side block). Never down.
+    local function bestAt(radius, dy)
         local best, bestPrice
 
         for dx = -radius, radius do
             for dz = -radius, radius do
-                if math.max(math.abs(dx), math.abs(dz)) == radius then
-                    local side = cell + Vector3.new(dx, 0, dz)
+                if math.max(math.abs(dx), math.abs(dz)) == radius and not (dx == 0 and dz == 0) then
+                    local stand = cell + Vector3.new(dx, dy, dz)
 
-                    if not mine:FindFirstChild(vec3ToString(side)) then
-                        local floor = mine:FindFirstChild(vec3ToString(side + Vector3.new(0, 1, 0)))
+                    if not mine:FindFirstChild(vec3ToString(stand)) then
+                        local floor = mine:FindFirstChild(vec3ToString(stand + Vector3.new(0, 1, 0)))
 
                         if floor and Mining.why(floor) == nil then
                             local price = Ores.price(typeOf(floor) or "")
 
                             if not best or price > bestPrice then
-                                best, bestPrice = side, price
+                                best, bestPrice = stand, price
                             end
                         end
                     end
@@ -2423,11 +2424,24 @@ local function stepAside(character, root)
             end
         end
 
+        return best
+    end
+
+    for radius = 1, Config.sideSearchRadius do
+        local best = bestAt(radius, 0)
+        local up = false
+
+        if not best then
+            best = bestAt(radius, -1)
+            up = best ~= nil
+        end
+
         if best then
-            logPrint(("step aside r=%d -> %s"):format(radius, vec3ToString(best)))
+            logPrint(("step aside r=%d %s-> %s"):format(
+                radius, up and "up " or "", vec3ToString(best)))
 
             -- Cell centre, so Blocks.below() afterwards still points at the
-            -- floor that was just validated (not a neighbour cell).
+            -- validated floor and not at a boundary-rounded neighbour.
             Movement.jump(character, Blocks.standPoint(best))
             return
         end
@@ -2594,6 +2608,23 @@ local FarmMode = Mode.new("Farm", function(self)
         end
     end
 
+    local below = Blocks.below(root.Position)
+    local belowReason = below and Mining.why(below)
+
+    -- Liquid-adjacent (or otherwise blocked) floor: this block can never be
+    -- broken, and mining anything below the current layer would only dig into
+    -- the same liquid pocket. Ignore the ore selection and escape sideways/up.
+    if belowReason == "liquid" or belowReason == "blocked" then
+        logWarn(("floor blocked (%s), forcing side escape"):format(tostring(belowReason)))
+
+        if escapeLiquid(character, root) then
+            return
+        end
+
+        stepAside(character, root)
+        return
+    end
+
     -- 3. Mine the best selected block already in reach. No movement.
     local ore = Ores.nearest(root.Position, Mining.reach())
 
@@ -2605,8 +2636,6 @@ local FarmMode = Mode.new("Farm", function(self)
     end
 
     -- 4. Nothing reachable: dig straight down, one block at a time.
-    local below = Blocks.below(root.Position)
-
     if not below then
         -- Fell into a liquid pocket with no floor: climb out one block up.
         if escapeLiquid(character, root) then
