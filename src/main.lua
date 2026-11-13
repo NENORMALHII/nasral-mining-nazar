@@ -60,7 +60,8 @@ local Config = {
     sellCapacity = 200,
     sellCooldown = 1,
     sellAnchorY = 8014,
-    sellHoldAfter = 5,
+    sellHoldBefore = 3,
+    sellHoldAfter = 2,
 
     blockEvent = "BlockEvent",
     minedEvent = "BlockMinedEvent",
@@ -1737,14 +1738,14 @@ function Sell.try(origin)
             return 0
         end
 
-        -- Hold the root exactly at sellAnchorY while the remote runs and for
-        -- sellHoldAfter seconds after the last sale.
+        -- Hold exactly at sellAnchorY: sellHoldBefore seconds before the sale,
+        -- the whole sale, then sellHoldAfter seconds after the last remote.
         if not Sell.holdForSale(character) then
             Sell.diag("nosurface", "autosell: no root to anchor for the sale")
             return 0
         end
 
-        task.wait(Config.moveBuffer)
+        task.wait(Config.sellHoldBefore)
         local value = Sell.run(false, origin)
         task.wait(Config.sellHoldAfter)
         Movement.releaseHold()
@@ -1847,7 +1848,7 @@ function Sell.manual()
     local ok, sold = pcall(function()
         Sell.toSurface(character)
         Sell.holdForSale(character)
-        task.wait(Config.moveBuffer)
+        task.wait(Config.sellHoldBefore)
         local value = Sell.run(true, "manual")
         task.wait(Config.sellHoldAfter)
         Movement.releaseHold()

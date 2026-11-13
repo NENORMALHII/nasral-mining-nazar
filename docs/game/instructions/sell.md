@@ -54,10 +54,11 @@ so the sale always happens at the same coordinates. It logs
 `BlockEvent`/`BlockMinedEvent` window (`Movement.holdRoot` is set), the sell is
 deferred to the next watcher tick instead of interrupting it.
 
-`Sell.holdForSale` anchors the root exactly at `(fieldCenter.X, 8014, fieldCenter.Z)`
-for the whole sale, then waits `Config.sellHoldAfter = 5` s after the last remote,
-and only then calls `Movement.releaseHold`. Without the anchor the character falls
-from y=8014 and the server rejects part of the sale.
+`Sell.holdForSale` anchors the root exactly at `(fieldCenter.X, 8014, fieldCenter.Z)`.
+Timeline: `Config.sellHoldBefore = 3` s on the anchor, then all `InvokeServer` calls,
+then `Config.sellHoldAfter = 2` s on the anchor after the last remote, and only then
+`Movement.releaseHold`. Without the anchor the character falls from y=8014 and the
+server rejects part of the sale.
 `Sell.busy` is set for the whole
 surface trip, and `FarmMode`/`MushroomMode` return immediately while it is set,
 so they cannot move the character or clear the anchor mid-sale.
