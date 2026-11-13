@@ -3,6 +3,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
 
 ---------------------------------------------------------------------------
 -- Config
@@ -36,6 +37,7 @@ local Config = {
     mineReachMargin = 4,
     moveCooldown = 0.5,
     maxRejects = 5,
+    sideSearchRadius = 10,
 
     surfaceDepth = 2,
     surfaceScanRadius = 6,
@@ -72,6 +74,123 @@ local Config = {
     pickaxeRemote = "UpdatePickaxe",
     defaultMineTime = 4,
 }
+
+---------------------------------------------------------------------------
+-- Settings (executor standard: writefile/readfile/isfile/makefolder + JSON)
+---------------------------------------------------------------------------
+
+local Settings = {
+    path = "nm2/settings.json",
+    fallbackPath = "nm2_settings.json",
+    data = {},
+    loaded = false,
+}
+
+local function settingsReady()
+    return type(writefile) == "function"
+        and type(readfile) == "function"
+        and type(isfile) == "function"
+end
+
+function Settings.load()
+    if Settings.loaded then
+        return Settings.data
+    end
+
+    Settings.loaded = true
+
+    if not settingsReady() then
+        return Settings.data
+    end
+
+    local source = Settings.path
+    local existsOk, exists = pcall(isfile, source)
+
+    if not existsOk or not exists then
+        source = Settings.fallbackPath
+        existsOk, exists = pcall(isfile, source)
+    end
+
+    if not existsOk or not exists then
+        return Settings.data
+    end
+
+    local readOk, text = pcall(readfile, source)
+    if not readOk or type(text) ~= "string" or text == "" then
+        return Settings.data
+    end
+
+    Settings.lastJson = text
+
+    local decodeOk, decoded = pcall(function()
+        return HttpService:JSONDecode(text)
+    end)
+
+    if decodeOk and type(decoded) == "table" then
+        Settings.data = decoded
+    end
+
+    return Settings.data
+end
+
+function Settings.get(key, fallback)
+    local value = Settings.load()[key]
+    if value == nil then
+        return fallback
+    end
+    return value
+end
+
+function Settings.persist()
+    if not settingsReady() then
+        return
+    end
+
+    local okEncode, text = pcall(function()
+        return HttpService:JSONEncode(Settings.data)
+    end)
+
+    if not okEncode or text == Settings.lastJson then
+        return
+    end
+
+    Settings.lastJson = text
+
+    local okWrite = pcall(function()
+        if type(makefolder) == "function" then
+            pcall(makefolder, "nm2")
+        end
+        writefile(Settings.path, text)
+    end)
+
+    if not okWrite then
+        pcall(writefile, Settings.fallbackPath, text)
+    end
+end
+
+function Settings.set(key, value)
+    Settings.load()
+    Settings.data[key] = value
+    Settings.persist()
+end
+
+-- List of option indexes (selection), always a table of numbers.
+function Settings.indices(key, fallback)
+    local value = Settings.get(key)
+    if type(value) ~= "table" then
+        return fallback
+    end
+
+    local list = {}
+
+    for _, index in ipairs(value) do
+        if type(index) == "number" then
+            table.insert(list, index)
+        end
+    end
+
+    return list
+end
 
 ---------------------------------------------------------------------------
 -- Ping tracker (rolling min for stable safety buffer)
@@ -612,6 +731,12 @@ function Blocks.calibrate()
     Blocks.offset = firstOffset
     Blocks.calibrated = true
     logPrint(("blocks offset %s"):format(tostring(Blocks.offset)))
+end
+
+-- Centre of an empty cell: the root lands inside the same cell whose floor was
+-- validated, not on a cell boundary that can round to a neighbour.
+function Blocks.standPoint(cell)
+    return Blocks.worldOf(cell) + Vector3.new(0, 0.5, 0)
 end
 
 function Blocks.below(worldPosition)
@@ -1424,7 +1549,7 @@ function Ores.nearest(position, radius)
 
     local reach = math.ceil(limit / 7)
     local selected = Ores.selectedSet()
-    local best, bestScore
+    local candidates = {}
 
     for dx = -reach, reach do
         for dy = -reach, reach do
@@ -1440,15 +1565,29 @@ function Ores.nearest(position, radius)
                         local name = typeOf(block)
 
                         if name and (not selected or selected[name]) and Mining.valid(block) == nil then
-                            local score = Ores.price(name) * 1000 - distance
-
-                            if not bestScore or score > bestScore then
-                                best, bestScore = block, score
-                            end
+                            table.insert(candidates, {
+                                block = block,
+                                score = Ores.price(name) * 1000 - distance,
+                            })
                         end
                     end
                 end
             end
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        return a.score > b.score
+    end)
+
+    -- Mining.valid is cheap but does not know about liquids: ask Mining.why
+    -- lazily, and only for the sorted candidates until one really passes.
+    local best
+
+    for _, candidate in ipairs(candidates) do
+        if candidate.block.Parent and Mining.why(candidate.block) == nil then
+            best = candidate.block
+            break
         end
     end
 
@@ -2222,18 +2361,23 @@ local function escapeLiquid(character, root)
         directions[index], directions[swap] = directions[swap], directions[index]
     end
 
-    for _, direction in ipairs(directions) do
-        for distance = 1, Config.liquidSearchRange do
+    -- Distance outer, directions inner: take the nearest mineable block instead
+    -- of the first direction that happens to hit far away.
+    for distance = 1, Config.liquidSearchRange do
+        for _, direction in ipairs(directions) do
             local target = up + direction * distance
             local block = mine:FindFirstChild(vec3ToString(target))
 
             if block and Mining.why(block) == nil then
-                logPrint(("liquid escape -> %s (%s)"):format(
-                    vec3ToString(target), tostring(typeOf(block))))
+                local stand = target + Vector3.new(0, -1, 0)
 
-                Movement.jump(character, Blocks.worldOf(target)
-                    + Vector3.new(0, Config.teleportLift, 0))
-                return true
+                if not mine:FindFirstChild(vec3ToString(stand)) then
+                    logPrint(("liquid escape -> %s (%s)"):format(
+                        vec3ToString(target), tostring(typeOf(block))))
+
+                    Movement.jump(character, Blocks.standPoint(stand))
+                    return true
+                end
             end
         end
     end
@@ -2253,34 +2397,45 @@ local function stepAside(character, root)
     end
 
     local cell = Blocks.toBlock(root.Position)
-    local best, bestPrice
 
-    for _, offset in pairs(blockOffsets) do
-        if offset.Y == 0 then
-            local side = cell + Vector3.new(offset.X, 0, offset.Z)
-            local floor = mine:FindFirstChild(vec3ToString(side + Vector3.new(0, 1, 0)))
+    -- Expand ring by ring: a single ring of 4 neighbours can be all liquid or
+    -- all undiggable, so keep looking outwards until a column is found.
+    for radius = 1, Config.sideSearchRadius do
+        local best, bestPrice
 
-            if floor
-                and Mining.why(floor) == nil
-                and not mine:FindFirstChild(vec3ToString(side)) then
-                local price = Ores.price(typeOf(floor) or "")
+        for dx = -radius, radius do
+            for dz = -radius, radius do
+                if math.max(math.abs(dx), math.abs(dz)) == radius then
+                    local side = cell + Vector3.new(dx, 0, dz)
 
-                if not best or price > bestPrice then
-                    best, bestPrice = side, price
+                    if not mine:FindFirstChild(vec3ToString(side)) then
+                        local floor = mine:FindFirstChild(vec3ToString(side + Vector3.new(0, 1, 0)))
+
+                        if floor and Mining.why(floor) == nil then
+                            local price = Ores.price(typeOf(floor) or "")
+
+                            if not best or price > bestPrice then
+                                best, bestPrice = side, price
+                            end
+                        end
+                    end
                 end
             end
         end
+
+        if best then
+            logPrint(("step aside r=%d -> %s"):format(radius, vec3ToString(best)))
+
+            -- Cell centre, so Blocks.below() afterwards still points at the
+            -- floor that was just validated (not a neighbour cell).
+            Movement.jump(character, Blocks.standPoint(best))
+            return
+        end
     end
 
-    if not best then
-        logWarn("down-block undiggable, no side escape")
-        task.wait(1)
-        return
-    end
-
-    local world = Blocks.worldOf(best)
-    logPrint(("step aside -> %s"):format(vec3ToString(best)))
-    Movement.jump(character, Vector3.new(world.X, root.Position.Y, world.Z))
+    logWarn(("down-block undiggable, no side escape within %d"):format(
+        Config.sideSearchRadius))
+    task.wait(1)
 end
 
 local FarmMode = Mode.new("Farm", function(self)
@@ -2635,16 +2790,31 @@ function Ui.create()
     local library = Ui.load()
     local window = library.init("nazar mining 2", "v1.1.0", "NM2_MAIN")
 
+    local savedMode = math.clamp(tonumber(Settings.get("mode", 1)) or 1, 1, #Modes.list)
+    local savedEnabled = Settings.get("enabled", false) == true
+    local savedInstant = Settings.get("instantMove", Config.instantMove) == true
+    local savedTween = tonumber(Settings.get("tweenSpeed", Config.tweenSpeed)) or Config.tweenSpeed
+    local savedVerbose = Settings.get("verboseLogs", Log.enabled) == true
+    local savedNoRender = Settings.get("noRender", false) == true
+    local savedSellEnabled = Settings.get("sellEnabled", Sell.enabled) == true
+
+    Config.instantMove = savedInstant
+    Config.tweenSpeed = savedTween
+    Log.enabled = savedVerbose
+    Sell.enabled = savedSellEnabled
+
     local main, _ = window:AddTab("Main", "назар прайм v2")
 
     local modePanel = main:AddSeperator("Mode")
-    local enabled = false
+    local enabled = savedEnabled
 
     local modeDropdown
     modeDropdown = modePanel:AddDropdown({
         title = "Category",
         options = { "Farm", "Mushrooms" },
         callback = function(index)
+            Settings.set("mode", index)
+
             local mode = Modes.list[index]
             Modes.select(mode)
             if enabled and mode then
@@ -2655,8 +2825,11 @@ function Ui.create()
 
     modePanel:AddToggle({
         title = "Enabled",
+        checked = savedEnabled,
         callback = function(state)
             enabled = state
+            Settings.set("enabled", state)
+
             if state then
                 Modes.enable(Modes.active)
             else
@@ -2671,16 +2844,19 @@ function Ui.create()
     movePanel:AddToggle({
         title = "Instant move",
         desc = "teleport instead of tween",
+        checked = savedInstant,
         callback = function(state)
             Config.instantMove = state
+            Settings.set("instantMove", state)
         end,
     })
 
     movePanel:AddSlider({
         title = "Tween speed",
-        values = { min = 20, max = 400, default = Config.tweenSpeed, round = 1 },
+        values = { min = 20, max = 400, default = savedTween, round = 1 },
         callback = function(value)
             Config.tweenSpeed = value
+            Settings.set("tweenSpeed", value)
         end,
     })
 
@@ -2692,13 +2868,14 @@ function Ui.create()
         table.insert(defaults, index)
     end
 
+    local savedOres = Settings.indices("ores", defaults)
     local selection = orePanel:AddSelection({
         title = "Ores",
         options = names,
-        default = defaults,
+        default = savedOres,
     })
 
-    selection.setSelected(defaults)
+    selection.setSelected(savedOres)
     Ores.bindSelection(selection, names)
 
     local sellTab = window:AddTab("Auto sell", "sell resources when the backpack is full")
@@ -2707,20 +2884,23 @@ function Ui.create()
     sellPanel:AddToggle({
         title = "Enabled",
         desc = "sell selected resources when the backpack is full",
+        checked = savedSellEnabled,
         callback = function(state)
             Sell.enabled = state
+            Settings.set("sellEnabled", state)
             logPrint("autosell toggle " .. (state and "on" or "off"))
         end,
     })
 
     local sellNames = Sell.names()
+    local savedSell = Settings.indices("sellSelected", {})
     local sellSelection = sellPanel:AddSelection({
         title = "Resources to sell",
         options = sellNames,
-        default = {},
+        default = savedSell,
     })
 
-    sellSelection.setSelected({})
+    sellSelection.setSelected(savedSell)
     Sell.bindSelection(sellSelection, sellNames)
 
     sellPanel:AddButton({
@@ -2742,8 +2922,23 @@ function Ui.create()
     logPanel:AddToggle({
         title = "Verbose logs",
         desc = "print ore reasons and mining steps",
+        checked = savedVerbose,
         callback = function(state)
             Log.enabled = state
+            Settings.set("verboseLogs", state)
+        end,
+    })
+
+    logPanel:AddToggle({
+        title = "Disable 3D render",
+        desc = "RunService:Set3dRenderingEnabled(false)",
+        checked = savedNoRender,
+        callback = function(state)
+            Settings.set("noRender", state)
+
+            pcall(function()
+                RunService:Set3dRenderingEnabled(not state)
+            end)
         end,
     })
 
@@ -2764,6 +2959,11 @@ function Ui.create()
                 handleInput.setText(stats.handle)
                 playerInput.setText(stats.player)
                 stateInput.setText(stats.state)
+
+                -- Selections have no change callback in uilib: persist them here.
+                -- Settings.persist skips the write when the JSON is unchanged.
+                Settings.set("ores", selection.getSelected() or {})
+                Settings.set("sellSelected", sellSelection.getSelected() or {})
             end)
 
             if not ok then
@@ -2772,7 +2972,7 @@ function Ui.create()
         end
     end)
 
-    modeDropdown.setSelected(1)
+    modeDropdown.setSelected(savedMode)
 
     return window
 end
@@ -2876,6 +3076,13 @@ end
 ---------------------------------------------------------------------------
 -- Bootstrap
 ---------------------------------------------------------------------------
+
+-- Restore the saved render state before the UI is built.
+if Settings.get("noRender", false) == true then
+    pcall(function()
+        RunService:Set3dRenderingEnabled(false)
+    end)
+end
 
 LogView.create()
 
