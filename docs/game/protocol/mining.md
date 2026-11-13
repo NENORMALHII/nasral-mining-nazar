@@ -230,12 +230,22 @@ If the bot finishes too early, the server rejects with "server rejected".
 
 Rejection streak: `Mining.rejects` counts consecutive `server rejected` results and is
 zeroed by any successful break. The log line carries `streak=N`. At
-`Config.maxRejects = 5` the bot sets `Mining.resetRequested`; on the next Farm tick it
-logs `mining reset: teleport to surface, caches cleared`, resets
-`Blocks.calibrated`/`Blocks.lastCalibrate` and `Ores.clearCache()` (scan cell, cached
-target, ignore timers), then teleports to
-`fieldCenter + (0, emptyMineLift + teleportLift, 0)` and re-enters the mine from the
-surface pit.
+`Config.maxRejects = 5` the bot sets `Mining.resetRequested`; on the next Farm tick it:
+
+1. clears cached mapping and scan state: `Blocks.calibrated = false`,
+   `Blocks.lastCalibrate = 0`, `Blocks.offset = Vector3.zero`, `Ores.clearCache()`
+   (scan cell, cached target, ignore timers), then recalibrates;
+2. calls `Surface.resetPoint()`: scans only the fixed surface layer `y = -1` within
+   `surfaceScanRadius` of the field centre, accepts a cell only when `Surface.depth`
+   says depth >= 1 (cell empty, solid floor below), re-checks both the empty cell and
+   the floor block in `Workspace.Mine`, and returns
+   `Blocks.worldOf(cell) + teleportLift`;
+3. logs `reset point x,y,z depth=N` and `mining reset: teleport to ..., caches cleared`,
+   jumps there and waits for the landing.
+
+If no validated cell exists it logs
+`mining reset: no safe point inside the mine, staying put` and does not move. The scan
+never leaves the field, so the reset cannot teleport outside the map.
 
 Position formula (same as `ReplicatedFirst.Util`):
 

@@ -690,6 +690,58 @@ function Surface.find(position)
     return best
 end
 
+-- Reset target after a rejection streak. Scans the fixed surface layer (y = -1,
+-- the empty cell above the ground block) around the field centre only, so it can
+-- never land outside the generated mine. Returns a world position whose cell is
+-- empty and which has a solid floor below, plus a tiny lift.
+function Surface.resetPoint()
+    local mine = workspace:FindFirstChild(Config.mineName)
+    if not mine then
+        return nil
+    end
+
+    local center = Blocks.toBlock(Config.fieldCenter)
+    local topY = -1
+    local best, bestDepth, bestDistance
+    local radius = Config.surfaceScanRadius
+
+    for dx = -radius, radius do
+        for dz = -radius, radius do
+            local x, z = center.X + dx, center.Z + dz
+            local depth = Surface.depth(mine, x, z, topY)
+
+            if depth and depth >= 1 then
+                local distance = dx * dx + dz * dz
+
+                if not bestDepth
+                    or depth > bestDepth
+                    or (depth == bestDepth and distance < bestDistance) then
+                    best = Vector3.new(x, topY, z)
+                    bestDepth = depth
+                    bestDistance = distance
+                end
+            end
+        end
+    end
+
+    if not best then
+        return nil
+    end
+
+    -- Validate once more right before the teleport: the cell must stay empty and
+    -- the floor below must still be a mine block.
+    if mine:FindFirstChild(vec3ToString(best)) then
+        return nil
+    end
+
+    if not mine:FindFirstChild(vec3ToString(best + Vector3.new(0, 1, 0))) then
+        return nil
+    end
+
+    logPrint(("reset point %s depth=%d"):format(vec3ToString(best), bestDepth))
+    return Blocks.worldOf(best) + Vector3.new(0, Config.teleportLift, 0)
+end
+
 ---------------------------------------------------------------------------
 -- Mining
 ---------------------------------------------------------------------------
@@ -2223,18 +2275,24 @@ local FarmMode = Mode.new("Farm", function(self)
         Mining.resetRequested = false
         Mining.rejects = 0
 
+        -- Clear cached block mapping and ore scan state before choosing a target.
         Blocks.calibrated = false
         Blocks.lastCalibrate = 0
+        Blocks.offset = Vector3.zero
         Ores.clearCache()
+        Blocks.calibrate()
 
-        logWarn("mining reset: teleport to surface, caches cleared")
+        local point = Surface.resetPoint()
 
-        Movement.jump(character, Vector3.new(
-            Config.fieldCenter.X,
-            Config.fieldCenter.Y + Config.emptyMineLift + Config.teleportLift,
-            Config.fieldCenter.Z
-        ))
-        Movement.waitLanded(character, Config.emptyMineWait)
+        if point then
+            logWarn(("mining reset: teleport to %s, caches cleared"):format(
+                tostring(point)))
+            Movement.jump(character, point)
+            Movement.waitLanded(character, Config.emptyMineWait)
+        else
+            logWarn("mining reset: no safe point inside the mine, staying put")
+        end
+
         return
     end
 
