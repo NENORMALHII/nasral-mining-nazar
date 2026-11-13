@@ -49,6 +49,13 @@ logs `autosell: leaving depth N for the surface`. If a mine is currently in its
 `BlockEvent`/`BlockMinedEvent` window (`Movement.holdRoot` is set), the sell is
 deferred to the next watcher tick instead of interrupting it.
 
+While `SellResourceFunction` is being invoked, the root is anchored with
+`Movement.hold` and released after the last `InvokeServer` (`Movement.releaseHold`).
+Without the anchor the character falls the last `emptyMineLift` studs above the
+cave and the server rejects part of the sale. `Sell.busy` is set for the whole
+surface trip, and `FarmMode`/`MushroomMode` return immediately while it is set,
+so they cannot move the character or clear the anchor mid-sale.
+
 Diagnostics (throttled to one line per 10 s for repeated states):
 
 - `autosell toggle on|off` — toggle changed;

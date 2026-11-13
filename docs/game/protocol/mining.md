@@ -88,11 +88,16 @@ so teleporting to the block centre was unnecessary and caused `BlockMinedEvent` 
 
 - Farm mines only blocks already in reach; otherwise it digs the block under the feet.
 - After a shaft block breaks the character falls naturally (`Movement.waitLanded`).
-- Loot teleports use `Movement.jump` (`PivotTo` directly, no tween).
-- Every teleport sets `Movement.lastMoveAt`; Farm waits `moveCooldown` (0.5 s) before the next
+- All movement goes through `Movement.to`: `Movement.jump` is only an alias. With
+  `Config.instantMove = false` (default) the root is anchored and tweened at
+  `Config.tweenSpeed` for `distance / speed` seconds (clamped to 0.05..5), then settled;
+  with `Config.instantMove = true` the move is a single `PivotTo`. There is no separate
+  "teleport" path any more, so loot, pits, step-aside, empty field and auto-sell surface
+  moves all use the same method.
+- Every move sets `Movement.lastMoveAt`; Farm waits `moveCooldown` (0.5 s) before the next
   `BlockEvent`, so mining never starts in the same tick as a position change.
-- `HumanoidRootPart` is anchored during the `BlockEvent`/`BlockMinedEvent` window, and while the
-  `Mine` container has no blocks at all (see the empty-field rule below).
+- `HumanoidRootPart` is anchored during tweens, during the `BlockEvent`/`BlockMinedEvent`
+  window, and while the `Mine` container has no blocks at all (see the empty-field rule below).
 - Empty field (`Mine` has zero children): there is nothing to dig and no ground, so digging down
   can never succeed. Farm jumps once to `Config.fieldCenter` + `Config.emptyMineLift` studs, keeps
   the character anchored, and re-checks every `Config.emptyMineWait` seconds. The jump only fires

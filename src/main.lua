@@ -452,12 +452,19 @@ function Movement.to(character, position, speed)
     })
 
     Movement.tween = tween
+
+    local finished = false
+    local connection = tween.Completed:Connect(function()
+        finished = true
+    end)
+
     tween:Play()
 
     local deadline = os.clock() + duration + 1
-    while Movement.tween == tween and os.clock() < deadline do
+    while not finished and Movement.tween == tween and os.clock() < deadline do
         task.wait(0.03)
     end
+    connection:Disconnect()
 
     local reached = (root.Position - position).Magnitude <= Config.moveStopDistance + 3
 
@@ -473,15 +480,13 @@ function Movement.to(character, position, speed)
     Movement.settle(character)
 end
 
-function Movement.jump(character, position)
-    local root = character.PrimaryPart
-    if not root then
-        return
-    end
-
-    Movement.release()
-    character:PivotTo(CFrame.new(position))
-    Movement.lastMoveAt = os.clock()
+-- Single movement path for every teleport in the script (loot, surface, pits,
+-- step aside, auto sell). `Movement.to` decides how to move:
+--   Config.instantMove == true  -> PivotTo immediately;
+--   Config.instantMove == false -> Linear tween at Config.tweenSpeed,
+--                                  then settle.
+function Movement.jump(character, position, speed)
+    Movement.to(character, position, speed)
 end
 
 ---------------------------------------------------------------------------
@@ -1459,6 +1464,7 @@ end
 
 local Sell = {
     enabled = false,
+    busy = false,
     selection = nil,
     namesList = nil,
     lastRun = 0,
@@ -1633,12 +1639,35 @@ function Sell.try(origin)
     logPrint(("autosell trigger %s used=%d/%d src=%s enabled=%s"):format(
         origin, used, capacity, tostring(source), tostring(Sell.enabled)))
 
-    if Sell.enabled and not Sell.toSurface(Character.get()) then
-        Sell.diag("nosurface", "autosell: no character to move to the surface")
-        return 0
+    if not Sell.enabled then
+        return Sell.run(false, origin)
     end
 
-    return Sell.run(false, origin)
+    local character = Character.get()
+    Sell.busy = true
+
+    local ok, sold = pcall(function()
+        if not Sell.toSurface(character) then
+            Sell.diag("nosurface", "autosell: no character to move to the surface")
+            return 0
+        end
+
+        -- Hold the root while the remote runs: falling above the cave makes the
+        -- server reject part of the sell.
+        Movement.hold(character)
+        local value = Sell.run(false, origin)
+        Movement.releaseHold()
+        return value
+    end)
+
+    Movement.releaseHold()
+    Sell.busy = false
+
+    if not ok then
+        error(sold)
+    end
+
+    return sold
 end
 
 function Sell.run(force, origin)
@@ -1976,6 +2005,11 @@ local FarmMode = Mode.new("Farm", function(self)
         return
     end
 
+    -- Auto sell owns the character while it travels to the surface.
+    if Sell.busy then
+        return
+    end
+
     if not character.PrimaryPart then
         return
     end
@@ -2130,6 +2164,10 @@ end, Movement.cancel)
 local MushroomMode = Mode.new("Mushrooms", function(self)
     local character = Character.get()
     if not self.enabled then
+        return
+    end
+
+    if Sell.busy then
         return
     end
 
