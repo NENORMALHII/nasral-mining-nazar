@@ -1818,6 +1818,31 @@ function Sell.run(force, origin)
     return sold
 end
 
+-- "Sell now" button: forced run, works with a partially filled backpack, with
+-- the Auto sell toggle off, and from inside the mine (it surfaces first).
+function Sell.manual()
+    local character = Character.get()
+    Sell.busy = true
+
+    local ok, sold = pcall(function()
+        Sell.toSurface(character)
+        Movement.hold(character)
+        task.wait(Config.moveBuffer)
+        local value = Sell.run(true, "manual")
+        Movement.releaseHold()
+        return value
+    end)
+
+    Movement.releaseHold()
+    Sell.busy = false
+
+    if not ok then
+        error(sold)
+    end
+
+    return sold
+end
+
 ---------------------------------------------------------------------------
 -- Loot (workspace.TargetFilter/{BlockName}_Drop)
 ---------------------------------------------------------------------------
@@ -2585,7 +2610,7 @@ function Ui.create()
     sellPanel:AddButton({
         title = "Sell now",
         callback = function()
-            logPrint("manual sell total " .. Sell.run(true, "manual"))
+            logPrint("manual sell total " .. Sell.manual())
         end,
     })
 

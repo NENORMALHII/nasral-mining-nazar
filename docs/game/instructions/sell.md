@@ -39,7 +39,10 @@ end
 independent from the farming modes:
 
 - `"watch"` — background loop every 1 s, runs whether Farm/Mushroom is on or off;
-- `"manual"` — the "Sell now" button, forced and logged as `manual sell total`.
+- `"manual"` — the "Sell now" button (`Sell.manual()`), forced and logged as
+  `manual sell total`. It ignores `Sell.enabled`, ignores `isFull()` (works with a
+  partially filled backpack), still respects the resource selection, surfaces first
+  if the player is underground, and holds the root until the last remote returns.
 
 The remote refuses to work while the player is underground. Before firing it,
 `Sell.toSurface` checks `Blocks.toBlock(root.Position).Y`: if the player is below
