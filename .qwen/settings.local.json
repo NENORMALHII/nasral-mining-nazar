@@ -1,7 +1,18 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git status --short; echo ---; git diff --stat; echo ---; git log --oneline -5; echo ---; git status -sb | head -1)"
+      "Bash(git status --short; echo ---; git diff --stat; echo ---; git log --oneline -5; echo ---; git status -sb | head -1)",
+      "Bash(ls -R src docs/game/instructions docs/game/protocol 2>/dev/null | head -60)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && git log --oneline -3 -- src/main.lua && git status --short && grep -n \"surfaceDepth\\\\|fieldCenter\\\\|moveCooldown\\\\|mineName\\\\|fallTolerance\\\\|blockSize\" src/main.lua | head -40)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && ls docs/game/decompiled docs/game/data && grep -rn \"Destroy\\(\\)\\\\|Parent = nil\\\\|Mine, *--\\\\?\" docs/game/decompiled/*.lua | grep -i \"block\\\\|mine\" | head -20)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && grep -n \"Bedrock\\\\|spawn\\\\|Spawn\\\\|Lobby\\\\|lobby\\\\|baseplate\\\\|Baseplate\\\\|Void\" -i src/main.lua docs/game/protocol/mining.md | head -30)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && grep -in \"baseplate\\\\|floor\\\\|ground\\\\|terrain\\\\|spawn\" docs/game/dumptree.txt | head -20 && echo ---- && grep -n \"Workspace\" -A 30 docs/game/dumptree.txt | head -50)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && sed -n '95,112p' docs/game/dumptree.txt && echo \"=== Mine ===\" && grep -n \"├─ Mine \\\\[\" docs/game/dumptree.txt | head)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && sed -n '11553,11575p' docs/game/dumptree.txt && echo \"=== count block-like children ===\" && awk 'NR>11553 && /^│  ├─ /{exit} NR>11553{print}' docs/game/dumptree.txt | head -5)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && grep -n \"^local Mode\\\\|function Mode\\\\.\" -A 22 src/main.lua | sed -n '1,60p')",
+      "Bash(cd /home/ilya/artyom-asshole-mining && \\(which luau luau-analyze lua lua5.4 luajit 2>/dev/null || echo \"no lua runtime\"\\) && sed -n '1771,1800p' src/main.lua)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && luajit -e \"local f,e=loadfile\\('src/main.lua'\\); print\\(f and 'parsed ok' or \\('ERR: '..tostring\\(e\\)\\)\\)\")",
+      "Bash(cd /home/ilya/artyom-asshole-mining && sed -n '86,104p' docs/game/protocol/mining.md)"
     ]
   }
 }

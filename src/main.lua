@@ -42,6 +42,8 @@ local Config = {
     surfaceMinDepth = 2,
     fieldCenter = Vector3.new(89.5, 7998.5, -21.5),
     fieldRadius = 14,
+    emptyMineLift = 20,
+    emptyMineWait = 2,
     moveSettleTime = 0.25,
     moveSettleEpsilon = 0.2,
 
@@ -1772,6 +1774,29 @@ local FarmMode = Mode.new("Farm", function(self)
 
     Blocks.calibrate()
 
+    -- Empty field: nothing to dig and no ground under it. Raise once and anchor,
+    -- otherwise every tick teleports up and falls back.
+    local mineModel = workspace:FindFirstChild(Config.mineName)
+
+    if mineModel and #mineModel:GetChildren() == 0 then
+        local safe = Vector3.new(
+            Config.fieldCenter.X,
+            Config.fieldCenter.Y + Config.emptyMineLift,
+            Config.fieldCenter.Z
+        )
+
+        if (safe - root.Position).Magnitude > 4 then
+            Movement.jump(character, safe)
+            logPrint("mine empty, raised above the field")
+        end
+
+        Movement.hold(character)
+        task.wait(Config.emptyMineWait)
+        return
+    end
+
+    Movement.releaseHold()
+
     -- 2. On the surface: move to the field centre first, then reuse the deepest pit.
     local cell = Blocks.toBlock(root.Position)
 
@@ -1826,36 +1851,6 @@ local FarmMode = Mode.new("Farm", function(self)
     local below = Blocks.below(root.Position)
 
     if not below then
-        -- Check if mine is empty (no blocks at all)
-        local mine = workspace:FindFirstChild(Config.mineName)
-        if mine and #mine:GetChildren() == 0 then
-            -- Mine is empty, place character higher to avoid falling forever
-            local cell = Blocks.toBlock(root.Position)
-            
-            if cell.Y < Config.surfaceDepth then
-                -- On surface, move to 10 studs above field center
-                local targetPos = Vector3.new(
-                    Config.fieldCenter.X,
-                    Config.fieldCenter.Y + 10,
-                    Config.fieldCenter.Z
-                )
-                Movement.jump(character, targetPos)
-                logPrint("mine empty, moved to field center height")
-                return
-            end
-            
-            -- Not on surface, try to move up
-            local targetY = root.Position.Y + 10
-            local testCell = Vector3.new(cell.X, cell.Y + 1, cell.Z)
-            local worldPos = Blocks.worldOf(testCell)
-            
-            if not mine:FindFirstChild(vec3ToString(Blocks.toBlock(worldPos))) then
-                Movement.jump(character, Vector3.new(root.Position.X, targetY, root.Position.Z))
-                logPrint("mine empty, moved up")
-                return
-            end
-        end
-        
         Movement.waitLanded(character)
         return
     end

@@ -91,7 +91,13 @@ so teleporting to the block centre was unnecessary and caused `BlockMinedEvent` 
 - Loot teleports use `Movement.jump` (`PivotTo` directly, no tween).
 - Every teleport sets `Movement.lastMoveAt`; Farm waits `moveCooldown` (0.5 s) before the next
   `BlockEvent`, so mining never starts in the same tick as a position change.
-- `HumanoidRootPart` is anchored only during the `BlockEvent`/`BlockMinedEvent` window.
+- `HumanoidRootPart` is anchored during the `BlockEvent`/`BlockMinedEvent` window, and while the
+  `Mine` container has no blocks at all (see the empty-field rule below).
+- Empty field (`Mine` has zero children): there is nothing to dig and no ground, so digging down
+  can never succeed. Farm jumps once to `Config.fieldCenter` + `Config.emptyMineLift` studs, keeps
+  the character anchored, and re-checks every `Config.emptyMineWait` seconds. The jump only fires
+  again when the character is more than 4 studs from that point, so the loop no longer teleports
+  and falls every tick. `Movement.releaseHold()` runs on the first tick that sees blocks again.
 - Side escape (`stepAside` in `src/main.lua`): if the block under the feet fails `Mining.why`
   (liquid neighbour, `Oil/Lava/Grass/Void`, another player's `Dug`), digging down can never
   succeed. Farm then jumps one column sideways, keeping the current height, into the richest
