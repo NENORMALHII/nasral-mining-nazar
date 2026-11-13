@@ -45,20 +45,20 @@ independent from the farming modes:
   if the player is underground, and holds the root until the last remote returns.
 
 The remote refuses to work while the player is underground. Before firing it,
-`Sell.toSurface` checks `Blocks.toBlock(root.Position).Y`: if the player is below
-`Config.surfaceDepth`, it jumps to
-`(fieldCenter.X, Config.sellAnchorY, fieldCenter.Z)` with `sellAnchorY = 8014`.
-`Sell.holdForSale` then anchors the root and sets its CFrame to exactly that point,
-so the sale always happens at the same coordinates. It logs
-`autosell: leaving depth N for y=8014`. If a mine is currently in its
+The sell remote only accepts the fixed point `Config.sellAnchor = (78, 8013, -219)`
+(`x=78, y=8013, z=-219`); any other position is rejected. `Sell.toSurface` jumps
+there unless the player is already close to it on the surface, and
+`Sell.holdForSale` anchors the root and sets its CFrame exactly to that point, so
+the sale always happens at the same coordinates. It logs
+`autosell: leaving depth N for sell point 78,8013,-219`. If a mine is currently in its
 `BlockEvent`/`BlockMinedEvent` window (`Movement.holdRoot` is set), the sell is
 deferred to the next watcher tick instead of interrupting it.
 
-`Sell.holdForSale` anchors the root exactly at `(fieldCenter.X, 8014, fieldCenter.Z)`.
+`Sell.holdForSale` anchors the root exactly at `(78, 8013, -219)`.
 Timeline: `Config.sellHoldBefore = 3` s on the anchor, then all `InvokeServer` calls,
 then `Config.sellHoldAfter = 2` s on the anchor after the last remote, and only then
-`Movement.releaseHold`. Without the anchor the character falls from y=8014 and the
-server rejects part of the sale.
+`Movement.releaseHold`. Without the anchor the character falls from the sell point
+and the server rejects part of the sale.
 `Sell.busy` is set for the whole
 surface trip, and `FarmMode`/`MushroomMode` return immediately while it is set,
 so they cannot move the character or clear the anchor mid-sale.

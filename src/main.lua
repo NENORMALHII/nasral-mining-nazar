@@ -59,7 +59,7 @@ local Config = {
     sellRemote = "SellResourceFunction",
     sellCapacity = 200,
     sellCooldown = 1,
-    sellAnchorY = 8014,
+    sellAnchor = Vector3.new(78, 8013, -219),
     sellHoldBefore = 3,
     sellHoldAfter = 2,
 
@@ -1657,29 +1657,28 @@ function Sell.diag(key, text)
     logPrint(text)
 end
 
--- The sell remote refuses to work while the player is underground. Move above
--- the field centre to Config.sellAnchorY; the caller anchors the root there.
+-- The sell remote only accepts a fixed position (78, 8013, -219). Move there
+-- before selling; the caller anchors the root exactly at that point.
 function Sell.toSurface(character)
     local root = character and character.PrimaryPart
     if not root then
         return false
     end
 
+    local anchor = Config.sellAnchor
     local cell = Blocks.toBlock(root.Position)
-    if cell.Y < Config.surfaceDepth then
+
+    if cell.Y < Config.surfaceDepth and (anchor - root.Position).Magnitude < 4 then
         return true
     end
 
-    logPrint(("autosell: leaving depth %d for y=%d"):format(cell.Y, Config.sellAnchorY))
-    Movement.jump(character, Vector3.new(
-        Config.fieldCenter.X,
-        Config.sellAnchorY,
-        Config.fieldCenter.Z
-    ))
+    logPrint(("autosell: leaving depth %d for sell point %s"):format(
+        cell.Y, vec3ToString(anchor)))
+    Movement.jump(character, anchor)
     return true
 end
 
--- Anchor the root exactly at sellAnchorY above the field centre.
+-- Anchor the root exactly at the sell point.
 function Sell.holdForSale(character)
     local root = character and character.PrimaryPart
     if not root then
@@ -1687,11 +1686,7 @@ function Sell.holdForSale(character)
     end
 
     Movement.hold(character)
-    root.CFrame = CFrame.new(
-        Config.fieldCenter.X,
-        Config.sellAnchorY,
-        Config.fieldCenter.Z
-    )
+    root.CFrame = CFrame.new(Config.sellAnchor)
     return true
 end
 
@@ -1738,7 +1733,7 @@ function Sell.try(origin)
             return 0
         end
 
-        -- Hold exactly at sellAnchorY: sellHoldBefore seconds before the sale,
+        -- Hold exactly at Config.sellAnchor: sellHoldBefore seconds before the sale,
         -- the whole sale, then sellHoldAfter seconds after the last remote.
         if not Sell.holdForSale(character) then
             Sell.diag("nosurface", "autosell: no root to anchor for the sale")
