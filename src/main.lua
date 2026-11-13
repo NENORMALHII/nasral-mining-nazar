@@ -45,6 +45,8 @@ local Config = {
     emptyMineLift = 20,
     emptyMineWait = 2,
     teleportLift = 3.5,
+    liquidStuckCount = 4,
+    liquidSearchRange = 16,
     moveSettleTime = 0.25,
     moveSettleEpsilon = 0.2,
 
@@ -2002,6 +2004,82 @@ end
 -- Farm mode
 ---------------------------------------------------------------------------
 
+-- Number of horizontal neighbours of `cell` that are liquid (Oil/Lava), and the
+-- total checked. The block below is skipped, same as IsBlockBesideLiquid.
+local function liquidNeighbours(mine, cell)
+    local liquid, total = 0, 0
+
+    for _, offset in pairs(blockOffsets) do
+        if offset.Y ~= 1 then
+            total += 1
+            local neighbour = mine:FindFirstChild(vec3ToString(cell + offset))
+            local info = neighbour and resourceInfo(typeOf(neighbour))
+
+            if info and info.LiquidResource then
+                liquid += 1
+            end
+        end
+    end
+
+    return liquid, total
+end
+
+-- Fully stuck in liquid: almost every horizontal neighbour is Oil/Lava.
+local function stuckInLiquid(mine, cell)
+    local liquid, total = liquidNeighbours(mine, cell)
+    return total > 0 and liquid >= Config.liquidStuckCount
+end
+
+-- Liquid escape: the bot cannot dig the block under it and cannot step aside.
+-- Look one block above the stuck cell, then walk a random horizontal direction
+-- until a mineable block is found. Blocks at the liquid level and below are never
+-- mined, only the one above the liquid. Teleport on top of it and let Farm dig
+-- that block next tick.
+local function escapeLiquid(character, root)
+    local mine = workspace:FindFirstChild(Config.mineName)
+    if not mine then
+        return false
+    end
+
+    local cell = Blocks.toBlock(root.Position)
+    if not stuckInLiquid(mine, cell) then
+        return false
+    end
+
+    local up = cell + Vector3.new(0, -1, 0)
+
+    local directions = {
+        Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0),
+        Vector3.new(0, 0, 1), Vector3.new(0, 0, -1),
+        Vector3.new(1, 0, 1), Vector3.new(1, 0, -1),
+        Vector3.new(-1, 0, 1), Vector3.new(-1, 0, -1),
+    }
+
+    for index = #directions, 2, -1 do
+        local swap = math.random(index)
+        directions[index], directions[swap] = directions[swap], directions[index]
+    end
+
+    for _, direction in ipairs(directions) do
+        for distance = 1, Config.liquidSearchRange do
+            local target = up + direction * distance
+            local block = mine:FindFirstChild(vec3ToString(target))
+
+            if block and Mining.why(block) == nil then
+                logPrint(("liquid escape -> %s (%s)"):format(
+                    vec3ToString(target), tostring(typeOf(block))))
+
+                Movement.jump(character, Blocks.worldOf(target)
+                    + Vector3.new(0, Config.teleportLift, 0))
+                return true
+            end
+        end
+    end
+
+    logWarn("liquid escape: no mineable block above the liquid")
+    return false
+end
+
 -- Escape for the dig-straight-down case: the block under the bot is one we refuse
 -- to dig (liquid neighbour, Oil/Lava/Grass/Void, someone else's Dug). Pick the
 -- richest neighbouring column whose own cell is empty and whose floor is diggable,
@@ -2187,6 +2265,11 @@ local FarmMode = Mode.new("Farm", function(self)
     local below = Blocks.below(root.Position)
 
     if not below then
+        -- Fell into a liquid pocket with no floor: climb out one block up.
+        if escapeLiquid(character, root) then
+            return
+        end
+
         Movement.waitLanded(character)
         return
     end
@@ -2197,6 +2280,10 @@ local FarmMode = Mode.new("Farm", function(self)
     end
 
     if below.Parent and Mining.why(below) then
+        if escapeLiquid(character, root) then
+            return
+        end
+
         stepAside(character, root)
     end
 end, Movement.cancel)

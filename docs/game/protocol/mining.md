@@ -114,6 +114,15 @@ so teleporting to the block centre was unnecessary and caused `BlockMinedEvent` 
   neighbouring cell that is empty at our level and has a diggable floor block below it.
   Without this the loop re-attempted the same undiggable block every `loopDelay` and idled.
   If no neighbour qualifies it logs `down-block undiggable, no side escape` and waits 1 s.
+- Liquid escape (`escapeLiquid` in `src/main.lua`): when the bot is fully stuck in liquid,
+  i.e. at least `Config.liquidStuckCount = 4` of the 5 horizontal neighbours are
+  `LiquidResource` (Oil/Lava), sidestepping cannot help. Farm raises the search one block
+  above the stuck cell (`cell + (0, -1, 0)`), shuffles the 8 horizontal block directions,
+  and walks each one up to `Config.liquidSearchRange = 16` blocks until it finds a block
+  with `Mining.why(block) == nil`. Blocks at the liquid level and below are never mined.
+  On a hit it logs `liquid escape -> x,y,z (Type)` and teleports on top of that block
+  (`Blocks.worldOf(cell) + teleportLift`); the next Farm tick digs it as the block under
+  the feet.
 
 ## Surface pits
 
