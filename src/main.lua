@@ -48,6 +48,7 @@ local Config = {
     teleportLift = 3.5,
     liquidStuckCount = 4,
     liquidSearchRange = 16,
+    moveBuffer = 0.1,
     moveSettleTime = 0.25,
     moveSettleEpsilon = 0.2,
 
@@ -452,6 +453,7 @@ function Movement.to(character, position, speed)
         end)
 
         Character.platformStand(character, false)
+        task.wait(Config.moveBuffer)
         Movement.lastMoveAt = os.clock()
         Movement.settle(character)
         return
@@ -489,7 +491,9 @@ function Movement.to(character, position, speed)
 
     local reached = (root.Position - position).Magnitude <= Config.moveStopDistance + 3
 
+    -- Stay anchored at the destination for a short buffer before physics resumes.
     if Movement.tween == tween then
+        task.wait(Config.moveBuffer)
         Movement.release()
     end
 
@@ -1718,9 +1722,10 @@ function Sell.try(origin)
             return 0
         end
 
-        -- Hold the root while the remote runs: falling above the cave makes the
-        -- server reject part of the sell.
+        -- Hold the root at the destination while the remote runs: falling above
+        -- the cave makes the server reject part of the sell.
         Movement.hold(character)
+        task.wait(Config.moveBuffer)
         local value = Sell.run(false, origin)
         Movement.releaseHold()
         return value

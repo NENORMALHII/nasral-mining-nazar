@@ -94,6 +94,9 @@ so teleporting to the block centre was unnecessary and caused `BlockMinedEvent` 
   with `Config.instantMove = true` the move is a single `PivotTo`. There is no separate
   "teleport" path any more, so loot, pits, step-aside, empty field and auto-sell surface
   moves all use the same method.
+- Destination buffer: after a tween (and after an instant `PivotTo`) the character stays
+  anchored at the target for `Config.moveBuffer = 0.1` s before `Movement.release` resumes
+  physics. Prevents sliding/falling in the same frame the move ends.
 - Every move sets `Movement.lastMoveAt`; Farm waits `moveCooldown` (0.5 s) before the next
   `BlockEvent`, so mining never starts in the same tick as a position change.
 - Stability: `Movement.release` zeroes `AssemblyLinearVelocity`/`AssemblyAngularVelocity`
