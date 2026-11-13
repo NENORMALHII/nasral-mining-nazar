@@ -59,6 +59,8 @@ local Config = {
     sellRemote = "SellResourceFunction",
     sellCapacity = 200,
     sellCooldown = 1,
+    sellSurfaceLift = 20,
+    sellHold = 0.5,
 
     blockEvent = "BlockEvent",
     minedEvent = "BlockMinedEvent",
@@ -1669,7 +1671,7 @@ function Sell.toSurface(character)
 
     local target = Vector3.new(
         Config.fieldCenter.X,
-        Config.fieldCenter.Y + Config.emptyMineLift,
+        Config.fieldCenter.Y + Config.sellSurfaceLift,
         Config.fieldCenter.Z
     )
 
@@ -1725,8 +1727,9 @@ function Sell.try(origin)
         -- Hold the root at the destination while the remote runs: falling above
         -- the cave makes the server reject part of the sell.
         Movement.hold(character)
-        task.wait(Config.moveBuffer)
+        task.wait(Config.sellHold)
         local value = Sell.run(false, origin)
+        task.wait(Config.sellHold)
         Movement.releaseHold()
         return value
     end)
@@ -1827,8 +1830,9 @@ function Sell.manual()
     local ok, sold = pcall(function()
         Sell.toSurface(character)
         Movement.hold(character)
-        task.wait(Config.moveBuffer)
+        task.wait(Config.sellHold)
         local value = Sell.run(true, "manual")
+        task.wait(Config.sellHold)
         Movement.releaseHold()
         return value
     end)

@@ -47,16 +47,17 @@ independent from the farming modes:
 The remote refuses to work while the player is underground. Before firing it,
 `Sell.toSurface` checks `Blocks.toBlock(root.Position).Y`: if the player is below
 `Config.surfaceDepth`, it jumps to
-`fieldCenter + (0, emptyMineLift, 0)`, waits `emptyMineWait` for the landing and
+`fieldCenter + (0, sellSurfaceLift, 0)` (`sellSurfaceLift = 20`), waits
+`emptyMineWait` for the landing and
 logs `autosell: leaving depth N for the surface`. If a mine is currently in its
 `BlockEvent`/`BlockMinedEvent` window (`Movement.holdRoot` is set), the sell is
 deferred to the next watcher tick instead of interrupting it.
 
 Before the first `InvokeServer` the root is anchored with `Movement.hold`, kept
-there for `Config.moveBuffer = 0.1` s and for the whole sale, and released only
-after the last remote returns (`Movement.releaseHold`). Without the anchor the
-character falls the last `emptyMineLift` studs above the cave and the server
-rejects part of the sale.
+there for `Config.sellHold = 0.5` s before and after the sale, and for the whole
+sale, and released only after the last remote returns (`Movement.releaseHold`).
+Without the anchor the character falls the last `sellSurfaceLift` studs above the
+cave and the server rejects part of the sale.
 `Sell.busy` is set for the whole
 surface trip, and `FarmMode`/`MushroomMode` return immediately while it is set,
 so they cannot move the character or clear the anchor mid-sale.
