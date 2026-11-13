@@ -12,7 +12,9 @@
       "Bash(cd /home/ilya/artyom-asshole-mining && grep -n \"^local Mode\\\\|function Mode\\\\.\" -A 22 src/main.lua | sed -n '1,60p')",
       "Bash(cd /home/ilya/artyom-asshole-mining && \\(which luau luau-analyze lua lua5.4 luajit 2>/dev/null || echo \"no lua runtime\"\\) && sed -n '1771,1800p' src/main.lua)",
       "Bash(cd /home/ilya/artyom-asshole-mining && luajit -e \"local f,e=loadfile\\('src/main.lua'\\); print\\(f and 'parsed ok' or \\('ERR: '..tostring\\(e\\)\\)\\)\")",
-      "Bash(cd /home/ilya/artyom-asshole-mining && sed -n '86,104p' docs/game/protocol/mining.md)"
+      "Bash(cd /home/ilya/artyom-asshole-mining && sed -n '86,104p' docs/game/protocol/mining.md)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && grep -n \"Sell\\\\.\\\\|Ores.names\\\\|sell\" src/main.lua | grep -vn \"^1[34]\" | head -40)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && grep -rn \"SellResourceFunction\" docs/ src/ | head && echo \"=== backpack head ===\" && sed -n '1,60p' docs/game/decompiled/inventory-backpack.lua)"
     ]
   }
 }

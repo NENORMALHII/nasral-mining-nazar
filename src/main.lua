@@ -1442,14 +1442,18 @@ function Sell.run(force)
         if selected[name] then
             local count = Sell.count(name)
             if count > 0 then
-                local ok = pcall(function()
-                    remote:InvokeServer(name, count)
+                local ok, result = pcall(function()
+                    return remote:InvokeServer(name, count)
                 end)
-                if ok then
-                    sold += count
-                    logPrint(("sold %s x%d"):format(name, count))
+
+                if not ok then
+                    logWarn(("sell error %s: %s"):format(name, tostring(result)))
+                elseif result == false then
+                    -- The remote answered, so the name or the count is wrong.
+                    logWarn(("sell refused %s x%d"):format(name, count))
                 else
-                    logWarn("sell failed " .. name)
+                    sold += count
+                    logPrint(("sold %s x%d -> %s"):format(name, count, tostring(result)))
                 end
             end
         end
