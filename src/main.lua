@@ -1351,6 +1351,94 @@ function Ores.count()
 end
 
 ---------------------------------------------------------------------------
+-- Inventory (client-side resource counts)
+---------------------------------------------------------------------------
+
+-- Resource counts live in the client module `InventoriesClient`, loaded by
+-- `PlayerScriptLoader` (see docs/game/instructions/getinventory.lua). Backpack
+-- children are tools only and LocalPlayer attributes do not carry resources.
+local Inventory = {
+    client = nil,
+    lastTry = 0,
+}
+
+function Inventory.getClient()
+    if Inventory.client then
+        return Inventory.client
+    end
+
+    if os.clock() - Inventory.lastTry < 5 then
+        return nil
+    end
+    Inventory.lastTry = os.clock()
+
+    local loader = loadModule("Modules", "PlayerScriptLoader")
+    if not loader then
+        return nil
+    end
+
+    local ok, scripts = pcall(function()
+        return loader:WaitForPlayerScripts()
+    end)
+    if not ok or not scripts then
+        return nil
+    end
+
+    local modules = scripts:FindFirstChild("Modules")
+    local module = modules and modules:FindFirstChild("InventoriesClient")
+    if not module then
+        return nil
+    end
+
+    local okModule, client = pcall(require, module)
+    if not okModule or type(client) ~= "table" then
+        return nil
+    end
+
+    Inventory.client = client
+    return client
+end
+
+function Inventory.get()
+    local client = Inventory.getClient()
+    if not client then
+        return nil
+    end
+
+    local ok, inventory = pcall(function()
+        return client.GetInventory()
+    end)
+    if not ok then
+        return nil
+    end
+
+    return inventory
+end
+
+-- nil when the inventory module is not loaded yet, so callers can fall back.
+function Inventory.count(name)
+    local inventory = Inventory.get()
+    local resources = inventory and inventory.Resources
+    if not resources then
+        return nil
+    end
+
+    local value = resources[name]
+    return type(value) == "number" and value or 0
+end
+
+function Inventory.usage()
+    local inventory = Inventory.get()
+    if inventory
+        and type(inventory.CurrentSize) == "number"
+        and type(inventory.MaxSize) == "number" then
+        return inventory.CurrentSize, inventory.MaxSize
+    end
+
+    return nil
+end
+
+---------------------------------------------------------------------------
 -- Auto sell (ReplicatedStorage.SellResourceFunction)
 ---------------------------------------------------------------------------
 
@@ -1386,8 +1474,14 @@ end
 -- ATTR_ITEM_COUNT attribute (see Modules.Inventory.Backpack).
 local attrItemCount = (Game.Constants and Game.Constants.ATTR_ITEM_COUNT) or "ItemCount"
 
--- Backpack stack size first, LocalPlayer attribute of the same name as a fallback.
+-- InventoriesClient first (real resource counts), then Backpack tool stacks,
+-- then a LocalPlayer attribute of the same name.
 function Sell.count(name)
+    local amount = Inventory.count(name)
+    if amount ~= nil then
+        return amount
+    end
+
     local backpack = Players.LocalPlayer:FindFirstChild("Backpack")
     local total = 0
 
@@ -1414,6 +1508,11 @@ end
 -- used, capacity. The Inventory GUI label shows "used / capacity"; fall back to
 -- the attribute total against Config.sellCapacity when the label is absent.
 function Sell.usage()
+    local used, capacity = Inventory.usage()
+    if used and capacity then
+        return used, capacity
+    end
+
     local playerGui = Players.LocalPlayer:FindFirstChild("PlayerGui")
     local inventory = playerGui and playerGui:FindFirstChild("Inventory")
     local toggle = inventory and inventory:FindFirstChild("ToggleButton")

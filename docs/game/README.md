@@ -31,6 +31,7 @@ docs/game/
 | `forge-client.lua` | `PlayerGui.Forge.Container.Content.ForgeClient` |
 | `fuel-data.lua` | `ReplicatedStorage.Scripts.FuelData` |
 | `inventory-backpack.lua` | `ReplicatedStorage.Modules.Inventory.Backpack` (Delta) |
+| `resourceslist.lua` | `ReplicatedStorage.Modules.Resources` |
 
 ## protocol/
 
@@ -43,8 +44,9 @@ docs/game/
 | File | Content |
 |---|---|
 | `block-drops.md` | `workspace.TargetFilter`, `{BlockName}_Drop`, `DropScript.Player` |
-| `sell.md` | `SellResourceFunction:InvokeServer(resource, count)` |
+| `sell.md` | `SellResourceFunction:InvokeServer(resource, count)` and resource counts |
 | `forge-remotes.md` | `ForgeUpdateEvent` actions |
+| `getinventory.lua` | `InventoriesClient.GetInventory()` dump, source of resource counts |
 
 ## data/
 
