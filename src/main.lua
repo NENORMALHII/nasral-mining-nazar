@@ -1382,8 +1382,31 @@ function Sell.selectedSet()
     return set
 end
 
--- Resource counts are read from LocalPlayer attributes (one attribute per resource).
+-- Stacks are item instances in the player's Backpack; the size is the
+-- ATTR_ITEM_COUNT attribute (see Modules.Inventory.Backpack).
+local attrItemCount = (Game.Constants and Game.Constants.ATTR_ITEM_COUNT) or "ItemCount"
+
+-- Backpack stack size first, LocalPlayer attribute of the same name as a fallback.
 function Sell.count(name)
+    local backpack = Players.LocalPlayer:FindFirstChild("Backpack")
+    local total = 0
+
+    if backpack then
+        for _, item in ipairs(backpack:GetChildren()) do
+            if item.Name == name then
+                local value = item:GetAttribute(attrItemCount)
+
+                if type(value) == "number" then
+                    total += value
+                end
+            end
+        end
+    end
+
+    if total > 0 then
+        return total
+    end
+
     local value = Players.LocalPlayer:GetAttribute(name)
     return type(value) == "number" and value or 0
 end
@@ -1437,6 +1460,17 @@ function Sell.run(force)
 
     local selected = Sell.selectedSet()
     local sold = 0
+
+    if force then
+        local nSelected = 0
+
+        for _ in pairs(selected) do
+            nSelected += 1
+        end
+
+        logPrint(("sell: names=%d selected=%d used=%d/%d"):format(
+            #(Sell.namesList or {}), nSelected, Sell.usage()))
+    end
 
     for _, name in ipairs(Sell.namesList or {}) do
         if selected[name] then
