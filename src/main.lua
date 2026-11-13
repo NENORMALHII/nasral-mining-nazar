@@ -1,5 +1,6 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TeleportService = game:GetService("TeleportService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
@@ -33,6 +34,9 @@ local Config = {
 
     mineName = "Mine",
     oreRange = 21,
+
+    rejoinDelay = 2,
+    rejoinAttachTries = 60,
 
     mineReachMargin = 4,
     moveCooldown = 0.5,
@@ -82,6 +86,19 @@ local Config = {
 
 ---------------------------------------------------------------------------
 -- Settings (executor standard: writefile/readfile/isfile/makefolder + JSON)
+--
+-- A typed registry: every saved option is one `Settings.define` entry, and the
+-- UI only calls `Settings.read(key)` / `Settings.write(key, value)`. Adding an
+-- option never touches the file format code.
+--
+-- kinds:
+--   bool   - true/false
+--   number - number, clamped to `min`/`max`, optional `round` (1 = integer)
+--   names  - array of resource names (selections); `default = "all"` means every
+--            entry of the current option list
+--
+-- `apply` is the restore hook: `Settings.restore()` calls it once per key before
+-- the UI is built, so no option needs its own bootstrap block.
 ---------------------------------------------------------------------------
 
 local Settings = {
@@ -89,12 +106,33 @@ local Settings = {
     fallbackPath = "nm2_settings.json",
     data = {},
     loaded = false,
+    defs = {},
+    bound = {},
 }
 
+-- `isfile` is optional: many executors only ship `readfile`, which errors on a
+-- missing file, so the read itself is the existence check.
 local function settingsReady()
-    return type(writefile) == "function"
-        and type(readfile) == "function"
-        and type(isfile) == "function"
+    return type(writefile) == "function" and type(readfile) == "function"
+end
+
+local function readText(path)
+    local ok, text = pcall(readfile, path)
+
+    if ok and type(text) == "string" and text ~= "" then
+        return text
+    end
+
+    return nil
+end
+
+local function fileExists(path)
+    if type(isfile) ~= "function" then
+        return true
+    end
+
+    local ok, exists = pcall(isfile, path)
+    return ok and exists
 end
 
 function Settings.load()
@@ -108,20 +146,17 @@ function Settings.load()
         return Settings.data
     end
 
-    local source = Settings.path
-    local existsOk, exists = pcall(isfile, source)
+    local text
 
-    if not existsOk or not exists then
-        source = Settings.fallbackPath
-        existsOk, exists = pcall(isfile, source)
+    if fileExists(Settings.path) then
+        text = readText(Settings.path)
     end
 
-    if not existsOk or not exists then
-        return Settings.data
+    if not text and fileExists(Settings.fallbackPath) then
+        text = readText(Settings.fallbackPath)
     end
 
-    local readOk, text = pcall(readfile, source)
-    if not readOk or type(text) ~= "string" or text == "" then
+    if not text then
         return Settings.data
     end
 
@@ -138,21 +173,25 @@ function Settings.load()
     return Settings.data
 end
 
-function Settings.get(key, fallback)
-    local value = Settings.load()[key]
-    if value == nil then
-        return fallback
-    end
-    return value
-end
-
 function Settings.persist()
     if not settingsReady() then
         return
     end
 
+    -- Only registered keys are written: a stale `enabled`/`noRender` from an old
+    -- build is dropped instead of lingering in the file as if it were saved.
+    local snapshot = {}
+
+    for key in pairs(Settings.defs) do
+        local value = Settings.data[key]
+
+        if value ~= nil then
+            snapshot[key] = value
+        end
+    end
+
     local okEncode, text = pcall(function()
-        return HttpService:JSONEncode(Settings.data)
+        return HttpService:JSONEncode(snapshot)
     end)
 
     if not okEncode or text == Settings.lastJson then
@@ -173,15 +212,131 @@ function Settings.persist()
     end
 end
 
-function Settings.set(key, value)
-    Settings.load()
-    Settings.data[key] = value
-    Settings.persist()
+---------------------------------------------------------------------------
+-- Typed registry
+---------------------------------------------------------------------------
+
+local normalizers = {}
+
+function normalizers.bool(spec, value)
+    return value == true
 end
 
--- List of option indexes (selection), always a table of numbers.
+function normalizers.number(spec, value)
+    local number = tonumber(value)
+
+    if not number then
+        return spec.default
+    end
+
+    if spec.min then
+        number = math.max(spec.min, number)
+    end
+
+    if spec.max then
+        number = math.min(spec.max, number)
+    end
+
+    if spec.round then
+        number = math.floor(number * spec.round + 0.5) / spec.round
+    end
+
+    return number
+end
+
+function normalizers.names(spec, value)
+    local out = {}
+
+    if type(value) ~= "table" then
+        return out
+    end
+
+    for _, name in ipairs(value) do
+        if type(name) == "string" then
+            table.insert(out, name)
+        end
+    end
+
+    return out
+end
+
+function Settings.define(key, spec)
+    spec.key = key
+    spec.kind = spec.kind or "bool"
+    Settings.defs[key] = spec
+    return spec
+end
+
+function Settings.normalize(key, value)
+    local spec = Settings.defs[key]
+    if not spec then
+        return value
+    end
+
+    local normalize = normalizers[spec.kind] or normalizers.bool
+    return normalize(spec, value)
+end
+
+-- Value used when the file has no entry. `"all"`/`"none"` selections resolve to
+-- an empty list here: the concrete entries are the current option list, which is
+-- only known by `Settings.selection`.
+function Settings.fallback(key)
+    local spec = Settings.defs[key]
+    if not spec then
+        return nil
+    end
+
+    if spec.kind == "names" then
+        return {}
+    end
+
+    return spec.default
+end
+
+function Settings.read(key)
+    Settings.load()
+
+    local value = Settings.data[key]
+
+    if value == nil then
+        return Settings.fallback(key)
+    end
+
+    return Settings.normalize(key, value)
+end
+
+function Settings.write(key, value)
+    Settings.load()
+
+    local normalized = Settings.normalize(key, value)
+    Settings.data[key] = normalized
+    Settings.persist()
+
+    local spec = Settings.defs[key]
+
+    if spec and spec.apply then
+        pcall(spec.apply, normalized)
+    end
+
+    return normalized
+end
+
+-- Restore every `apply` hook before the UI exists.
+function Settings.restore()
+    for key, spec in pairs(Settings.defs) do
+        if spec.apply then
+            pcall(spec.apply, Settings.read(key))
+        end
+    end
+end
+
+---------------------------------------------------------------------------
+-- Selections (widgets work with indexes, the file stores resource names)
+---------------------------------------------------------------------------
+
 function Settings.indices(key, fallback)
-    local value = Settings.get(key)
+    local value = Settings.load()[key]
+
     if type(value) ~= "table" then
         return fallback
     end
@@ -195,6 +350,127 @@ function Settings.indices(key, fallback)
     end
 
     return list
+end
+
+-- Saved indexes were written against an older resource table: drop the ones that
+-- no longer exist instead of restoring a selection that maps to nothing.
+function Settings.clampIndices(list, count)
+    local out = {}
+
+    for _, index in ipairs(list) do
+        index = math.floor(tonumber(index) or 0)
+
+        if index >= 1 and index <= count then
+            table.insert(out, index)
+        end
+    end
+
+    return out
+end
+
+-- Stored names -> indexes in the current option list.
+function Settings.indexList(names, saved)
+    if type(saved) ~= "table" then
+        return {}
+    end
+
+    local positions = {}
+
+    for index, name in ipairs(names) do
+        positions[name] = index
+    end
+
+    local indexes = {}
+
+    for _, name in ipairs(saved) do
+        local index = type(name) == "string" and positions[name]
+
+        if index then
+            table.insert(indexes, index)
+        end
+    end
+
+    return indexes
+end
+
+-- Widget indexes -> names for saving.
+function Settings.nameList(names, indexes)
+    local out = {}
+
+    for _, index in ipairs(indexes or {}) do
+        local name = names[index]
+
+        if name then
+            table.insert(out, name)
+        end
+    end
+
+    return out
+end
+
+function Settings.defaultIndices(key, names)
+    local spec = Settings.defs[key]
+
+    if spec and spec.default == "all" then
+        local all = {}
+
+        for index = 1, #names do
+            table.insert(all, index)
+        end
+
+        return all
+    end
+
+    return {}
+end
+
+-- Index list for a selection widget.
+-- New format: names under `key`. Old format: indexes under `legacyKey`.
+-- If a saved list exists but nothing matches any more, the option default wins.
+function Settings.selection(key, legacyKey, names)
+    local fallback = Settings.defaultIndices(key, names)
+    local saved = Settings.load()[key]
+
+    if type(saved) == "table" then
+        local indexes = Settings.indexList(names, saved)
+
+        if #indexes == 0 and #saved > 0 then
+            return fallback
+        end
+
+        return indexes
+    end
+
+    local legacy = legacyKey and Settings.indices(legacyKey, nil)
+
+    if legacy then
+        local indexes = Settings.clampIndices(legacy, #names)
+
+        if #indexes == 0 and #legacy > 0 then
+            return fallback
+        end
+
+        return indexes
+    end
+
+    return fallback
+end
+
+-- Register a selection widget for the polling writer. uilib has no change
+-- callback, so `Settings.flushSelections` (called from a timer) saves whatever
+-- the widget currently holds; `Settings.persist` skips unchanged JSON.
+function Settings.bindSelection(key, names, widget)
+    table.insert(Settings.bound, { key = key, names = names, widget = widget })
+end
+
+function Settings.flushSelections()
+    for _, entry in ipairs(Settings.bound) do
+        local indexes = entry.widget.getSelected()
+
+        if indexes then
+            Settings.write(entry.key, Settings.nameList(entry.names, indexes))
+        end
+    end
 end
 
 ---------------------------------------------------------------------------
@@ -1525,8 +1801,16 @@ function Ores.names()
         end
     end
 
+    -- Deterministic order: equal prices fall back to the name, so the catalogue
+    -- index of a resource does not change between sessions.
     table.sort(names, function(a, b)
-        return Ores.price(a) > Ores.price(b)
+        local priceA, priceB = Ores.price(a), Ores.price(b)
+
+        if priceA == priceB then
+            return a < b
+        end
+
+        return priceA > priceB
     end)
 
     namesCache = names
@@ -1813,8 +2097,15 @@ function Sell.names()
         end
     end
 
+    -- Same deterministic order as `Ores.names`: price, then name.
     table.sort(names, function(a, b)
-        return Ores.price(a) > Ores.price(b)
+        local priceA, priceB = Ores.price(a), Ores.price(b)
+
+        if priceA == priceB then
+            return a < b
+        end
+
+        return priceA > priceB
     end)
 
     return names
@@ -3016,6 +3307,184 @@ function Modes.enable(mode)
 end
 
 ---------------------------------------------------------------------------
+-- Auto rejoin
+---------------------------------------------------------------------------
+
+-- Roblox shows the disconnect dialog as
+-- `CoreGui.RobloxPromptGui.promptOverlay.ErrorPrompt`. When the option is on the
+-- bot teleports back to the same place instead of sitting on the error screen.
+--
+-- Executors are never expected to be graceful here: the game is already gone, so
+-- the teleport is retried on a timer until the client actually leaves.
+
+local Rejoin = {
+    enabled = false,
+    attached = false,
+    busy = false,
+}
+
+function Rejoin.teleport()
+    local ok = pcall(function()
+        TeleportService:Teleport(game.PlaceId)
+    end)
+
+    if ok then
+        return true
+    end
+
+    -- Client `Teleport` is rate limited and some executors block it;
+    -- `TeleportAsync` with the local player is the fallback.
+    return pcall(function()
+        TeleportService:TeleportAsync(game.PlaceId, { Players.LocalPlayer })
+    end)
+end
+
+function Rejoin.leave(reason)
+    if Rejoin.busy then
+        return
+    end
+
+    Rejoin.busy = true
+    logWarn(("auto rejoin: %s, teleporting to place %d"):format(
+        tostring(reason), game.PlaceId))
+
+    task.spawn(function()
+        -- Same loop as the classic snippet: keep asking for a teleport until the
+        -- client unloads the place.
+        while Rejoin.enabled do
+            Rejoin.teleport()
+            task.wait(Config.rejoinDelay)
+        end
+
+        Rejoin.busy = false
+    end)
+end
+
+function Rejoin.watch()
+    if Rejoin.attached then
+        return
+    end
+
+    Rejoin.attached = true
+
+    task.spawn(function()
+        local okGui, coreGui = pcall(function()
+            return game:GetService("CoreGui")
+        end)
+
+        if not okGui or not coreGui then
+            Rejoin.attached = false
+            logWarn("auto rejoin: CoreGui unavailable")
+            return
+        end
+
+        -- The prompt GUI can appear a little after the script runs, but do not
+        -- wait forever: leave the toggle able to re-arm.
+        local prompt
+
+        for _ = 1, Config.rejoinAttachTries do
+            prompt = coreGui:FindFirstChild("RobloxPromptGui")
+
+            if prompt then
+                break
+            end
+
+            task.wait(1)
+        end
+
+        if not prompt then
+            Rejoin.attached = false
+            logWarn("auto rejoin: RobloxPromptGui not found")
+            return
+        end
+
+        local overlay = prompt:FindFirstChild("promptOverlay") or prompt:WaitForChild("promptOverlay", 10)
+
+        if not overlay then
+            Rejoin.attached = false
+            logWarn("auto rejoin: promptOverlay not found")
+            return
+        end
+
+        local function check(child)
+            if child.Name ~= "ErrorPrompt" then
+                return
+            end
+
+            if not Rejoin.enabled then
+                return
+            end
+
+            Rejoin.leave("disconnect prompt")
+        end
+
+        overlay.ChildAdded:Connect(check)
+
+        -- The prompt can already be on screen when the option is turned on.
+        local existing = overlay:FindFirstChild("ErrorPrompt")
+        if existing then
+            check(existing)
+        end
+    end)
+end
+
+function Rejoin.set(enabled)
+    Rejoin.enabled = enabled == true
+
+    if Rejoin.enabled then
+        Rejoin.watch()
+    end
+end
+
+---------------------------------------------------------------------------
+-- Saved options
+---------------------------------------------------------------------------
+
+-- Everything the bot remembers between executions. One line per option: the
+-- registry handles validation, defaults and the restore hook, the UI only calls
+-- `Settings.read(key)` and `Settings.write(key, value)`.
+--
+-- Deliberately NOT saved: the Farm/Mushrooms `enabled` toggle and
+-- `Disable 3D render`. Both are per-session switches the user sets by hand.
+
+Settings.define("mode", {
+    kind = "number", min = 1, max = #Modes.list, round = 1, default = 1,
+})
+
+Settings.define("instantMove", {
+    kind = "bool", default = Config.instantMove,
+    apply = function(value) Config.instantMove = value end,
+})
+
+Settings.define("tweenSpeed", {
+    kind = "number", min = 20, max = 400, round = 1, default = Config.tweenSpeed,
+    apply = function(value) Config.tweenSpeed = value end,
+})
+
+Settings.define("oreNames", {
+    kind = "names", default = "all",
+})
+
+Settings.define("sellEnabled", {
+    kind = "bool", default = Sell.enabled,
+    apply = function(value) Sell.enabled = value end,
+})
+
+Settings.define("sellNames", {
+    kind = "names", default = "none",
+})
+
+Settings.define("verboseLogs", {
+    kind = "bool", default = Log.enabled,
+    apply = function(value) Log.enabled = value end,
+})
+
+Settings.define("autoRejoin", {
+    kind = "bool", default = false,
+    apply = function(value) Rejoin.set(value) end,
+})
+
+---------------------------------------------------------------------------
 -- UI
 ---------------------------------------------------------------------------
 
@@ -3090,30 +3559,26 @@ function Ui.create()
     local library = Ui.load()
     local window = library.init("nazar mining 2", "v1.1.0", "NM2_MAIN")
 
-    local savedMode = math.clamp(tonumber(Settings.get("mode", 1)) or 1, 1, #Modes.list)
-    local savedEnabled = Settings.get("enabled", false) == true
-    local savedInstant = Settings.get("instantMove", Config.instantMove) == true
-    local savedTween = tonumber(Settings.get("tweenSpeed", Config.tweenSpeed)) or Config.tweenSpeed
-    local savedVerbose = Settings.get("verboseLogs", Log.enabled) == true
-    local savedNoRender = Settings.get("noRender", false) == true
-    local savedSellEnabled = Settings.get("sellEnabled", Sell.enabled) == true
+    local savedMode = Settings.read("mode")
+    local savedInstant = Settings.read("instantMove")
+    local savedTween = Settings.read("tweenSpeed")
+    local savedVerbose = Settings.read("verboseLogs")
+    local savedRejoin = Settings.read("autoRejoin")
+    local savedSellEnabled = Settings.read("sellEnabled")
 
-    Config.instantMove = savedInstant
-    Config.tweenSpeed = savedTween
-    Log.enabled = savedVerbose
-    Sell.enabled = savedSellEnabled
+    -- `enabled` and `noRender` are session switches: never restored.
+    local enabled = false
 
     local main, _ = window:AddTab("Main", "назар прайм v2")
 
     local modePanel = main:AddSeperator("Mode")
-    local enabled = savedEnabled
 
     local modeDropdown
     modeDropdown = modePanel:AddDropdown({
         title = "Category",
         options = { "Farm", "Mushrooms" },
         callback = function(index)
-            Settings.set("mode", index)
+            Settings.write("mode", index)
 
             local mode = Modes.list[index]
             Modes.select(mode)
@@ -3125,10 +3590,9 @@ function Ui.create()
 
     modePanel:AddToggle({
         title = "Enabled",
-        checked = savedEnabled,
+        checked = false,
         callback = function(state)
             enabled = state
-            Settings.set("enabled", state)
 
             if state then
                 Modes.enable(Modes.active)
@@ -3146,8 +3610,7 @@ function Ui.create()
         desc = "teleport instead of tween",
         checked = savedInstant,
         callback = function(state)
-            Config.instantMove = state
-            Settings.set("instantMove", state)
+            Settings.write("instantMove", state)
         end,
     })
 
@@ -3155,20 +3618,13 @@ function Ui.create()
         title = "Tween speed",
         values = { min = 20, max = 400, default = savedTween, round = 1 },
         callback = function(value)
-            Config.tweenSpeed = value
-            Settings.set("tweenSpeed", value)
+            Settings.write("tweenSpeed", value)
         end,
     })
 
     local orePanel = main:AddSeperator("Farm ores")
     local names = Ores.names()
-    local defaults = {}
-
-    for index, name in ipairs(names) do
-        table.insert(defaults, index)
-    end
-
-    local savedOres = Settings.indices("ores", defaults)
+    local savedOres = Settings.selection("oreNames", "ores", names)
     local selection = orePanel:AddSelection({
         title = "Ores",
         options = names,
@@ -3177,6 +3633,7 @@ function Ui.create()
 
     selection.setSelected(savedOres)
     Ores.bindSelection(selection, names)
+    Settings.bindSelection("oreNames", names, selection)
 
     local sellTab = window:AddTab("Auto sell", "sell resources when the backpack is full")
     local sellPanel = sellTab:AddSeperator("Auto sell")
@@ -3186,14 +3643,13 @@ function Ui.create()
         desc = "sell selected resources when the backpack is full",
         checked = savedSellEnabled,
         callback = function(state)
-            Sell.enabled = state
-            Settings.set("sellEnabled", state)
+            Settings.write("sellEnabled", state)
             logPrint("autosell toggle " .. (state and "on" or "off"))
         end,
     })
 
     local sellNames = Sell.names()
-    local savedSell = Settings.indices("sellSelected", {})
+    local savedSell = Settings.selection("sellNames", "sellSelected", sellNames)
     local sellSelection = sellPanel:AddSelection({
         title = "Resources to sell",
         options = sellNames,
@@ -3202,6 +3658,7 @@ function Ui.create()
 
     sellSelection.setSelected(savedSell)
     Sell.bindSelection(sellSelection, sellNames)
+    Settings.bindSelection("sellNames", sellNames, sellSelection)
 
     sellPanel:AddButton({
         title = "Sell now",
@@ -3218,6 +3675,17 @@ function Ui.create()
     local playerInput = statsPanel:AddTextInput({ title = "Player" })
     local stateInput = statsPanel:AddTextInput({ title = "State" })
 
+    local sessionPanel = debugTab:AddSeperator("Session")
+    sessionPanel:AddToggle({
+        title = "Auto rejoin",
+        desc = "teleport back after the disconnect prompt",
+        checked = savedRejoin,
+        callback = function(state)
+            Settings.write("autoRejoin", state)
+            logPrint("auto rejoin " .. (state and "on" or "off"))
+        end,
+    })
+
     local logPanel = debugTab:AddSeperator("Logs")
     logPanel:AddToggle({
         title = "Verbose logs",
@@ -3225,17 +3693,16 @@ function Ui.create()
         checked = savedVerbose,
         callback = function(state)
             Log.enabled = state
-            Settings.set("verboseLogs", state)
+            Settings.write("verboseLogs", state)
         end,
     })
 
     logPanel:AddToggle({
         title = "Disable 3D render",
         desc = "RunService:Set3dRenderingEnabled(false)",
-        checked = savedNoRender,
+        checked = false,
         callback = function(state)
-            Settings.set("noRender", state)
-
+            -- Per-session switch: deliberately not saved.
             pcall(function()
                 RunService:Set3dRenderingEnabled(not state)
             end)
@@ -3249,7 +3716,19 @@ function Ui.create()
         end,
     })
 
+    -- uilib Selection has no change callback, so every registered widget is
+    -- polled. Separate loop from the stats readout: a failing stat must never stop
+    -- the options from being saved. `Settings.persist` skips unchanged JSON.
     task.spawn(function()
+        while true do
+            task.wait(0.5)
+            pcall(Settings.flushSelections)
+        end
+    end)
+
+    task.spawn(function()
+        local failures = 0
+
         while true do
             task.wait(2)
 
@@ -3259,15 +3738,17 @@ function Ui.create()
                 handleInput.setText(stats.handle)
                 playerInput.setText(stats.player)
                 stateInput.setText(stats.state)
-
-                -- Selections have no change callback in uilib: persist them here.
-                -- Settings.persist skips the write when the JSON is unchanged.
-                Settings.set("ores", selection.getSelected() or {})
-                Settings.set("sellSelected", sellSelection.getSelected() or {})
             end)
 
-            if not ok then
-                break
+            -- Cosmetic only: keep retrying a few times, then stop spamming.
+            if ok then
+                failures = 0
+            else
+                failures = failures + 1
+
+                if failures >= 5 then
+                    break
+                end
             end
         end
     end)
@@ -3377,12 +3858,10 @@ end
 -- Bootstrap
 ---------------------------------------------------------------------------
 
--- Restore the saved render state before the UI is built.
-if Settings.get("noRender", false) == true then
-    pcall(function()
-        RunService:Set3dRenderingEnabled(false)
-    end)
-end
+-- Apply every saved option (movement method, tween speed, logs, auto sell, auto
+-- rejoin) before the UI is built. Options with an `apply` hook live in the
+-- registry, so this is the only restore call in the script.
+Settings.restore()
 
 LogView.create()
 
