@@ -59,8 +59,8 @@ local Config = {
     sellRemote = "SellResourceFunction",
     sellCapacity = 200,
     sellCooldown = 1,
-    sellSurfaceLift = 20,
-    sellHold = 0.5,
+    sellAnchorY = 8014,
+    sellHoldAfter = 5,
 
     blockEvent = "BlockEvent",
     minedEvent = "BlockMinedEvent",
@@ -1656,8 +1656,8 @@ function Sell.diag(key, text)
     logPrint(text)
 end
 
--- The sell remote refuses to work while the player is underground, so move to
--- the surface above the field centre first and wait for the landing.
+-- The sell remote refuses to work while the player is underground. Move above
+-- the field centre to Config.sellAnchorY; the caller anchors the root there.
 function Sell.toSurface(character)
     local root = character and character.PrimaryPart
     if not root then
@@ -1669,15 +1669,28 @@ function Sell.toSurface(character)
         return true
     end
 
-    local target = Vector3.new(
+    logPrint(("autosell: leaving depth %d for y=%d"):format(cell.Y, Config.sellAnchorY))
+    Movement.jump(character, Vector3.new(
         Config.fieldCenter.X,
-        Config.fieldCenter.Y + Config.sellSurfaceLift,
+        Config.sellAnchorY,
+        Config.fieldCenter.Z
+    ))
+    return true
+end
+
+-- Anchor the root exactly at sellAnchorY above the field centre.
+function Sell.holdForSale(character)
+    local root = character and character.PrimaryPart
+    if not root then
+        return false
+    end
+
+    Movement.hold(character)
+    root.CFrame = CFrame.new(
+        Config.fieldCenter.X,
+        Config.sellAnchorY,
         Config.fieldCenter.Z
     )
-
-    logPrint(("autosell: leaving depth %d for the surface"):format(cell.Y))
-    Movement.jump(character, target)
-    Movement.waitLanded(character, Config.emptyMineWait)
     return true
 end
 
@@ -1724,12 +1737,16 @@ function Sell.try(origin)
             return 0
         end
 
-        -- Hold the root at the destination while the remote runs: falling above
-        -- the cave makes the server reject part of the sell.
-        Movement.hold(character)
-        task.wait(Config.sellHold)
+        -- Hold the root exactly at sellAnchorY while the remote runs and for
+        -- sellHoldAfter seconds after the last sale.
+        if not Sell.holdForSale(character) then
+            Sell.diag("nosurface", "autosell: no root to anchor for the sale")
+            return 0
+        end
+
+        task.wait(Config.moveBuffer)
         local value = Sell.run(false, origin)
-        task.wait(Config.sellHold)
+        task.wait(Config.sellHoldAfter)
         Movement.releaseHold()
         return value
     end)
@@ -1829,10 +1846,10 @@ function Sell.manual()
 
     local ok, sold = pcall(function()
         Sell.toSurface(character)
-        Movement.hold(character)
-        task.wait(Config.sellHold)
+        Sell.holdForSale(character)
+        task.wait(Config.moveBuffer)
         local value = Sell.run(true, "manual")
-        task.wait(Config.sellHold)
+        task.wait(Config.sellHoldAfter)
         Movement.releaseHold()
         return value
     end)
