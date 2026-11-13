@@ -67,8 +67,11 @@ Server side is not in the place dump, so server checks below are inferred.
   otherwise the offset is kept at zero and the measurement is retried after the 5 s gate.
 - `Blocks.standPoint(cell) = worldOf(cell) + (0, 0.5, 0)` — cell centre, so a teleport
   never lands on a half-cell boundary where `rawBlock` could round to a neighbour.
-- `Mining.besideLiquid(block)` and Farm's liquid check share the same 6-offset
-  `IsBlockBesideLiquid` logic (the block below is skipped).
+- `Blocks.liquidSet()` builds a name -> true set of every `LiquidResource` (Oil/Lava) block
+  once per world (also after a reset) and `Blocks.liquidNeighbour(cell)` answers the
+  `IsBlockBesideLiquid` question with 5 hash lookups instead of 5 `FindFirstChild` calls.
+  `Mining.besideLiquid(block)` delegates to it, so the rule lives in one place and the
+  planner can call it thousands of times per plan without touching the instance tree.
 
 `ReplicatedStorage.Modules.Constants`:
 
@@ -108,7 +111,7 @@ so teleporting to the block centre was unnecessary and caused `BlockMinedEvent` 
   `Config.instantMove = false` (default) the root is anchored and tweened at
   `Config.tweenSpeed` for `distance / speed` seconds (clamped to 0.05..5), then settled;
   with `Config.instantMove = true` the move is a single `PivotTo`. There is no separate
-  "teleport" path any more, so loot, pits, step-aside, empty field and auto-sell surface
+  "teleport" path any more, so loot, pits, plan steps, empty field and auto-sell surface
   moves all use the same method.
 - Destination buffer: after a tween (and after an instant `PivotTo`) the character stays
   anchored at the target for `Config.moveBuffer = 0.1` s before `Movement.release` resumes
@@ -127,30 +130,43 @@ so teleporting to the block centre was unnecessary and caused `BlockMinedEvent` 
   the character anchored, and re-checks every `Config.emptyMineWait` seconds. The jump only fires
   again when the character is more than 4 studs from that point, so the loop no longer teleports
   and falls every tick. `Movement.releaseHold()` runs on the first tick that sees blocks again.
-- Liquid floor is special-cased: when `Mining.why(below)` is `liquid` or `blocked`, Farm
-  never even attempts `mine(below)` (the block borders liquid and cannot break) and does not
-  mine any lower ore either. It logs `floor blocked (<reason>), forcing side escape` and
-  immediately runs the side escape.
-- Side escape (`stepAside` in `src/main.lua`) is selection-independent: the ore selection is
-  ignored, any resource is allowed when escaping. Farm searches ring by ring outwards
-  (radius `1..Config.sideSearchRadius = 10`). For each ring it first tries the current layer
-  (`dy = 0`), then one block UP (`dy = -1`); the floor below that up-cell is the
-  current-layer side block, so this moves sideways or up, never down. Inside each ring the
-  richest floor wins. The first ring with a candidate logs `step aside r=N [up] -> x,y,z`
-  and teleports to `Blocks.standPoint(cell)` — the cell centre, so `Blocks.below()` on the
-  next tick still points at the validated floor and not at a boundary-rounded neighbour.
-  If no candidate exists inside the radius it logs
-  `down-block undiggable, no side escape within N` and waits 1 s, then retries.
-- Liquid escape (`escapeLiquid` in `src/main.lua`): when the bot is fully stuck in liquid,
-  i.e. at least `Config.liquidStuckCount = 4` of the 5 horizontal neighbours are
-  `LiquidResource` (Oil/Lava), sidestepping cannot help. Farm raises the search one block
-  above the stuck cell (`cell + (0, -1, 0)`), then searches by increasing distance
-  (outer loop `1..liquidSearchRange = 16`, inner loop over the shuffled 8 directions), so
-  the nearest mineable block wins instead of the first direction that happens to hit.
-  Blocks at the liquid level and below are never mined. On a hit it logs
-  `liquid escape -> x,y,z (Type)`, checks that the cell above the block is empty and
-  teleports into that cell with `Blocks.standPoint`; the next Farm tick digs it as the
-  block under the feet.
+- Liquid / blocked floor: Farm looks at the block under the feet before mining anything.
+  If `Mining.why(below)` is non-nil (`liquid`, `blocked`, `dug`, `bedrock`, ...), digging
+  straight down can only fail. Farm logs `floor blocked (<reason>), planning route` and hands
+  over to the escape planner. If there is no block at all the bot is falling; it logs nothing,
+  resets the plan and waits for the landing before deciding anything.
+- Escape planner (`Plan` in `src/main.lua`) — the bot mines a one-cell shaft surrounded by
+  solid rock, so there is usually no free cell to teleport into; it has to dig one.
+  Escaping is therefore solved as a grid search, not as "find an empty neighbour":
+  - node = a cell the bot stands in;
+  - edge = one of the 6 neighbours. An empty cell above (own shaft) costs
+    `planHop + planUpCost`; a solid block costs `Mining.mineTime(block) + planHop`.
+    Anything not `Mining.valid` or beside liquid is impassable, and so is an empty cell
+    reached sideways or downwards (that would be a fall);
+  - goal = a cell with `Config.planClearance = 3` diggable blocks in a row below it, so the
+    bot does not stop next to the same liquid pocket;
+  - Dijkstra (binary heap) with early exit inside a `planRadius = 7` cell box,
+    `planMaxNodes = 4000` cap and a `task.wait()` every 500 pops.
+- The planner ignores the ore selection: escape may use any resource. The plan is built once
+  and cached in `Plan.current`; it is rebuilt only when `Plan.expected` no longer matches the
+  real cell (loot, server, fall), after two failed digs, on a mode stop and on a reset.
+- Execution: one dig per tick. Logs `plan: N steps Xs -> x,y,z` when built, then digs the
+  target block and teleports to `Blocks.standPoint(target)` (cell centre). Empty steps (the
+  bot's own shaft) are not teleported into on their own — gravity drops the bot straight back
+  down a one-cell shaft — the climb is used only as launch height for the next dig in the
+  same tick.
+- Preventive trigger: even when the floor is diggable, Farm plans a route as soon as the next
+  `planClearance` blocks under the column are not all diggable (`Plan.clear`), so the bot
+  leaves before sitting in a liquid pocket.
+- Goal validity: the path mines its own cells, so a goal that sits directly on top of the
+  route would lose its floor. Such a goal is rejected (the ancestor chain is compared with
+  `goal + (0, 1, 0)`), which is why the planner digs sideways instead of mining a staircase
+  straight up in the same column.
+- No route (capped search or every cell impassable): logs `plan: no route, requesting
+  surface reset` and sets `Mining.resetRequested`, which clears `Plan` and the liquid cache
+  and teleports to the surface reset point. The same cell is not reset-spammed: within
+  `Config.planRetry = 5` s a repeated failure only logs `plan: still no route, waiting` and
+  waits 1 s, since other players can change the block layout.
 
 ## Surface pits
 
@@ -392,6 +408,9 @@ is received, waits up to 6 heartbeats, and logs
 - `Ores.nearest` collects candidates cheaply, sorts by score and calls `Mining.why` only until
   the first candidate passes, so liquid-blocked ore no longer wastes a tick and an ignore slot.
 - `Mining.maxDistance()` is re-read per equip; `typeOf` is a plain attribute read.
+- `Blocks.liquidSet` is one pass over the mine per world; after that every liquid question is a
+  hash lookup. `Plan` runs at most once per stuck situation, not per tick; `Plan.clear` (3
+  lookups) is the only per-tick cost on the normal dig path.
 - StreamingEnabled caveat: if `workspace.StreamingEnabled` is true, a missing client block does
-  not mean the block is missing on the server. `Surface.depth` would report "no floor" and the
-  star check would see a map edge where there is none. The bot assumes streaming is off.
+  not mean the block is missing on the server. `Surface.depth` and `Plan` would treat unloaded
+  rock as air and dig into it. The bot assumes streaming is off.

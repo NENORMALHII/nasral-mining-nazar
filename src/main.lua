@@ -37,7 +37,14 @@ local Config = {
     mineReachMargin = 4,
     moveCooldown = 0.5,
     maxRejects = 5,
-    sideSearchRadius = 10,
+
+    -- Escape planner (Dijkstra over block cells).
+    planRadius = 7,
+    planClearance = 3,
+    planHop = 0.3,
+    planUpCost = 4,
+    planMaxNodes = 4000,
+    planRetry = 5,
 
     surfaceDepth = 2,
     surfaceScanRadius = 6,
@@ -50,8 +57,6 @@ local Config = {
     emptyMineLift = 20,
     emptyMineWait = 2,
     teleportLift = 3.5,
-    liquidStuckCount = 4,
-    liquidSearchRange = 16,
     moveBuffer = 0.1,
     moveSettleTime = 0.25,
     moveSettleEpsilon = 0.2,
@@ -632,7 +637,7 @@ function Movement.to(character, position, speed)
 end
 
 -- Single movement path for every teleport in the script (loot, surface, pits,
--- step aside, auto sell). `Movement.to` decides how to move:
+-- plan steps, auto sell). `Movement.to` decides how to move:
 --   Config.instantMove == true  -> PivotTo immediately;
 --   Config.instantMove == false -> Linear tween at Config.tweenSpeed,
 --                                  then settle.
@@ -747,6 +752,67 @@ function Blocks.below(worldPosition)
 
     local cell = Blocks.toBlock(worldPosition) + Vector3.new(0, 1, 0)
     return mine:FindFirstChild(vec3ToString(cell))
+end
+
+-- Cached set of liquid (Oil/Lava) block names, rebuilt on world change or after
+-- a reset. One pass over the mine turns every "is this block beside liquid"
+-- question into a handful of hash lookups instead of `FindFirstChild` calls.
+Blocks.liquids = nil
+Blocks.liquidsWorld = nil
+
+function Blocks.invalidateLiquids()
+    Blocks.liquids = nil
+    Blocks.liquidsWorld = nil
+end
+
+function Blocks.liquidSet()
+    local player = Players.LocalPlayer
+    local world = player and tostring(player:GetAttribute(Game.attrWorldId))
+
+    if Blocks.liquids and Blocks.liquidsWorld == world then
+        return Blocks.liquids
+    end
+
+    local mine = workspace:FindFirstChild(Config.mineName)
+    if not mine then
+        return nil
+    end
+
+    local set = {}
+
+    for index, block in ipairs(mine:GetChildren()) do
+        local position = block:GetAttribute(Game.attrMinePosition)
+        local info = position and resourceInfo(typeOf(block))
+
+        if info and info.LiquidResource then
+            set[vec3ToString(position)] = true
+        end
+
+        if index % 4000 == 0 then
+            task.wait()
+        end
+    end
+
+    Blocks.liquids = set
+    Blocks.liquidsWorld = world
+    return set
+end
+
+-- True when any neighbour of `cell` except the one below is liquid: such a block
+-- cannot be broken. `blockOffsets.DOWN` is `(0, 1, 0)`, i.e. deeper.
+function Blocks.liquidNeighbour(cell)
+    local liquids = Blocks.liquidSet()
+    if not liquids then
+        return false
+    end
+
+    for _, offset in pairs(blockOffsets) do
+        if offset.Y ~= 1 and liquids[vec3ToString(cell + offset)] then
+            return true
+        end
+    end
+
+    return false
 end
 
 ---------------------------------------------------------------------------
@@ -1282,22 +1348,11 @@ end
 
 function Mining.besideLiquid(block)
     local position = block:GetAttribute(Game.attrMinePosition)
-    local mine = workspace:FindFirstChild(Config.mineName)
-    if not position or not mine then
+    if not position then
         return false
     end
 
-    for _, offset in pairs(blockOffsets) do
-        if offset.Y ~= 1 then
-            local neighbor = mine:FindFirstChild(vec3ToString(position + offset))
-            local info = neighbor and resourceInfo(typeOf(neighbor))
-            if info and info.LiquidResource then
-                return true
-            end
-        end
-    end
-
-    return false
+    return Blocks.liquidNeighbour(position)
 end
 
 function Mining.valid(block)
@@ -2305,151 +2360,343 @@ end
 -- Farm mode
 ---------------------------------------------------------------------------
 
--- Number of horizontal neighbours of `cell` that are liquid (Oil/Lava), and the
--- total checked. The block below is skipped, same as IsBlockBesideLiquid.
-local function liquidNeighbours(mine, cell)
-    local liquid, total = 0, 0
+-- Escape planner
+--
+-- The bot can only dig what is in reach, but it can teleport anywhere. Escaping a
+-- liquid pocket therefore is a grid pathfinding problem, not a "find a free cell"
+-- problem: in a one-cell shaft surrounded by solid rock there is no free cell to
+-- teleport to, the bot has to dig one.
+--
+-- Node   = cell the bot stands in.
+-- Edge   = one of the 6 neighbours. An empty cell above is cheap; a solid diggable
+--          block costs its mine time; liquid, bedrock, foreign `Dug`, blocked
+--          types and liquid-adjacent blocks are impassable.
+-- Goal   = cell with `Config.planClearance` diggable blocks in a row below it.
+--
+-- Dijkstra with early exit inside a `planRadius` box. The ore selection is
+-- ignored: escape may use any resource.
 
-    for _, offset in pairs(blockOffsets) do
-        if offset.Y ~= 1 then
-            total += 1
-            local neighbour = mine:FindFirstChild(vec3ToString(cell + offset))
-            local info = neighbour and resourceInfo(typeOf(neighbour))
+local Plan = {
+    current = nil,
+}
 
-            if info and info.LiquidResource then
-                liquid += 1
-            end
+local CELL_UP = Vector3.new(0, -1, 0)
+local CELL_DOWN = Vector3.new(0, 1, 0)
+
+local PLAN_MOVES = {
+    Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0),
+    Vector3.new(0, 0, 1), Vector3.new(0, 0, -1),
+    CELL_UP, CELL_DOWN,
+}
+
+local function heapPush(heap, node)
+    local index = #heap + 1
+    heap[index] = node
+
+    while index > 1 do
+        local parent = math.floor(index / 2)
+
+        if heap[parent].cost <= heap[index].cost then
+            break
+        end
+
+        heap[parent], heap[index] = heap[index], heap[parent]
+        index = parent
+    end
+end
+
+local function heapPop(heap)
+    local count = #heap
+    if count == 0 then
+        return nil
+    end
+
+    local first = heap[1]
+    heap[1] = heap[count]
+    heap[count] = nil
+    count = count - 1
+
+    local index = 1
+
+    while true do
+        local left, right = index * 2, index * 2 + 1
+        local smallest = index
+
+        if left <= count and heap[left].cost < heap[smallest].cost then
+            smallest = left
+        end
+
+        if right <= count and heap[right].cost < heap[smallest].cost then
+            smallest = right
+        end
+
+        if smallest == index then
+            break
+        end
+
+        heap[smallest], heap[index] = heap[index], heap[smallest]
+        index = smallest
+    end
+
+    return first
+end
+
+-- Cheapest test first: the cached liquid set, then the attribute checks.
+local function diggable(block)
+    if not block or not block.Parent then
+        return false
+    end
+
+    if Mining.besideLiquid(block) then
+        return false
+    end
+
+    return Mining.valid(block) == nil
+end
+
+-- The column below `cell` must allow a few clean down-digs, otherwise the plan
+-- would stop next to the same liquid pocket. An empty cell is fine, but the first
+-- floor under it has to be there.
+function Plan.clear(mine, cell)
+    for depth = 1, Config.planClearance do
+        local block = mine:FindFirstChild(vec3ToString(cell + CELL_DOWN * depth))
+
+        if not block then
+            return depth > 1
+        end
+
+        if not diggable(block) then
+            return false
         end
     end
 
-    return liquid, total
+    return true
 end
 
--- Fully stuck in liquid: almost every horizontal neighbour is Oil/Lava.
-local function stuckInLiquid(mine, cell)
-    local liquid, total = liquidNeighbours(mine, cell)
-    return total > 0 and liquid >= Config.liquidStuckCount
+function Plan.reset()
+    Plan.current = nil
 end
 
--- Liquid escape: the bot cannot dig the block under it and cannot step aside.
--- Look one block above the stuck cell, then walk a random horizontal direction
--- until a mineable block is found. Blocks at the liquid level and below are never
--- mined, only the one above the liquid. Teleport on top of it and let Farm dig
--- that block next tick.
-local function escapeLiquid(character, root)
+-- No route for the same cell within `planRetry` seconds: do not request a
+-- surface reset every tick. The world may change (other players dig), so retry.
+function Plan.failedRecently(cell)
+    if not Plan.failKey or Plan.failKey ~= vec3ToString(cell) then
+        return false
+    end
+
+    return os.clock() - Plan.failTime < Config.planRetry
+end
+
+function Plan.noteFailure(cell)
+    Plan.failKey = vec3ToString(cell)
+    Plan.failTime = os.clock()
+end
+
+function Plan.build(start)
     local mine = workspace:FindFirstChild(Config.mineName)
     if not mine then
-        return false
+        return nil
     end
 
-    local cell = Blocks.toBlock(root.Position)
-    if not stuckInLiquid(mine, cell) then
-        return false
-    end
+    local radius = Config.planRadius
+    local startKey = vec3ToString(start)
+    local cells = { [startKey] = start }
+    local costs = { [startKey] = 0 }
+    local parents = {}
 
-    local up = cell + Vector3.new(0, -1, 0)
+    -- `false` means "cell looked up and empty"; nil means "not looked up yet".
+    local blocks = {}
+    local digs = {}
+    local heap = {}
 
-    local directions = {
-        Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0),
-        Vector3.new(0, 0, 1), Vector3.new(0, 0, -1),
-        Vector3.new(1, 0, 1), Vector3.new(1, 0, -1),
-        Vector3.new(-1, 0, 1), Vector3.new(-1, 0, -1),
-    }
+    heapPush(heap, { cost = 0, key = startKey })
 
-    for index = #directions, 2, -1 do
-        local swap = math.random(index)
-        directions[index], directions[swap] = directions[swap], directions[index]
-    end
+    local pops = 0
 
-    -- Distance outer, directions inner: take the nearest mineable block instead
-    -- of the first direction that happens to hit far away.
-    for distance = 1, Config.liquidSearchRange do
-        for _, direction in ipairs(directions) do
-            local target = up + direction * distance
-            local block = mine:FindFirstChild(vec3ToString(target))
+    while true do
+        local node = heapPop(heap)
 
-            if block and Mining.why(block) == nil then
-                local stand = target + Vector3.new(0, -1, 0)
+        if not node then
+            return nil
+        end
 
-                if not mine:FindFirstChild(vec3ToString(stand)) then
-                    logPrint(("liquid escape -> %s (%s)"):format(
-                        vec3ToString(target), tostring(typeOf(block))))
+        pops = pops + 1
 
-                    Movement.jump(character, Blocks.standPoint(stand))
-                    return true
+        if pops > Config.planMaxNodes then
+            logWarn("plan: node cap reached")
+            return nil
+        end
+
+        if pops % 500 == 0 then
+            task.wait()
+        end
+
+        local key = node.key
+
+        if node.cost <= costs[key] then
+            local cell = cells[key]
+
+            if key ~= startKey and Plan.clear(mine, cell) then
+                -- The path mines its own cells, so a goal sitting right on top of
+                -- the route has no floor left once the route is dug. Reject it.
+                local belowKey = vec3ToString(cell + CELL_DOWN)
+                local chain = {}
+                local walk = key
+                local minedBelow = false
+
+                while walk ~= startKey do
+                    if walk == belowKey then
+                        minedBelow = true
+                    end
+
+                    table.insert(chain, 1, cells[walk])
+                    walk = parents[walk]
+                end
+
+                if not minedBelow then
+                    return chain, node.cost
                 end
             end
-        end
-    end
 
-    logWarn("liquid escape: no mineable block above the liquid")
-    return false
-end
+            for _, move in ipairs(PLAN_MOVES) do
+                local nextCell = cell + move
+                local delta = nextCell - start
 
--- Escape for the dig-straight-down case: the block under the bot is one we refuse
--- to dig (liquid neighbour, Oil/Lava/Grass/Void, someone else's Dug). Pick the
--- richest neighbouring column whose own cell is empty and whose floor is diggable,
--- so the next down-dig has a different block under it.
-local function stepAside(character, root)
-    local mine = workspace:FindFirstChild(Config.mineName)
-    if not mine then
-        return
-    end
+                if math.abs(delta.X) <= radius
+                    and math.abs(delta.Y) <= radius
+                    and math.abs(delta.Z) <= radius then
+                    local nextKey = vec3ToString(nextCell)
+                    local block = blocks[nextKey]
 
-    local cell = Blocks.toBlock(root.Position)
+                    if block == nil then
+                        block = mine:FindFirstChild(nextKey) or false
+                        blocks[nextKey] = block
+                    end
 
-    -- Selection-independent: escape may use any adjacent resource, selected or
-    -- not. `dy` = 0 stays on the current layer, `dy = -1` moves one block UP
-    -- (the floor below that cell is the current-layer side block). Never down.
-    local function bestAt(radius, dy)
-        local best, bestPrice
+                    local step
 
-        for dx = -radius, radius do
-            for dz = -radius, radius do
-                if math.max(math.abs(dx), math.abs(dz)) == radius and not (dx == 0 and dz == 0) then
-                    local stand = cell + Vector3.new(dx, dy, dz)
+                    if block then
+                        -- Dig the block and stand in the freed cell. `diggable`
+                        -- is cached per cell: a node is examined from up to 6
+                        -- parents and it reads attributes.
+                        local dig = digs[nextKey]
 
-                    if not mine:FindFirstChild(vec3ToString(stand)) then
-                        local floor = mine:FindFirstChild(vec3ToString(stand + Vector3.new(0, 1, 0)))
+                        if dig == nil then
+                            dig = diggable(block)
+                            digs[nextKey] = dig
+                        end
 
-                        if floor and Mining.why(floor) == nil then
-                            local price = Ores.price(typeOf(floor) or "")
+                        if dig then
+                            step = Mining.mineTime(block) + Config.planHop
+                        end
+                    elseif move == CELL_UP then
+                        -- Own shaft: climb, but climbing back costs a down-dig later.
+                        step = Config.planHop + Config.planUpCost
+                    end
 
-                            if not best or price > bestPrice then
-                                best, bestPrice = stand, price
-                            end
+                    if step then
+                        local total = node.cost + step
+
+                        if not costs[nextKey] or total < costs[nextKey] then
+                            costs[nextKey] = total
+                            parents[nextKey] = key
+                            cells[nextKey] = nextCell
+                            heapPush(heap, { cost = total, key = nextKey })
                         end
                     end
                 end
             end
         end
+    end
+end
 
-        return best
+-- One dig per tick. `mineBlock(block)` is Farm's own mining wrapper; it returns
+-- true only when the block is really gone.
+function Plan.run(character, root, mineBlock)
+    local cell = Blocks.toBlock(root.Position)
+    local plan = Plan.current
+
+    -- Loot, the server or a fall moved the bot: rebuild from the real cell.
+    if plan and plan.expected ~= cell then
+        Plan.reset()
+        plan = nil
     end
 
-    for radius = 1, Config.sideSearchRadius do
-        local best = bestAt(radius, 0)
-        local up = false
+    if not plan then
+        local path, cost = Plan.build(cell)
 
-        if not best then
-            best = bestAt(radius, -1)
-            up = best ~= nil
+        if not path or #path == 0 then
+            logWarn(("plan: no route from %s"):format(vec3ToString(cell)))
+            return false
         end
 
-        if best then
-            logPrint(("step aside r=%d %s-> %s"):format(
-                radius, up and "up " or "", vec3ToString(best)))
+        plan = { path = path, index = 1, expected = cell, fails = 0 }
+        Plan.current = plan
+        Plan.failKey = nil
 
-            -- Cell centre, so Blocks.below() afterwards still points at the
-            -- validated floor and not at a boundary-rounded neighbour.
-            Movement.jump(character, Blocks.standPoint(best))
-            return
+        logPrint(("plan: %d steps %.1fs -> %s"):format(
+            #path, cost, vec3ToString(path[#path])))
+    end
+
+    local mine = workspace:FindFirstChild(Config.mineName)
+    if not mine then
+        Plan.reset()
+        return false
+    end
+
+    -- Empty steps are the bot's own shaft. It cannot stay there: gravity drops it
+    -- back down a one-cell shaft, so climbing only works as part of the next dig.
+    -- Remember the climb and mine the next solid cell from that height.
+    local climb
+    local target, block
+
+    while plan.index <= #plan.path do
+        target = plan.path[plan.index]
+        block = mine:FindFirstChild(vec3ToString(target))
+
+        if block then
+            break
+        end
+
+        climb = target
+        target, block = nil, nil
+        plan.index = plan.index + 1
+    end
+
+    if not target then
+        Plan.reset()
+        logPrint("plan: nothing left to dig")
+        return true
+    end
+
+    if climb then
+        -- Climb only when the dig needs the height: a teleport in the same tick
+        -- as BlockEvent is what `Config.moveCooldown` normally avoids.
+        if not Mining.inRange(character, block) then
+            Movement.jump(character, Blocks.standPoint(climb))
         end
     end
 
-    logWarn(("down-block undiggable, no side escape within %d"):format(
-        Config.sideSearchRadius))
-    task.wait(1)
+    if not mineBlock(block) then
+        plan.fails = plan.fails + 1
+
+        if plan.fails >= 2 then
+            Plan.reset()
+        end
+
+        return true
+    end
+
+    Movement.jump(character, Blocks.standPoint(target))
+    plan.expected = target
+    plan.index = plan.index + 1
+
+    if plan.index > #plan.path then
+        Plan.reset()
+        logPrint("plan: done")
+    end
+
+    return true
 end
 
 local FarmMode = Mode.new("Farm", function(self)
@@ -2476,6 +2723,8 @@ local FarmMode = Mode.new("Farm", function(self)
         Blocks.calibrated = false
         Blocks.lastCalibrate = 0
         Blocks.offset = Vector3.zero
+        Blocks.invalidateLiquids()
+        Plan.reset()
         Ores.clearCache()
         Blocks.calibrate()
 
@@ -2611,17 +2860,48 @@ local FarmMode = Mode.new("Farm", function(self)
     local below = Blocks.below(root.Position)
     local belowReason = below and Mining.why(below)
 
-    -- Liquid-adjacent (or otherwise blocked) floor: this block can never be
-    -- broken, and mining anything below the current layer would only dig into
-    -- the same liquid pocket. Ignore the ore selection and escape sideways/up.
-    if belowReason == "liquid" or belowReason == "blocked" then
-        logWarn(("floor blocked (%s), forcing side escape"):format(tostring(belowReason)))
+    -- No floor under the feet: the bot is falling. Let physics finish before
+    -- planning, otherwise every fall tick would rebuild a plan.
+    if not below then
+        Plan.reset()
+        Movement.waitLanded(character)
+        return
+    end
 
-        if escapeLiquid(character, root) then
+    -- Escape planning. A route is built when:
+    --   * a plan is already running,
+    --   * the floor cannot be dug (liquid neighbour, blocked type, foreign Dug),
+    --   * or the next `planClearance` blocks under this column are not clean
+    --     (preventive: move away before sitting in a liquid pocket).
+    -- The planner ignores the ore selection and digs its own tunnel: the bot sits
+    -- in a one-cell shaft, so there is usually no free cell to teleport into.
+    local needPlan = Plan.current ~= nil
+
+    if not needPlan and mineModel then
+        if belowReason ~= nil or not Plan.clear(mineModel, cell) then
+            needPlan = true
+
+            if belowReason then
+                logWarn(("floor blocked (%s), planning route"):format(tostring(belowReason)))
+            end
+        end
+    end
+
+    if needPlan then
+        if Plan.run(character, root, mine) then
             return
         end
 
-        stepAside(character, root)
+        if Plan.failedRecently(cell) then
+            logWarn("plan: still no route, waiting")
+            task.wait(1)
+            return
+        end
+
+        Plan.noteFailure(cell)
+        logWarn("plan: no route, requesting surface reset")
+        Plan.reset()
+        Mining.resetRequested = true
         return
     end
 
@@ -2636,29 +2916,20 @@ local FarmMode = Mode.new("Farm", function(self)
     end
 
     -- 4. Nothing reachable: dig straight down, one block at a time.
-    if not below then
-        -- Fell into a liquid pocket with no floor: climb out one block up.
-        if escapeLiquid(character, root) then
-            return
-        end
-
-        Movement.waitLanded(character)
-        return
-    end
-
     if mine(below) then
         Movement.waitLanded(character)
         return
     end
 
     if below.Parent and Mining.why(below) then
-        if escapeLiquid(character, root) then
-            return
-        end
-
-        stepAside(character, root)
+        -- Rejected between the plan check and the swing: escalate next tick.
+        Plan.reset()
+        logWarn("down-block undiggable, planning route")
     end
-end, Movement.cancel)
+end, function()
+    Plan.reset()
+    Movement.cancel()
+end)
 
 ---------------------------------------------------------------------------
 -- Mushroom mode
