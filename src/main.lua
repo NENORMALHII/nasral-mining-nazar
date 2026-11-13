@@ -1830,9 +1830,30 @@ local FarmMode = Mode.new("Farm", function(self)
         local mine = workspace:FindFirstChild(Config.mineName)
         if mine and #mine:GetChildren() == 0 then
             -- Mine is empty, place character higher to avoid falling forever
-            Movement.jump(character, Vector3.new(root.Position.X, root.Position.Y + 10, root.Position.Z))
-            logPrint("mine empty, moved up")
-            return
+            local cell = Blocks.toBlock(root.Position)
+            
+            if cell.Y < Config.surfaceDepth then
+                -- On surface, move to 10 studs above field center
+                local targetPos = Vector3.new(
+                    Config.fieldCenter.X,
+                    Config.fieldCenter.Y + 10,
+                    Config.fieldCenter.Z
+                )
+                Movement.jump(character, targetPos)
+                logPrint("mine empty, moved to field center height")
+                return
+            end
+            
+            -- Not on surface, try to move up
+            local targetY = root.Position.Y + 10
+            local testCell = Vector3.new(cell.X, cell.Y + 1, cell.Z)
+            local worldPos = Blocks.worldOf(testCell)
+            
+            if not mine:FindFirstChild(vec3ToString(Blocks.toBlock(worldPos))) then
+                Movement.jump(character, Vector3.new(root.Position.X, targetY, root.Position.Z))
+                logPrint("mine empty, moved up")
+                return
+            end
         end
         
         Movement.waitLanded(character)
