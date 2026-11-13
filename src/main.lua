@@ -36,13 +36,13 @@ local Config = {
     mineReachMargin = 4,
     moveCooldown = 0.5,
     maxRejects = 5,
-    maxSideFails = 3,
 
     surfaceDepth = 2,
     surfaceScanRadius = 6,
     surfaceMaxDepth = 10,
     surfaceMinDepth = 2,
     surfaceProbeDepth = 6,
+    surfaceStarMin = 8,
     fieldCenter = Vector3.new(89.5, 7998.5, -21.5),
     fieldRadius = 14,
     emptyMineLift = 20,
@@ -208,24 +208,12 @@ local function vec3ToString(position)
     return ("%d,%d,%d"):format(position.X, position.Y, position.Z)
 end
 
--- Block type never changes after spawn: cache it per block (weak keys).
-local typeCache = setmetatable({}, { __mode = "k" })
-
 local function typeOf(block)
-    local cached = typeCache[block]
-
-    if cached ~= nil then
-        if cached == false then
-            return nil
-        end
-        return cached
-    end
-
     local typeValue = block:FindFirstChild("Type")
-    local value = typeValue and typeValue.Value or block:GetAttribute("Resource")
-
-    typeCache[block] = value or false
-    return value
+    if typeValue then
+        return typeValue.Value
+    end
+    return block:GetAttribute("Resource")
 end
 
 local function resourceInfo(name)
@@ -233,41 +221,6 @@ local function resourceInfo(name)
         return nil
     end
     return Game.Resources[name]
-end
-
--- Fast block lookup by name. FindFirstChild walks children and formats a string
--- on every call, which is too slow for the 7x7x7 scans. Rebuilt once and kept
--- in sync through ChildAdded/ChildRemoved.
-local Index = {
-    mine = nil,
-    byName = {},
-}
-
-function Index.build(mine)
-    if not mine or Index.mine == mine then
-        return
-    end
-
-    Index.mine = mine
-    Index.byName = {}
-
-    for _, block in ipairs(mine:GetChildren()) do
-        Index.byName[block.Name] = block
-    end
-
-    mine.ChildAdded:Connect(function(block)
-        Index.byName[block.Name] = block
-    end)
-
-    mine.ChildRemoved:Connect(function(block)
-        if Index.byName[block.Name] == block then
-            Index.byName[block.Name] = nil
-        end
-    end)
-end
-
-function Index.at(cell)
-    return Index.byName[vec3ToString(cell)]
 end
 
 ---------------------------------------------------------------------------
@@ -426,6 +379,10 @@ function Movement.release()
     Movement.character = nil
 end
 
+function Movement.cancel()
+    Movement.release()
+end
+
 function Movement.hold(character)
     local root = character.PrimaryPart
     if root then
@@ -568,149 +525,93 @@ end
 -- Blocks (world <-> block coordinates)
 ---------------------------------------------------------------------------
 
-local Blocks = {
-    origin = Vector3.new(61.5, 7998.5, -56.5),
-    calibrated = false,
-    lastCalibrate = -1e9,
-    worldId = nil,
-}
+local Blocks = {}
 
-function Blocks.toBlock(position)
-    local d = position - Blocks.origin
+local BASE_X = 61.5
+local BASE_Z = -56.5
+local BASE_ALTITUDE = 7998.5
+
+Blocks.offset = Vector3.new(0, 0, 0)
+Blocks.calibrated = false
+Blocks.lastCalibrate = 0
+
+local function rawBlock(position)
     return Vector3.new(
-        math.floor(d.X / 7 + 0.5),
-        -math.floor(d.Y / 7 + 0.5),
-        math.floor(d.Z / 7 + 0.5)
+        math.floor((position.X - BASE_X) / 7 + 0.5),
+        -math.floor((position.Y - BASE_ALTITUDE) / 7 + 0.5),
+        math.floor((position.Z - BASE_Z) / 7 + 0.5)
     )
 end
 
+local function rawWorld(cell)
+    return Vector3.new(
+        BASE_X + 7 * cell.X,
+        BASE_ALTITUDE - 7 * cell.Y,
+        BASE_Z + 7 * cell.Z
+    )
+end
+
+function Blocks.toBlock(position)
+    return rawBlock(position) + Blocks.offset
+end
+
 function Blocks.worldOf(cell)
-    return Blocks.origin + Vector3.new(7 * cell.X, -7 * cell.Y, 7 * cell.Z)
+    return rawWorld(cell - Blocks.offset)
 end
 
--- Centre of an empty cell: feet end up right above the floor, not on the
--- half-cell boundary where rawBlock could round to the neighbouring cell.
-function Blocks.standPoint(cell)
-    return Blocks.worldOf(cell) + Vector3.new(0, 0.5, 0)
-end
-
-function Blocks.key(block)
-    local minePosition = block and block:GetAttribute(Game.attrMinePosition)
-    if minePosition then
-        return vec3ToString(minePosition)
-    end
-    return block and block.Name or nil
-end
-
--- Oil/Lava neighbours around a cell (the cell below is skipped, same as
--- IsBlockBesideLiquid). One implementation used by Mining and Farm.
-function Blocks.liquidNeighbours(cell)
-    local liquid, total = 0, 0
-
-    for _, offset in pairs(blockOffsets) do
-        if offset.Y ~= 1 then
-            total += 1
-            local neighbour = Index.at(cell + offset)
-            local info = neighbour and resourceInfo(typeOf(neighbour))
-
-            if info and info.LiquidResource then
-                liquid += 1
-            end
-        end
-    end
-
-    return liquid, total
-end
-
--- Block names are built from `MinePosition`; the origin converts world <-> cell.
--- One cheap radius query around the field centre measures it once. The previous
--- origin is kept until a new stable one is found, and it is re-measured when the
--- player's WorldId changes.
+-- Block names are built from the `MinePosition` attribute, which may be shifted
+-- from the world formula by a constant. One full children pass at the field
+-- centre measures that shift once; after that every name lookup is exact.
 function Blocks.calibrate()
-    local worldId = tostring(Players.LocalPlayer:GetAttribute(Game.attrWorldId))
-
-    if Blocks.worldId and Blocks.worldId ~= worldId then
-        Blocks.calibrated = false
-        Blocks.worldId = nil
-    end
-
     if Blocks.calibrated then
-        return true
+        return
     end
 
     if os.clock() - Blocks.lastCalibrate < 5 then
-        return false
+        return
     end
 
     Blocks.lastCalibrate = os.clock()
 
     local mine = workspace:FindFirstChild(Config.mineName)
     if not mine then
-        return false
+        return
     end
 
-    Index.build(mine)
+    local firstOffset, firstDistance
+    local secondOffset, secondDistance
 
-    local firstOrigin, firstDistance
-    local secondOrigin, secondDistance
-
-    local function consider(block)
+    for _, block in ipairs(mine:GetChildren()) do
         local minePosition = block:GetAttribute(Game.attrMinePosition)
-        if not minePosition then
-            return
-        end
 
-        local origin = block.Position - Vector3.new(
-            7 * minePosition.X,
-            -7 * minePosition.Y,
-            7 * minePosition.Z
-        )
-        local distance = (block.Position - Config.fieldCenter).Magnitude
+        if minePosition then
+            local offset = minePosition - rawBlock(block.Position)
+            local distance = (block.Position - Config.fieldCenter).Magnitude
 
-        if not firstDistance or distance < firstDistance then
-            secondOrigin, secondDistance = firstOrigin, firstDistance
-            firstOrigin, firstDistance = origin, distance
-        elseif not secondDistance or distance < secondDistance then
-            secondOrigin, secondDistance = origin, distance
+            if not firstDistance or distance < firstDistance then
+                secondOffset, secondDistance = firstOffset, firstDistance
+                firstOffset, firstDistance = offset, distance
+            elseif not secondDistance or distance < secondDistance then
+                secondOffset, secondDistance = offset, distance
+            end
         end
     end
 
-    local ok, parts = pcall(function()
-        local params = OverlapParams.new()
-        params.FilterType = Enum.RaycastFilterType.Include
-        params.FilterDescendantsInstances = { mine }
-        return workspace:GetPartBoundsInRadius(Config.fieldCenter, 20, params)
-    end)
-
-    if ok and parts then
-        for _, part in ipairs(parts) do
-            consider(part)
-        end
-    end
-
-    if not firstOrigin then
-        for _, block in ipairs(mine:GetChildren()) do
-            consider(block)
-        end
-    end
-
-    if not firstOrigin then
-        return false
+    if not firstOffset then
+        return
     end
 
     -- Validate on the second nearest block: a per-part pivot quirk would give a
-    -- different origin. Keep the old origin and retry instead of silently
-    -- calibrating with a wrong one.
-    if secondOrigin and secondOrigin ~= firstOrigin then
-        logWarn("block origin not stable, retrying")
-        return false
+    -- different offset there, so only accept a stable one.
+    if secondOffset and secondOffset ~= firstOffset then
+        logWarn("block offset not stable, keeping zero")
+        Blocks.calibrated = true
+        return
     end
 
-    Blocks.origin = firstOrigin
+    Blocks.offset = firstOffset
     Blocks.calibrated = true
-    Blocks.worldId = worldId
-    logPrint(("blocks origin %s"):format(tostring(Blocks.origin)))
-    return true
+    logPrint(("blocks offset %s"):format(tostring(Blocks.offset)))
 end
 
 function Blocks.below(worldPosition)
@@ -719,8 +620,8 @@ function Blocks.below(worldPosition)
         return nil
     end
 
-    Index.build(mine)
-    return Index.at(Blocks.toBlock(worldPosition) + Vector3.new(0, 1, 0))
+    local cell = Blocks.toBlock(worldPosition) + Vector3.new(0, 1, 0)
+    return mine:FindFirstChild(vec3ToString(cell))
 end
 
 ---------------------------------------------------------------------------
@@ -742,7 +643,7 @@ Surface.dirs = {
 function Surface.depth(mine, x, z, topY)
     for depth = 0, Config.surfaceMaxDepth - 1 do
         local y = topY + depth
-        if Index.at(Vector3.new(x, y, z)) then
+        if mine:FindFirstChild(vec3ToString(Vector3.new(x, y, z))) then
             return depth
         end
     end
@@ -771,7 +672,7 @@ function Surface.star(mine, cell, floorY)
                 cell.Z + dir.Z * step
             )
 
-            if Index.at(side) then
+            if mine:FindFirstChild(vec3ToString(side)) then
                 hits += 1
                 break
             end
@@ -785,18 +686,18 @@ end
 -- rays hit mine blocks. This rejects map edges, floating columns and open holes
 -- that are not surrounded by generated terrain.
 function Surface.safe(mine, cell, depth)
-    if Index.at(cell) then
+    if mine:FindFirstChild(vec3ToString(cell)) then
         return false
     end
 
     local floorY = cell.Y + depth
 
-    if not Index.at(Vector3.new(cell.X, floorY, cell.Z)) then
+    if not mine:FindFirstChild(vec3ToString(Vector3.new(cell.X, floorY, cell.Z))) then
         return false
     end
 
     local hits = Surface.star(mine, cell, floorY)
-    return hits == #Surface.dirs, hits
+    return hits >= Config.surfaceStarMin, hits
 end
 
 -- Deepest safe pit around `center` on layer `topY`. Collects depth candidates
@@ -841,31 +742,17 @@ function Surface.scan(mine, center, topY, minDepth)
     return nil
 end
 
--- Cached pit: re-scanned only when the cheap check fails or after a reset.
-Surface.pit = nil
-
-function Surface.validPit(mine, cell)
-    local depth = Surface.depth(mine, cell.X, cell.Z, -1)
-    return depth ~= nil and depth >= Config.surfaceMinDepth
-end
-
--- Cell to stand in before dropping down. Always uses the fixed surface layer
--- (-1), so the pit does not move when the teleported root rounds differently.
+-- Cell to stand in before dropping down, on the player's own layer.
 function Surface.find(position)
     local mine = workspace:FindFirstChild(Config.mineName)
     if not mine then
         return nil
     end
 
-    Index.build(mine)
     Blocks.calibrate()
 
-    if Surface.pit and Surface.validPit(mine, Surface.pit) then
-        return Surface.pit
-    end
-
-    Surface.pit = Surface.scan(mine, Blocks.toBlock(position), -1, Config.surfaceMinDepth)
-    return Surface.pit
+    local cell = Blocks.toBlock(position)
+    return Surface.scan(mine, cell, cell.Y, Config.surfaceMinDepth)
 end
 
 -- Reset target after a rejection streak: the same scan on the fixed surface
@@ -876,14 +763,12 @@ function Surface.resetPoint()
         return nil
     end
 
-    Index.build(mine)
-
     local cell = Surface.scan(mine, Blocks.toBlock(Config.fieldCenter), -1, 1)
     if not cell then
         return nil
     end
 
-    return Blocks.standPoint(cell)
+    return Blocks.worldOf(cell) + Vector3.new(0, Config.teleportLift, 0)
 end
 
 ---------------------------------------------------------------------------
@@ -1265,30 +1150,29 @@ function Mining.swingDelay()
     return math.random() * (Config.mineSwingMax - Config.mineSwingMin) + Config.mineSwingMin
 end
 
--- Cached per pickaxe: MaxDistance does not change while the tool is equipped.
 function Mining.maxDistance()
-    local pickaxe = Mining.pickaxe
-
-    if pickaxe and pickaxe == Mining.maxDistanceTool and Mining.maxDistanceValue then
-        return Mining.maxDistanceValue
-    end
-
-    local maxDistance = pickaxe and pickaxe:FindFirstChild("MaxDistance")
-    local value = maxDistance and maxDistance.Value or 25
-
-    Mining.maxDistanceTool = pickaxe
-    Mining.maxDistanceValue = value
-    return value
+    local maxDistance = Mining.pickaxe and Mining.pickaxe:FindFirstChild("MaxDistance")
+    return maxDistance and maxDistance.Value or 25
 end
 
 function Mining.besideLiquid(block)
     local position = block:GetAttribute(Game.attrMinePosition)
-    if not position then
+    local mine = workspace:FindFirstChild(Config.mineName)
+    if not position or not mine then
         return false
     end
 
-    local liquid = Blocks.liquidNeighbours(position)
-    return liquid > 0
+    for _, offset in pairs(blockOffsets) do
+        if offset.Y ~= 1 then
+            local neighbor = mine:FindFirstChild(vec3ToString(position + offset))
+            local info = neighbor and resourceInfo(typeOf(neighbor))
+            if info and info.LiquidResource then
+                return true
+            end
+        end
+    end
+
+    return false
 end
 
 function Mining.valid(block)
@@ -1372,9 +1256,6 @@ function Mining.mine(character, block)
         return false
     end
 
-    -- MinePosition string: the same key for BlockMinedEvent and the cancel call.
-    local key = Blocks.key(block)
-
     local waitTime = Mining.waitTime(block)
     local preSwing = Mining.preSwingDelay()
     local swing = Mining.swingDelay()
@@ -1404,7 +1285,7 @@ function Mining.mine(character, block)
         return true
     end
 
-    minedEvent:FireServer({ blockName = key })
+    minedEvent:FireServer({ blockName = vec3ToString(position) })
 
     local deadline = os.clock() + Config.mineRejectGrace
     while block.Parent and os.clock() < deadline do
@@ -1412,7 +1293,7 @@ function Mining.mine(character, block)
     end
 
     if block.Parent then
-        blockEvent:FireServer(key, { dug = false })
+        blockEvent:FireServer(vec3ToString(position), { dug = false })
         Mining.rejects += 1
 
         logWarn(("server rejected %s type=%s base=%.2f wait=%.3f streak=%d"):format(
@@ -1442,7 +1323,7 @@ end
 local Ores = {}
 
 local namesCache
-local ignored = setmetatable({}, { __mode = "k" })
+local ignored = {}
 
 function Ores.price(name)
     local info = resourceInfo(name)
@@ -1541,16 +1422,15 @@ function Ores.nearest(position, radius)
         return nil
     end
 
-    Index.build(mine)
-
     local reach = math.ceil(limit / 7)
     local selected = Ores.selectedSet()
-    local candidates = {}
+    local best, bestScore
 
     for dx = -reach, reach do
         for dy = -reach, reach do
             for dz = -reach, reach do
-                local block = Index.at(center + Vector3.new(dx, dy, dz))
+                local cell = center + Vector3.new(dx, dy, dz)
+                local block = mine:FindFirstChild(vec3ToString(cell))
 
                 if block then
                     local untilIgnore = ignored[block]
@@ -1559,31 +1439,16 @@ function Ores.nearest(position, radius)
                     if distance <= limit and (not untilIgnore or untilIgnore <= now) then
                         local name = typeOf(block)
 
-                        -- Cheap rejection first; the expensive liquid/why check
-                        -- runs lazily below only until one candidate passes.
-                        if name and (not selected or selected[name])
-                            and Mining.valid(block) == nil then
-                            table.insert(candidates, {
-                                block = block,
-                                score = Ores.price(name) * 1000 - distance,
-                            })
+                        if name and (not selected or selected[name]) and Mining.valid(block) == nil then
+                            local score = Ores.price(name) * 1000 - distance
+
+                            if not bestScore or score > bestScore then
+                                best, bestScore = block, score
+                            end
                         end
                     end
                 end
             end
-        end
-    end
-
-    table.sort(candidates, function(a, b)
-        return a.score > b.score
-    end)
-
-    local best
-
-    for _, candidate in ipairs(candidates) do
-        if candidate.block.Parent and Mining.why(candidate.block) == nil then
-            best = candidate.block
-            break
         end
     end
 
@@ -1604,7 +1469,7 @@ function Ores.clearCache()
     scanCache.time = 0
     scanCache.cell = nil
     scanCache.best = nil
-    ignored = setmetatable({}, { __mode = "k" })
+    ignored = {}
 end
 
 function Ores.count()
@@ -2267,7 +2132,7 @@ end
 ---------------------------------------------------------------------------
 
 local MushroomNode = {}
-local mushroomIgnored = setmetatable({}, { __mode = "k" })
+local mushroomIgnored = {}
 
 function MushroomNode.nearest(position)
     local best, bestDistance
@@ -2301,51 +2166,74 @@ end
 -- Farm mode
 ---------------------------------------------------------------------------
 
+-- Number of horizontal neighbours of `cell` that are liquid (Oil/Lava), and the
+-- total checked. The block below is skipped, same as IsBlockBesideLiquid.
+local function liquidNeighbours(mine, cell)
+    local liquid, total = 0, 0
+
+    for _, offset in pairs(blockOffsets) do
+        if offset.Y ~= 1 then
+            total += 1
+            local neighbour = mine:FindFirstChild(vec3ToString(cell + offset))
+            local info = neighbour and resourceInfo(typeOf(neighbour))
+
+            if info and info.LiquidResource then
+                liquid += 1
+            end
+        end
+    end
+
+    return liquid, total
+end
+
 -- Fully stuck in liquid: almost every horizontal neighbour is Oil/Lava.
-local function stuckInLiquid(cell)
-    local liquid, total = Blocks.liquidNeighbours(cell)
+local function stuckInLiquid(mine, cell)
+    local liquid, total = liquidNeighbours(mine, cell)
     return total > 0 and liquid >= Config.liquidStuckCount
 end
 
 -- Liquid escape: the bot cannot dig the block under it and cannot step aside.
--- Look one block above the stuck cell and take the NEAREST mineable block over
--- the 8 directions (distance outer, shuffled directions inner). Blocks at the
--- liquid level and below are never mined, only the one above the liquid.
+-- Look one block above the stuck cell, then walk a random horizontal direction
+-- until a mineable block is found. Blocks at the liquid level and below are never
+-- mined, only the one above the liquid. Teleport on top of it and let Farm dig
+-- that block next tick.
 local function escapeLiquid(character, root)
+    local mine = workspace:FindFirstChild(Config.mineName)
+    if not mine then
+        return false
+    end
+
     local cell = Blocks.toBlock(root.Position)
-    if not stuckInLiquid(cell) then
+    if not stuckInLiquid(mine, cell) then
         return false
     end
 
     local up = cell + Vector3.new(0, -1, 0)
-    local directions = {}
 
-    for index, dir in ipairs(Surface.dirs) do
-        directions[index] = dir
-    end
+    local directions = {
+        Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0),
+        Vector3.new(0, 0, 1), Vector3.new(0, 0, -1),
+        Vector3.new(1, 0, 1), Vector3.new(1, 0, -1),
+        Vector3.new(-1, 0, 1), Vector3.new(-1, 0, -1),
+    }
 
     for index = #directions, 2, -1 do
         local swap = math.random(index)
         directions[index], directions[swap] = directions[swap], directions[index]
     end
 
-    for distance = 1, Config.liquidSearchRange do
-        for _, dir in ipairs(directions) do
-            local target = up + dir * distance
-            local block = Index.at(target)
+    for _, direction in ipairs(directions) do
+        for distance = 1, Config.liquidSearchRange do
+            local target = up + direction * distance
+            local block = mine:FindFirstChild(vec3ToString(target))
 
             if block and Mining.why(block) == nil then
-                -- Teleport into the empty cell above the found block, never on
-                -- top of a solid part.
-                local stand = target + Vector3.new(0, -1, 0)
+                logPrint(("liquid escape -> %s (%s)"):format(
+                    vec3ToString(target), tostring(typeOf(block))))
 
-                if not Index.at(stand) then
-                    logPrint(("liquid escape -> %s (%s)"):format(
-                        vec3ToString(target), tostring(typeOf(block))))
-
-                    Movement.jump(character, Blocks.standPoint(stand))
-                    return true
-                end
+                Movement.jump(character, Blocks.worldOf(target)
+                    + Vector3.new(0, Config.teleportLift, 0))
+                return true
             end
         end
     end
@@ -2357,17 +2245,12 @@ end
 -- Escape for the dig-straight-down case: the block under the bot is one we refuse
 -- to dig (liquid neighbour, Oil/Lava/Grass/Void, someone else's Dug). Pick the
 -- richest neighbouring column whose own cell is empty and whose floor is diggable,
--- so the next down-dig has a different block under it. Repeated failures request
--- a surface reset instead of looping forever.
-local sideFails = 0
-
+-- so the next down-dig has a different block under it.
 local function stepAside(character, root)
     local mine = workspace:FindFirstChild(Config.mineName)
     if not mine then
         return
     end
-
-    Index.build(mine)
 
     local cell = Blocks.toBlock(root.Position)
     local best, bestPrice
@@ -2375,9 +2258,11 @@ local function stepAside(character, root)
     for _, offset in pairs(blockOffsets) do
         if offset.Y == 0 then
             local side = cell + Vector3.new(offset.X, 0, offset.Z)
-            local floor = Index.at(side + Vector3.new(0, 1, 0))
+            local floor = mine:FindFirstChild(vec3ToString(side + Vector3.new(0, 1, 0)))
 
-            if floor and Mining.why(floor) == nil and not Index.at(side) then
+            if floor
+                and Mining.why(floor) == nil
+                and not mine:FindFirstChild(vec3ToString(side)) then
                 local price = Ores.price(typeOf(floor) or "")
 
                 if not best or price > bestPrice then
@@ -2388,21 +2273,10 @@ local function stepAside(character, root)
     end
 
     if not best then
-        sideFails += 1
-        logWarn(("down-block undiggable, no side escape (%d)"):format(sideFails))
-
-        if sideFails >= Config.maxSideFails then
-            sideFails = 0
-            Mining.resetRequested = true
-            logWarn("side escape failed too often, requesting surface reset")
-        else
-            task.wait(1)
-        end
-
+        logWarn("down-block undiggable, no side escape")
+        task.wait(1)
         return
     end
-
-    sideFails = 0
 
     local world = Blocks.worldOf(best)
     logPrint(("step aside -> %s"):format(vec3ToString(best)))
@@ -2424,18 +2298,15 @@ local FarmMode = Mode.new("Farm", function(self)
         return
     end
 
-    Index.build(workspace:FindFirstChild(Config.mineName))
-
     -- Too many server rejections in a row: leave the shaft and clear stale state.
     if Mining.resetRequested then
         Mining.resetRequested = false
         Mining.rejects = 0
 
         -- Clear cached block mapping and ore scan state before choosing a target.
-        -- The old origin is kept until calibrate finds a stable new one.
         Blocks.calibrated = false
         Blocks.lastCalibrate = 0
-        Surface.pit = nil
+        Blocks.offset = Vector3.zero
         Ores.clearCache()
         Blocks.calibrate()
 
@@ -2505,9 +2376,6 @@ local FarmMode = Mode.new("Farm", function(self)
 
     Blocks.calibrate()
 
-    -- One lookup per tick, reused by the surface branch and the dig-down branch.
-    local below = Blocks.below(root.Position)
-
     -- Empty field: nothing to dig and no ground under it. Raise once and anchor,
     -- otherwise every tick teleports up and falls back.
     local mineModel = workspace:FindFirstChild(Config.mineName)
@@ -2537,7 +2405,7 @@ local FarmMode = Mode.new("Farm", function(self)
     if cell.Y < Config.surfaceDepth then
         if not Surface.atField(root.Position) then
             logPrint("surface: move to field centre")
-            Movement.jump(character, Config.fieldCenter + Vector3.new(0, 0.5, 0))
+            Movement.jump(character, Config.fieldCenter + Vector3.new(0, Config.teleportLift, 0))
             return
         end
 
@@ -2545,12 +2413,17 @@ local FarmMode = Mode.new("Farm", function(self)
 
         if pit then
             if cell.X ~= pit.X or cell.Z ~= pit.Z then
+                local mine = workspace:FindFirstChild(Config.mineName)
+                local mouth = Vector3.new(pit.X, cell.Y, pit.Z)
+
                 -- Only jump into a mouth that is really empty.
-                if not Index.at(pit) then
-                    Movement.jump(character, Blocks.standPoint(pit))
+                if mine and not mine:FindFirstChild(vec3ToString(mouth)) then
+                    Movement.jump(character, Blocks.worldOf(mouth) + Vector3.new(0, Config.teleportLift, 0))
                     return
                 end
             else
+                local below = Blocks.below(root.Position)
+
                 if below then
                     if mine(below) then
                         Movement.waitLanded(character)
@@ -2577,6 +2450,8 @@ local FarmMode = Mode.new("Farm", function(self)
     end
 
     -- 4. Nothing reachable: dig straight down, one block at a time.
+    local below = Blocks.below(root.Position)
+
     if not below then
         -- Fell into a liquid pocket with no floor: climb out one block up.
         if escapeLiquid(character, root) then
@@ -2599,7 +2474,7 @@ local FarmMode = Mode.new("Farm", function(self)
 
         stepAside(character, root)
     end
-end, Movement.release)
+end, Movement.cancel)
 
 ---------------------------------------------------------------------------
 -- Mushroom mode
@@ -2642,7 +2517,7 @@ local MushroomMode = Mode.new("Mushrooms", function(self)
 
     Movement.releaseHold()
     MushroomNode.ignore(box)
-end, Movement.release)
+end, Movement.cancel)
 
 ---------------------------------------------------------------------------
 -- Modes registry
@@ -2760,7 +2635,7 @@ function Ui.create()
     local library = Ui.load()
     local window = library.init("nazar mining 2", "v1.1.0", "NM2_MAIN")
 
-    local main, _ = window:AddTab("Main", "артем сын ебланки")
+    local main, _ = window:AddTab("Main", "назар прайм v2")
 
     local modePanel = main:AddSeperator("Mode")
     local enabled = false
