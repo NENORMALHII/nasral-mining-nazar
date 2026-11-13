@@ -35,6 +35,7 @@ local Config = {
 
     mineReachMargin = 4,
     moveCooldown = 0.5,
+    maxRejects = 5,
 
     surfaceDepth = 2,
     surfaceScanRadius = 6,
@@ -686,6 +687,8 @@ end
 
 local Mining = {
     baseMineTime = Config.defaultMineTime,
+    rejects = 0,
+    resetRequested = false,
 }
 
 local BLOCKED = { Oil = true, Lava = true, Grass = true, Void = true }
@@ -1188,6 +1191,7 @@ function Mining.mine(character, block)
     task.wait(waitTime)
 
     if not block.Parent then
+        Mining.rejects = 0
         return true
     end
 
@@ -1200,15 +1204,25 @@ function Mining.mine(character, block)
 
     if block.Parent then
         blockEvent:FireServer(vec3ToString(position), { dug = false })
-        logWarn(("server rejected %s type=%s base=%.2f wait=%.3f"):format(
+        Mining.rejects += 1
+
+        logWarn(("server rejected %s type=%s base=%.2f wait=%.3f streak=%d"):format(
             block.Name,
             tostring(typeOf(block)),
             Mining.baseMineTime,
-            waitTime
+            waitTime,
+            Mining.rejects
         ))
+
+        if Mining.rejects >= Config.maxRejects then
+            Mining.resetRequested = true
+            logWarn(("%d rejects in a row, requesting surface reset"):format(Mining.rejects))
+        end
+
         return false
     end
 
+    Mining.rejects = 0
     return true
 end
 
@@ -1358,6 +1372,14 @@ function Ores.ignore(block)
     ignored[block] = os.clock() + 5
     scanCache.time = 0
     scanCache.best = nil
+end
+
+-- Drop the cached scan cell/target and all temporary ignore timers.
+function Ores.clearCache()
+    scanCache.time = 0
+    scanCache.cell = nil
+    scanCache.best = nil
+    ignored = {}
 end
 
 function Ores.count()
@@ -2133,6 +2155,26 @@ local FarmMode = Mode.new("Farm", function(self)
     end
 
     if not character.PrimaryPart then
+        return
+    end
+
+    -- Too many server rejections in a row: leave the shaft and clear stale state.
+    if Mining.resetRequested then
+        Mining.resetRequested = false
+        Mining.rejects = 0
+
+        Blocks.calibrated = false
+        Blocks.lastCalibrate = 0
+        Ores.clearCache()
+
+        logWarn("mining reset: teleport to surface, caches cleared")
+
+        Movement.jump(character, Vector3.new(
+            Config.fieldCenter.X,
+            Config.fieldCenter.Y + Config.emptyMineLift + Config.teleportLift,
+            Config.fieldCenter.Z
+        ))
+        Movement.waitLanded(character, Config.emptyMineWait)
         return
     end
 

@@ -225,6 +225,15 @@ The client fires `BlockEvent`, waits `preSwing + swing + waitTime`, then fires `
 Server validates that elapsed time >= expected `mineTime` (with its own tolerance).
 If the bot finishes too early, the server rejects with "server rejected".
 
+Rejection streak: `Mining.rejects` counts consecutive `server rejected` results and is
+zeroed by any successful break. The log line carries `streak=N`. At
+`Config.maxRejects = 5` the bot sets `Mining.resetRequested`; on the next Farm tick it
+logs `mining reset: teleport to surface, caches cleared`, resets
+`Blocks.calibrated`/`Blocks.lastCalibrate` and `Ores.clearCache()` (scan cell, cached
+target, ignore timers), then teleports to
+`fieldCenter + (0, emptyMineLift + teleportLift, 0)` and re-enters the mine from the
+surface pit.
+
 Position formula (same as `ReplicatedFirst.Util`):
 
 ```
