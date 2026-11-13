@@ -1505,12 +1505,14 @@ function Sell.count(name)
     return type(value) == "number" and value or 0
 end
 
--- used, capacity. The Inventory GUI label shows "used / capacity"; fall back to
--- the attribute total against Config.sellCapacity when the label is absent.
+-- used, capacity, source. Source tells where the numbers came from:
+--   "client" — InventoriesClient.GetInventory() CurrentSize/MaxSize;
+--   "gui"    — PlayerGui.Inventory.ToggleButton.InventoryUsed text "used / max";
+--   "sum"    — sum of per-resource counts against Config.sellCapacity.
 function Sell.usage()
     local used, capacity = Inventory.usage()
     if used and capacity then
-        return used, capacity
+        return used, capacity, "client"
     end
 
     local playerGui = Players.LocalPlayer:FindFirstChild("PlayerGui")
@@ -1524,7 +1526,7 @@ function Sell.usage()
             table.insert(numbers, tonumber(number))
         end
         if #numbers >= 2 then
-            return numbers[1], numbers[2]
+            return numbers[1], numbers[2], "gui"
         end
     end
 
@@ -1532,7 +1534,7 @@ function Sell.usage()
     for _, name in ipairs(Ores.names()) do
         total += Sell.count(name)
     end
-    return total, Config.sellCapacity
+    return total, Config.sellCapacity, "sum"
 end
 
 function Sell.isFull()
@@ -1540,9 +1542,38 @@ function Sell.isFull()
     return capacity > 0 and used >= capacity
 end
 
-function Sell.run(force)
+function Sell.selectedCount()
+    local count = 0
+    for _ in pairs(Sell.selectedSet()) do
+        count += 1
+    end
+    return count
+end
+
+-- Called after loot pickups and block breaks: compares used vs max and runs the
+-- sell when full. Logs the trigger so it is clear why the remote fired (or not).
+function Sell.try(origin)
+    local used, capacity, source = Sell.usage()
+    if not (capacity > 0 and used >= capacity) then
+        return 0
+    end
+
+    if os.clock() - Sell.lastRun < Config.sellCooldown then
+        return 0
+    end
+
+    logPrint(("autosell trigger %s used=%d/%d src=%s enabled=%s"):format(
+        origin, used, capacity, tostring(source), tostring(Sell.enabled)))
+
+    return Sell.run(false, origin)
+end
+
+function Sell.run(force, origin)
     if not force then
-        if not Sell.enabled or not Sell.isFull() then
+        if not Sell.enabled then
+            return 0
+        end
+        if not Sell.isFull() then
             return 0
         end
         if os.clock() - Sell.lastRun < Config.sellCooldown then
@@ -1559,16 +1590,15 @@ function Sell.run(force)
 
     local selected = Sell.selectedSet()
     local sold = 0
+    local used, capacity, source = Sell.usage()
+    local nSelected = Sell.selectedCount()
 
-    if force then
-        local nSelected = 0
+    logPrint(("sell run (%s) names=%d selected=%d used=%d/%d src=%s"):format(
+        tostring(origin or (force and "manual") or "auto"),
+        #(Sell.namesList or {}), nSelected, used, capacity, tostring(source)))
 
-        for _ in pairs(selected) do
-            nSelected += 1
-        end
-
-        logPrint(("sell: names=%d selected=%d used=%d/%d"):format(
-            #(Sell.namesList or {}), nSelected, Sell.usage()))
+    if nSelected == 0 then
+        logWarn("autosell: no resources selected")
     end
 
     for _, name in ipairs(Sell.namesList or {}) do
@@ -1756,9 +1786,7 @@ function Loot.collectAll(character)
                 picked += 1
 
                 -- Free space as soon as the pickup fills the inventory.
-                if Sell.isFull() then
-                    Sell.run()
-                end
+                Sell.try("loot")
             else
                 index += 1
             end
@@ -1862,7 +1890,7 @@ local FarmMode = Mode.new("Farm", function(self)
         return
     end
 
-    Sell.run()
+    Sell.try("tick")
 
     -- 1. Loot first: teleport to every own drop immediately.
     Loot.sync(true)
@@ -1911,6 +1939,9 @@ local FarmMode = Mode.new("Farm", function(self)
         end
 
         task.wait(Config.lootSpawnWait)
+
+        -- A broken block adds loot to the inventory: sell right away when full.
+        Sell.try("block")
         return true
     end
 
@@ -2251,7 +2282,7 @@ function Ui.create()
     sellPanel:AddButton({
         title = "Sell now",
         callback = function()
-            logPrint("manual sell total " .. Sell.run(true))
+            logPrint("manual sell total " .. Sell.run(true, "manual"))
         end,
     })
 

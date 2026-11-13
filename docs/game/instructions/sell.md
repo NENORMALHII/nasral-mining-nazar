@@ -35,12 +35,33 @@ end
 
 ## When auto sell runs
 
-- at the start of every Farm tick (`Sell.run()`);
-- right after each successful loot pickup: `Sell.isFull()` compares
-  `Inventory.usage()` used vs max, then `Sell.run()` sells the selected resources.
+`Sell.try(origin)` compares used vs max and runs the sell when full. Triggers:
+
+- `"tick"` — start of every Farm tick;
+- `"loot"` — right after each successful loot pickup;
+- `"block"` — right after a block breaks (`Mining.mine` returned `true`);
+- `"manual"` — the "Sell now" button, forced and logged as `manual sell total`.
+
+Every trigger writes `autosell trigger <origin> used=U/M src=<source> enabled=<bool>`,
+and every actual run writes
+`sell run (<origin>) names=N selected=S used=U/M src=<source>`.
+If nothing is selected it also warns `autosell: no resources selected`.
 
 `Sell.run()` without `force` still requires the Auto sell toggle and respects
-`sellCooldown = 1`. The "Sell now" button forces a run.
+`sellCooldown = 1`.
+
+## Where used/max comes from (`Sell.usage`)
+
+The third return value `src` names the source:
+
+1. `"client"` — `InventoriesClient.GetInventory()` → `CurrentSize`, `MaxSize`.
+   This is the real backpack volume (see `getinventory.lua`). The module is loaded
+   with `PlayerScriptLoader:WaitForPlayerScripts()` → `Modules.InventoriesClient`,
+   cached after the first success, retried at most every 5 s.
+2. `"gui"` — fallback: parse `PlayerGui.Inventory.ToggleButton.InventoryUsed.Text`
+   as `used / max`.
+3. `"sum"` — last fallback: sum of `Sell.count(name)` over natural resources
+   compared against `Config.sellCapacity` (200).
 
 ## Failure seen before the fix
 
