@@ -44,19 +44,25 @@ independent from the farming modes:
   partially filled backpack), still respects the resource selection, surfaces first
   if the player is underground, and holds the root until the last remote returns.
 
-The remote refuses to work while the player is underground. Before firing it,
-The sell remote only accepts the fixed point `Config.sellAnchor = (78, 8013, -219)`
-(`x=78, y=8013, z=-219`); any other position is rejected. `Sell.toSurface` jumps
-there unless the player is already close to it on the surface, and
-`Sell.holdForSale` anchors the root and sets its CFrame exactly to that point, so
-the sale always happens at the same coordinates. It logs
-`autosell: leaving depth N for sell point 78,8013,-219`. If a mine is currently in its
+Selling MUST call `ReplicatedStorage.TeleportToSurfaceFunction` (RemoteFunction,
+`InvokeServer()`); the server teleports the player to the surface and only then
+accepts the sale. `Sell.toSurface` calls it on every sale (auto and manual), logs
+`autosell: called TeleportToSurfaceFunction`, waits `surfaceTeleportWait = 0.5` s
+for the landing and falls back to a client-side `Movement.jump` only when the
+remote is missing.
+
+The server itself places the player at the accepted sell point
+(`Config.sellAnchor = (78, 8013, -219)` is kept only for the fallback jump when
+the remote is missing). `Sell.holdForSale` just anchors the root where
+`TeleportToSurfaceFunction` put it, without snapping the CFrame. If a mine is currently in its
 `BlockEvent`/`BlockMinedEvent` window (`Movement.holdRoot` is set), the sell is
 deferred to the next watcher tick instead of interrupting it.
 
-`Sell.holdForSale` anchors the root exactly at `(78, 8013, -219)`.
-Timeline: `Config.sellHoldBefore = 3` s on the anchor, then all `InvokeServer` calls,
-then `Config.sellHoldAfter = 2` s on the anchor after the last remote, and only then
+`TeleportToSurfaceFunction` is the only supported way to reach the surface for a
+sale; do not rely on the client-side jump.
+
+Timeline: `Config.sellHoldBefore = 2` s on the anchor, then all `InvokeServer` calls,
+then `Config.sellHoldAfter = 1` s on the anchor after the last remote, and only then
 `Movement.releaseHold`. Without the anchor the character falls from the sell point
 and the server rejects part of the sale.
 `Sell.busy` is set for the whole

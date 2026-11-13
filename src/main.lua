@@ -60,8 +60,10 @@ local Config = {
     sellCapacity = 200,
     sellCooldown = 1,
     sellAnchor = Vector3.new(78, 8013, -219),
-    sellHoldBefore = 3,
-    sellHoldAfter = 2,
+    surfaceRemote = "TeleportToSurfaceFunction",
+    surfaceTeleportWait = 0.5,
+    sellHoldBefore = 2,
+    sellHoldAfter = 1,
 
     blockEvent = "BlockEvent",
     minedEvent = "BlockMinedEvent",
@@ -1657,28 +1659,40 @@ function Sell.diag(key, text)
     logPrint(text)
 end
 
--- The sell remote only accepts a fixed position (78, 8013, -219). Move there
--- before selling; the caller anchors the root exactly at that point.
+-- Selling must go through ReplicatedStorage.TeleportToSurfaceFunction: the server
+-- moves the player to the surface and only then accepts the sale. Client-side
+-- movement is kept as a fallback when the remote is missing.
 function Sell.toSurface(character)
     local root = character and character.PrimaryPart
     if not root then
         return false
     end
 
-    local anchor = Config.sellAnchor
-    local cell = Blocks.toBlock(root.Position)
+    local remote = ReplicatedStorage:FindFirstChild(Config.surfaceRemote)
 
-    if cell.Y < Config.surfaceDepth and (anchor - root.Position).Magnitude < 4 then
+    if remote then
+        local ok, err = pcall(function()
+            remote:InvokeServer()
+        end)
+
+        if ok then
+            logPrint("autosell: called " .. Config.surfaceRemote)
+        else
+            logWarn(("autosell: %s failed: %s"):format(Config.surfaceRemote, tostring(err)))
+        end
+
+        task.wait(Config.surfaceTeleportWait)
+        Movement.waitLanded(character, Config.surfaceTeleportWait)
         return true
     end
 
-    logPrint(("autosell: leaving depth %d for sell point %s"):format(
-        cell.Y, vec3ToString(anchor)))
-    Movement.jump(character, anchor)
+    logWarn("autosell: " .. Config.surfaceRemote .. " not found, moving client-side")
+    Movement.jump(character, Config.sellAnchor)
     return true
 end
 
--- Anchor the root exactly at the sell point.
+-- Anchor the root where TeleportToSurfaceFunction put the character. No manual
+-- repositioning: the server already places the player at the accepted point.
 function Sell.holdForSale(character)
     local root = character and character.PrimaryPart
     if not root then
@@ -1686,7 +1700,6 @@ function Sell.holdForSale(character)
     end
 
     Movement.hold(character)
-    root.CFrame = CFrame.new(Config.sellAnchor)
     return true
 end
 
@@ -1733,8 +1746,8 @@ function Sell.try(origin)
             return 0
         end
 
-        -- Hold exactly at Config.sellAnchor: sellHoldBefore seconds before the sale,
-        -- the whole sale, then sellHoldAfter seconds after the last remote.
+        -- Hold the surface position: sellHoldBefore seconds before the sale, the
+        -- whole sale, then sellHoldAfter seconds after the last remote.
         if not Sell.holdForSale(character) then
             Sell.diag("nosurface", "autosell: no root to anchor for the sale")
             return 0
