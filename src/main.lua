@@ -3479,9 +3479,10 @@ function AutoLoad.fire()
     end)
 end
 
--- Remove the save menu and darkness overlay the skipped intro leaves behind.
--- Camera restore mirrors the game's own PrepareForGame: subject = Humanoid,
--- type = Custom.
+-- The intro camera loop is a coroutine inside the Intro LocalScript and its
+-- stop flag is a script upvalue, so only destroying the whole Intro ScreenGui
+-- ends it. Camera restore mirrors the game's own PrepareForGame:
+-- subject = Humanoid, type = Custom.
 function AutoLoad.cleanup()
     return pcall(function()
         local player = Players.LocalPlayer
@@ -3489,12 +3490,10 @@ function AutoLoad.cleanup()
 
         if playerGui then
             local intro = playerGui:FindFirstChild("Intro")
-            local overlay = intro and intro:FindFirstChild("Overlay")
-            local mainMenu = overlay and overlay:FindFirstChild("MainMenu")
 
-            if mainMenu then
-                mainMenu:Destroy()
-                logPrint("autoload: MainMenu removed")
+            if intro then
+                intro:Destroy()
+                logPrint("autoload: Intro removed")
             end
 
             local darkness = playerGui:FindFirstChild("Darkness")

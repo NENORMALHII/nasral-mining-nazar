@@ -32,6 +32,7 @@ docs/game/
 | `fuel-data.lua` | `ReplicatedStorage.Scripts.FuelData` |
 | `inventory-backpack.lua` | `ReplicatedStorage.Modules.Inventory.Backpack` (Delta) |
 | `resourceslist.lua` | `ReplicatedStorage.Modules.Resources` |
+| `intro-script.lua` | `PlayerGui.Intro.Intro` (Delta) |
 
 ## protocol/
 

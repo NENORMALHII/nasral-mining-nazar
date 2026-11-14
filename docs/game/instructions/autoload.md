@@ -30,6 +30,13 @@ Auto load tab:
   shots. The cap exists because a wrong "not loaded" reading must never keep reloading a
   running world.
 - `AutoLoad.state` also reads attribute `Profile` and logs it as the loaded slot.
+- After a successful shot `AutoLoad.cleanup` skips the intro: destroys
+  `PlayerGui.Intro` and `PlayerGui.Darkness` if present, then restores the camera
+  (`CameraType = Custom`, waits up to 10 s for the character, `CameraSubject = Humanoid`),
+  the same restore the game's own `PrepareForGame` does. The whole `Intro` ScreenGui must
+  go, not just `MainMenu`: the camera-lock coroutine lives in the `Intro.Intro`
+  LocalScript and its stop flag is a script upvalue, so only destroying the script ends
+  the `RenderStepped` loop (`docs/game/decompiled/intro-script.lua`).
 
 Unverified in game: that `FullyLoaded` is the load-finish flag and that `Profile` is the
 slot index (both from `docs/game/data/player-stats.txt`). Each shot is logged as
