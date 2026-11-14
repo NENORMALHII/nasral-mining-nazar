@@ -3479,6 +3479,44 @@ function AutoLoad.fire()
     end)
 end
 
+-- The Intro LocalScript locks the camera (Scriptable + RenderStepped loop);
+-- destroying the ScreenGui kills that loop. Camera restore mirrors the game's
+-- own PrepareForGame: subject = Humanoid, type = Custom.
+function AutoLoad.cleanup()
+    return pcall(function()
+        local player = Players.LocalPlayer
+        local playerGui = player:FindFirstChild("PlayerGui")
+        local intro = playerGui and playerGui:FindFirstChild("Intro")
+
+        if intro then
+            intro:Destroy()
+            logPrint("autoload: Intro removed")
+        end
+
+        local camera = workspace.CurrentCamera
+
+        if camera then
+            camera.CameraType = Enum.CameraType.Custom
+        end
+
+        local deadline = os.clock() + 10
+        local character = player.Character
+
+        while not character and os.clock() < deadline do
+            task.wait(0.2)
+            character = player.Character
+        end
+
+        if character and camera then
+            local humanoid = character:WaitForChild("Humanoid", 5)
+
+            if humanoid then
+                camera.CameraSubject = humanoid
+            end
+        end
+    end)
+end
+
 function AutoLoad.watch()
     if AutoLoad.busy then
         return
@@ -3500,7 +3538,11 @@ function AutoLoad.watch()
             end
 
             logPrint(("autoload: firing slot %d (loaded=%s)"):format(AutoLoad.slot, tostring(loaded)))
-            AutoLoad.fire()
+
+            if AutoLoad.fire() then
+                AutoLoad.cleanup()
+            end
+
             task.wait(Config.autoloadDelay)
         end
 
