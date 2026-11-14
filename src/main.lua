@@ -711,9 +711,14 @@ end
 function Character.get()
     local player = Players.LocalPlayer
     local character = player.Character
-    if not character or not character.PrimaryPart then
-        character = player.CharacterAdded:Wait()
+
+    -- CharacterAdded never fires for a character that already exists, and at
+    -- auto-start the model can be present before its PrimaryPart replicates.
+    while not character or not character.PrimaryPart do
+        task.wait(0.2)
+        character = player.Character
     end
+
     return character
 end
 
