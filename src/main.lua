@@ -3667,16 +3667,9 @@ function Ui.create()
         end,
     })
 
-    local debugTab = window:AddTab("Debug", "stats and logs")
-    local statsPanel = debugTab:AddSeperator("Stats")
-
-    local pickaxeInput = statsPanel:AddTextInput({ title = "Pickaxe" })
-    local handleInput = statsPanel:AddTextInput({ title = "Handle" })
-    local playerInput = statsPanel:AddTextInput({ title = "Player" })
-    local stateInput = statsPanel:AddTextInput({ title = "State" })
-
-    local sessionPanel = debugTab:AddSeperator("Session")
-    sessionPanel:AddToggle({
+    local rejoinTab = window:AddTab("Auto rejoin", "come back after a disconnect")
+    local rejoinPanel = rejoinTab:AddSeperator("Session")
+    rejoinPanel:AddToggle({
         title = "Auto rejoin",
         desc = "teleport back after the disconnect prompt",
         checked = savedRejoin,
@@ -3685,6 +3678,14 @@ function Ui.create()
             logPrint("auto rejoin " .. (state and "on" or "off"))
         end,
     })
+
+    local debugTab = window:AddTab("Debug", "stats and logs")
+    local statsPanel = debugTab:AddSeperator("Stats")
+
+    local pickaxeInput = statsPanel:AddTextInput({ title = "Pickaxe" })
+    local handleInput = statsPanel:AddTextInput({ title = "Handle" })
+    local playerInput = statsPanel:AddTextInput({ title = "Player" })
+    local stateInput = statsPanel:AddTextInput({ title = "State" })
 
     local logPanel = debugTab:AddSeperator("Logs")
     logPanel:AddToggle({

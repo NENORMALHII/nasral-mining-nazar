@@ -64,7 +64,7 @@ stable across sessions:
 | `sellEnabled` | bool | Auto sell Enabled | `Sell.enabled` |
 | `sellNames` | names (`none`) | Resources to sell selection | — |
 | `verboseLogs` | bool | Verbose logs | `Log.enabled` |
-| `autoRejoin` | bool | Debug → Session → Auto rejoin | `Rejoin.set` |
+| `autoRejoin` | bool | Auto rejoin → Session → Auto rejoin | `Rejoin.set` |
 
 Not saved on purpose: the Farm/Mushrooms `enabled` toggle and `Disable 3D render`
 (`noRender`). Both are per-session switches that start off on every execution.
@@ -77,7 +77,7 @@ Debug → Logs → `Disable 3D render` calls
 
 ## Auto rejoin
 
-Debug → Session → `Auto rejoin` (`autoRejoin`). Independent of the Farm Enabled toggle.
+Auto rejoin tab → Session → `Auto rejoin` (`autoRejoin`). Independent of the Farm Enabled toggle.
 
 - The watcher waits up to `Config.rejoinAttachTries = 60` s for
   `CoreGui.RobloxPromptGui`, then takes `promptOverlay` (or `WaitForChild` up to 10 s).

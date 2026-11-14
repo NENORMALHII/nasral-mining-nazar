@@ -14,7 +14,12 @@
       "Bash(cd /home/ilya/artyom-asshole-mining && luajit -e \"local f,e=loadfile\\('src/main.lua'\\); print\\(f and 'parsed ok' or \\('ERR: '..tostring\\(e\\)\\)\\)\")",
       "Bash(cd /home/ilya/artyom-asshole-mining && sed -n '86,104p' docs/game/protocol/mining.md)",
       "Bash(cd /home/ilya/artyom-asshole-mining && grep -n \"Sell\\\\.\\\\|Ores.names\\\\|sell\" src/main.lua | grep -vn \"^1[34]\" | head -40)",
-      "Bash(cd /home/ilya/artyom-asshole-mining && grep -rn \"SellResourceFunction\" docs/ src/ | head && echo \"=== backpack head ===\" && sed -n '1,60p' docs/game/decompiled/inventory-backpack.lua)"
+      "Bash(cd /home/ilya/artyom-asshole-mining && grep -rn \"SellResourceFunction\" docs/ src/ | head && echo \"=== backpack head ===\" && sed -n '1,60p' docs/game/decompiled/inventory-backpack.lua)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && grep -n \"window\\\\|Window\\\\|win:\\\\|tabWindow\\\\|TabWindow\\\\|CreateTab\" vendor/uilib/source.lua | head -40)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && grep -n \"AddTab\\\\|newWindow\\\\|Window\\\\|AddLabel\\\\|AddButton\\\\|AddToggle\\\\|AddSlider\\\\|AddDropdown\\\\|uilib\\\\|UILib\" vendor/uilib/example.lua | head -40)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && grep -rln \"Auto sell\" docs/ src/ && git diff --stat)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && git diff src/main.lua)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && sed 's/+=/ = /g' src/main.lua > /tmp/nm2-parse.lua && luajit -bl /tmp/nm2-parse.lua >/dev/null 2>&1 && echo PARSE_OK && sed -n '3668,3694p' src/main.lua)"
     ]
   }
 }
