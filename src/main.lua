@@ -3479,18 +3479,30 @@ function AutoLoad.fire()
     end)
 end
 
--- The Intro LocalScript locks the camera (Scriptable + RenderStepped loop);
--- destroying the ScreenGui kills that loop. Camera restore mirrors the game's
--- own PrepareForGame: subject = Humanoid, type = Custom.
+-- Remove the save menu and darkness overlay the skipped intro leaves behind.
+-- Camera restore mirrors the game's own PrepareForGame: subject = Humanoid,
+-- type = Custom.
 function AutoLoad.cleanup()
     return pcall(function()
         local player = Players.LocalPlayer
         local playerGui = player:FindFirstChild("PlayerGui")
-        local intro = playerGui and playerGui:FindFirstChild("Intro")
 
-        if intro then
-            intro:Destroy()
-            logPrint("autoload: Intro removed")
+        if playerGui then
+            local intro = playerGui:FindFirstChild("Intro")
+            local overlay = intro and intro:FindFirstChild("Overlay")
+            local mainMenu = overlay and overlay:FindFirstChild("MainMenu")
+
+            if mainMenu then
+                mainMenu:Destroy()
+                logPrint("autoload: MainMenu removed")
+            end
+
+            local darkness = playerGui:FindFirstChild("Darkness")
+
+            if darkness then
+                darkness:Destroy()
+                logPrint("autoload: Darkness removed")
+            end
         end
 
         local camera = workspace.CurrentCamera
