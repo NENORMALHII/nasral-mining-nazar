@@ -65,6 +65,8 @@ stable across sessions:
 | `sellNames` | names (`none`) | Resources to sell selection | — |
 | `verboseLogs` | bool | Verbose logs | `Log.enabled` |
 | `autoRejoin` | bool | Auto rejoin → Session → Auto rejoin | `Rejoin.set` |
+| `autoloadEnabled` | bool | Auto load → Autoload | `AutoLoad.set` |
+| `autoloadSlot` | number (1..3) | Auto load → Save slot dropdown | `AutoLoad.slot` |
 
 Not saved on purpose: the Farm/Mushrooms `enabled` toggle and `Disable 3D render`
 (`noRender`). Both are per-session switches that start off on every execution.
@@ -92,3 +94,10 @@ Auto rejoin tab → Session → `Auto rejoin` (`autoRejoin`). Independent of the
 - If `CoreGui`/`RobloxPromptGui`/`promptOverlay` is missing, the watcher logs a warning and
   clears `Rejoin.attached`, so toggling the option again re-arms it.
 - `autoRejoin = true` is applied by `Settings.restore()` before the UI is built.
+
+## Autoload
+
+Auto load → `Autoload` (`autoloadEnabled`) + `Save slot` (`autoloadSlot`, 1..3). Fires
+`ReplicatedStorage.LoadGameEvent(slot)` every `Config.autoloadDelay = 1` s until the player
+attribute `FullyLoaded` turns true, at most `Config.autoloadTries = 10` times. Arg format and
+the attribute assumptions: `docs/game/instructions/autoload.md`.

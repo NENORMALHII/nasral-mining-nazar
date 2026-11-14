@@ -38,6 +38,12 @@ local Config = {
     rejoinDelay = 2,
     rejoinAttachTries = 60,
 
+    autoloadEvent = "LoadGameEvent",
+    autoloadLoadedAttr = "FullyLoaded",
+    autoloadProfileAttr = "Profile",
+    autoloadDelay = 1,
+    autoloadTries = 10,
+
     mineReachMargin = 4,
     moveCooldown = 0.5,
     maxRejects = 5,
@@ -3437,6 +3443,80 @@ function Rejoin.set(enabled)
 end
 
 ---------------------------------------------------------------------------
+-- Auto load
+---------------------------------------------------------------------------
+
+-- Before `FullyLoaded` turns true the game waits for a save slot click. With the
+-- option on the bot answers with `LoadGameEvent(slot)` itself, so an auto rejoin
+-- lands in the chosen save instead of the menu.
+--
+-- The tries are capped: if the attribute is missing or renamed, the bot must not
+-- keep reloading a world that is already running.
+
+local AutoLoad = {
+    enabled = false,
+    busy = false,
+    slot = 1,
+    slots = { "1", "2", "3" },
+}
+
+function AutoLoad.state()
+    local ok, loaded, profile = pcall(function()
+        local player = Players.LocalPlayer
+        return player:GetAttribute(Config.autoloadLoadedAttr), player:GetAttribute(Config.autoloadProfileAttr)
+    end)
+
+    if not ok then
+        return nil, nil
+    end
+
+    return loaded, profile
+end
+
+function AutoLoad.fire()
+    return pcall(function()
+        ReplicatedStorage:WaitForChild(Config.autoloadEvent, 5):FireServer(AutoLoad.slot)
+    end)
+end
+
+function AutoLoad.watch()
+    if AutoLoad.busy then
+        return
+    end
+
+    AutoLoad.busy = true
+
+    task.spawn(function()
+        for _ = 1, Config.autoloadTries do
+            if not AutoLoad.enabled then
+                break
+            end
+
+            local loaded, profile = AutoLoad.state()
+
+            if loaded == true then
+                logPrint(("autoload: loaded, slot %s"):format(tostring(profile)))
+                break
+            end
+
+            logPrint(("autoload: firing slot %d (loaded=%s)"):format(AutoLoad.slot, tostring(loaded)))
+            AutoLoad.fire()
+            task.wait(Config.autoloadDelay)
+        end
+
+        AutoLoad.busy = false
+    end)
+end
+
+function AutoLoad.set(enabled)
+    AutoLoad.enabled = enabled == true
+
+    if AutoLoad.enabled then
+        AutoLoad.watch()
+    end
+end
+
+---------------------------------------------------------------------------
 -- Saved options
 ---------------------------------------------------------------------------
 
@@ -3482,6 +3562,16 @@ Settings.define("verboseLogs", {
 Settings.define("autoRejoin", {
     kind = "bool", default = false,
     apply = function(value) Rejoin.set(value) end,
+})
+
+Settings.define("autoloadSlot", {
+    kind = "number", min = 1, max = #AutoLoad.slots, round = 1, default = AutoLoad.slot,
+    apply = function(value) AutoLoad.slot = value end,
+})
+
+Settings.define("autoloadEnabled", {
+    kind = "bool", default = false,
+    apply = function(value) AutoLoad.set(value) end,
 })
 
 ---------------------------------------------------------------------------
@@ -3565,6 +3655,8 @@ function Ui.create()
     local savedVerbose = Settings.read("verboseLogs")
     local savedRejoin = Settings.read("autoRejoin")
     local savedSellEnabled = Settings.read("sellEnabled")
+    local savedAutoload = Settings.read("autoloadEnabled")
+    local savedAutoloadSlot = Settings.read("autoloadSlot")
 
     -- `enabled` and `noRender` are session switches: never restored.
     local enabled = false
@@ -3679,6 +3771,29 @@ function Ui.create()
         end,
     })
 
+    local loadTab = window:AddTab("Auto load", "load the chosen save slot without clicking")
+    local loadPanel = loadTab:AddSeperator("Auto load")
+
+    local slotDropdown
+    slotDropdown = loadPanel:AddDropdown({
+        title = "Save slot",
+        desc = "argument of ReplicatedStorage.LoadGameEvent",
+        options = AutoLoad.slots,
+        callback = function(index)
+            Settings.write("autoloadSlot", index)
+        end,
+    })
+
+    loadPanel:AddToggle({
+        title = "Autoload",
+        desc = "fire LoadGameEvent with the slot until the save is loaded",
+        checked = savedAutoload,
+        callback = function(state)
+            Settings.write("autoloadEnabled", state)
+            logPrint("autoload " .. (state and "on" or "off"))
+        end,
+    })
+
     local debugTab = window:AddTab("Debug", "stats and logs")
     local statsPanel = debugTab:AddSeperator("Stats")
 
@@ -3755,6 +3870,7 @@ function Ui.create()
     end)
 
     modeDropdown.setSelected(savedMode)
+    slotDropdown.setSelected(savedAutoloadSlot)
 
     return window
 end
@@ -3860,7 +3976,7 @@ end
 ---------------------------------------------------------------------------
 
 -- Apply every saved option (movement method, tween speed, logs, auto sell, auto
--- rejoin) before the UI is built. Options with an `apply` hook live in the
+-- rejoin, auto load) before the UI is built. Options with an `apply` hook live in the
 -- registry, so this is the only restore call in the script.
 Settings.restore()
 

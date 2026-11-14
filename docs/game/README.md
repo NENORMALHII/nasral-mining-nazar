@@ -48,6 +48,7 @@ docs/game/
 | `forge-remotes.md` | `ForgeUpdateEvent` actions |
 | `getinventory.lua` | `InventoriesClient.GetInventory()` dump, source of resource counts |
 | `settings.md` | saved UI options (`nm2/settings.json`) and render toggle |
+| `autoload.md` | `LoadGameEvent(slot)` save-slot loading, `FullyLoaded`/`Profile` assumptions |
 
 ## data/
 

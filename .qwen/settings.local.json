@@ -19,7 +19,26 @@
       "Bash(cd /home/ilya/artyom-asshole-mining && grep -n \"AddTab\\\\|newWindow\\\\|Window\\\\|AddLabel\\\\|AddButton\\\\|AddToggle\\\\|AddSlider\\\\|AddDropdown\\\\|uilib\\\\|UILib\" vendor/uilib/example.lua | head -40)",
       "Bash(cd /home/ilya/artyom-asshole-mining && grep -rln \"Auto sell\" docs/ src/ && git diff --stat)",
       "Bash(cd /home/ilya/artyom-asshole-mining && git diff src/main.lua)",
-      "Bash(cd /home/ilya/artyom-asshole-mining && sed 's/+=/ = /g' src/main.lua > /tmp/nm2-parse.lua && luajit -bl /tmp/nm2-parse.lua >/dev/null 2>&1 && echo PARSE_OK && sed -n '3668,3694p' src/main.lua)"
+      "Bash(cd /home/ilya/artyom-asshole-mining && sed 's/+=/ = /g' src/main.lua > /tmp/nm2-parse.lua && luajit -bl /tmp/nm2-parse.lua >/dev/null 2>&1 && echo PARSE_OK && sed -n '3668,3694p' src/main.lua)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && grep -n \"LoadGame\\\\|loadSlot\\\\|Slot\\\\|slot\" src/main.lua | head -40)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && grep -rn \"LoadGameEvent\" docs/ src/ legacy/ 2>/dev/null | head -30)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && sed -n '16790,16840p' docs/game/dumptree.txt)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && grep -rn \"Event\\\\[RemoteEvent\\\\]\" docs/game/dumptree.txt | head -30)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && ls docs/game/decompiled docs/game/protocol docs/game/instructions)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && grep -n -i \"slot\\\\|continue\\\\|savescreen\\\\|loadingscreen\\\\|Main Menu\\\\|TeleportFrame\\\\|LoadingFrame\" docs/game/dumptree.txt | head -40)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && grep -n \"StarterGui\\\\|ScreenGui \\\\[ScreenGui\\\\]\" docs/game/dumptree.txt | head -40)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && sed -n '15225,15300p' docs/game/dumptree.txt)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && grep -rn -i \"LoadGame\\\\|NewGameEvent\\\\|StartGameForPlayer\\\\|save slot\\\\|slot 1\\\\|WorldId\" docs/game/decompiled docs/game/protocol docs/game/instructions docs/game/README.md 2>/dev/null | head -30)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && sed -n '1,60p' docs/game/README.md)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && cat docs/game/data/player-stats.txt | head -40)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && grep -n 'WaitForChild\\(Config\\\\|GetRemoteFunction\\\\|FindFirstChild\\(Config\\\\|^local Sell\\\\|^function Sell\\\\|attrWorldId = ' src/main.lua | head -40)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && sed -n '1170,1300p' vendor/uilib/source.lua | grep -n \"setSelected\\\\|renderOptions\\\\|callback\\(\" )",
+      "Bash(cd /home/ilya/artyom-asshole-mining && sed 's/+=/ = /g' src/main.lua > /tmp/nm2-parse.lua && luajit -bl /tmp/nm2-parse.lua >/dev/null 2>&1 && echo PARSE_OK; git diff --stat)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && git log --oneline -3 && git status --short)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && grep -n \"auto sell, auto\\\\|auto rejoin\\)\\\\|Deliberately NOT saved\" src/main.lua)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && grep -n \"autoRejoin\\\\|Auto rejoin\" docs/game/instructions/settings.md | head; grep -n \"settings.md\" docs/game/README.md)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && grep -n \"autoload\" docs/game/instructions/settings.md docs/game/README.md && sed 's/+=/ = /g' src/main.lua > /tmp/nm2-parse.lua && luajit -bl /tmp/nm2-parse.lua >/dev/null 2>&1 && echo PARSE_OK)",
+      "Bash(cd /home/ilya/artyom-asshole-mining && git diff src/main.lua | head -160)"
     ]
   }
 }
