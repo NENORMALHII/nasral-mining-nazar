@@ -58,6 +58,7 @@ stable across sessions:
 | Key | Kind | UI control | Restore hook |
 |---|---|---|---|
 | `mode` | number (1..2) | Category dropdown | — |
+| `farmEnabled` | bool | Main → Enabled | — (Category `setSelected` callback enables the mode) |
 | `instantMove` | bool | Instant move (movement method: tween ⇄ teleport) | `Config.instantMove` |
 | `tweenSpeed` | number (20..400) | Tween speed slider | `Config.tweenSpeed` |
 | `oreNames` | names (`all`) | Farm ores selection | — |
@@ -68,14 +69,23 @@ stable across sessions:
 | `autoloadEnabled` | bool | Auto load → Autoload | `AutoLoad.set` |
 | `autoloadSlot` | number (1..3) | Auto load → Save slot dropdown | `AutoLoad.slot` |
 
-Not saved on purpose: the Farm/Mushrooms `enabled` toggle and `Disable 3D render`
-(`noRender`). Both are per-session switches that start off on every execution.
+Not saved on purpose: `Disable 3D render` (`noRender`). It is a per-session switch that
+starts off on every execution. The Farm/Mushrooms `Enabled` toggle is saved as `farmEnabled`
+and restored through the Category dropdown: uilib `setSelected` fires the dropdown callback,
+which calls `Modes.enable` when the restored `enabled` flag is true.
 
 ## Disable 3D render
 
 Debug → Logs → `Disable 3D render` calls
 `RunService:Set3dRenderingEnabled(not state)` inside `pcall`. With the toggle on the call is
 `RunService:Set3dRenderingEnabled(false)`. Not persisted: 3D rendering is always on at startup.
+
+While the toggle is on, `RenderCover.set(true)` shows `PlayerGui.NM2_RenderCover`: a black
+full-screen `Frame` (`IgnoreGuiInset`, `Size = UDim2.fromScale(1, 1)`) with `DisplayOrder` and
+`ZIndex` at max int (2147483647), so it draws above every other ScreenGui. The frame is not
+`Active`, so clicks still reach the bot UI underneath and the toggle can be turned back off.
+Turning the toggle off hides the cover (`Enabled = false`); the ScreenGui is created once and
+reused.
 
 ## Auto rejoin
 

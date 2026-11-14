@@ -31,7 +31,8 @@ Auto load tab:
   running world.
 - `AutoLoad.state` also reads attribute `Profile` and logs it as the loaded slot.
 - After a successful shot `AutoLoad.cleanup` skips the intro: destroys
-  `PlayerGui.Intro` and `PlayerGui.Darkness` if present, then restores the camera
+  `PlayerGui.Intro` and `PlayerGui.Darkness` if present, sets
+  `PlayerGui.LoadingScreen.Frame.BackgroundTransparency = 1`, then restores the camera
   (`CameraType = Custom`, waits up to 10 s for the character, `CameraSubject = Humanoid`),
   the same restore the game's own `PrepareForGame` does. The whole `Intro` ScreenGui must
   go, not just `MainMenu`: the camera-lock coroutine lives in the `Intro.Intro`

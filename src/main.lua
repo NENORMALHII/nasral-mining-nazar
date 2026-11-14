@@ -3502,6 +3502,13 @@ function AutoLoad.cleanup()
                 darkness:Destroy()
                 logPrint("autoload: Darkness removed")
             end
+
+            local loadingScreen = playerGui:FindFirstChild("LoadingScreen")
+            local frame = loadingScreen and loadingScreen:FindFirstChild("Frame")
+
+            if frame then
+                frame.BackgroundTransparency = 1
+            end
         end
 
         local camera = workspace.CurrentCamera
@@ -3577,11 +3584,15 @@ end
 -- registry handles validation, defaults and the restore hook, the UI only calls
 -- `Settings.read(key)` and `Settings.write(key, value)`.
 --
--- Deliberately NOT saved: the Farm/Mushrooms `enabled` toggle and
--- `Disable 3D render`. Both are per-session switches the user sets by hand.
+-- Deliberately NOT saved: `Disable 3D render`. It is a per-session switch the
+-- user sets by hand.
 
 Settings.define("mode", {
     kind = "number", min = 1, max = #Modes.list, round = 1, default = 1,
+})
+
+Settings.define("farmEnabled", {
+    kind = "bool", default = false,
 })
 
 Settings.define("instantMove", {
@@ -3626,6 +3637,44 @@ Settings.define("autoloadEnabled", {
     kind = "bool", default = false,
     apply = function(value) AutoLoad.set(value) end,
 })
+
+---------------------------------------------------------------------------
+-- Render cover
+---------------------------------------------------------------------------
+
+-- Black full-screen frame shown while 3D rendering is off. Max int DisplayOrder
+-- and ZIndex put it above every other ScreenGui. The frame is not Active so
+-- input still reaches the UI toggle underneath.
+local RenderCover = { gui = nil }
+
+function RenderCover.set(visible)
+    if visible then
+        if not RenderCover.gui then
+            local playerGui = Players.LocalPlayer:WaitForChild("PlayerGui")
+
+            local gui = Instance.new("ScreenGui")
+            gui.Name = "NM2_RenderCover"
+            gui.ResetOnSpawn = false
+            gui.IgnoreGuiInset = true
+            gui.DisplayOrder = 2147483647
+            gui.Parent = playerGui
+
+            local frame = Instance.new("Frame")
+            frame.Name = "Cover"
+            frame.Size = UDim2.fromScale(1, 1)
+            frame.BackgroundColor3 = Color3.new(0, 0, 0)
+            frame.BorderSizePixel = 0
+            frame.ZIndex = 2147483647
+            frame.Parent = gui
+
+            RenderCover.gui = gui
+        end
+
+        RenderCover.gui.Enabled = true
+    elseif RenderCover.gui then
+        RenderCover.gui.Enabled = false
+    end
+end
 
 ---------------------------------------------------------------------------
 -- UI
@@ -3703,6 +3752,7 @@ function Ui.create()
     local window = library.init("nazar mining 2", "v1.1.0", "NM2_MAIN")
 
     local savedMode = Settings.read("mode")
+    local savedEnabled = Settings.read("farmEnabled")
     local savedInstant = Settings.read("instantMove")
     local savedTween = Settings.read("tweenSpeed")
     local savedVerbose = Settings.read("verboseLogs")
@@ -3711,8 +3761,10 @@ function Ui.create()
     local savedAutoload = Settings.read("autoloadEnabled")
     local savedAutoloadSlot = Settings.read("autoloadSlot")
 
-    -- `enabled` and `noRender` are session switches: never restored.
-    local enabled = false
+    -- `noRender` is a session switch: never restored. `enabled` is restored via
+    -- the Category dropdown: setSelected fires its callback, which enables the
+    -- mode when `enabled` is true.
+    local enabled = savedEnabled
 
     local main, _ = window:AddTab("Main", "назар прайм v2")
 
@@ -3735,9 +3787,10 @@ function Ui.create()
 
     modePanel:AddToggle({
         title = "Enabled",
-        checked = false,
+        checked = savedEnabled,
         callback = function(state)
             enabled = state
+            Settings.write("farmEnabled", state)
 
             if state then
                 Modes.enable(Modes.active)
@@ -3875,6 +3928,7 @@ function Ui.create()
             pcall(function()
                 RunService:Set3dRenderingEnabled(not state)
             end)
+            RenderCover.set(state)
         end,
     })
 
