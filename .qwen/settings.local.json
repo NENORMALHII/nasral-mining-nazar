@@ -38,7 +38,14 @@
       "Bash(cd /home/ilya/artyom-asshole-mining && grep -n \"auto sell, auto\\\\|auto rejoin\\)\\\\|Deliberately NOT saved\" src/main.lua)",
       "Bash(cd /home/ilya/artyom-asshole-mining && grep -n \"autoRejoin\\\\|Auto rejoin\" docs/game/instructions/settings.md | head; grep -n \"settings.md\" docs/game/README.md)",
       "Bash(cd /home/ilya/artyom-asshole-mining && grep -n \"autoload\" docs/game/instructions/settings.md docs/game/README.md && sed 's/+=/ = /g' src/main.lua > /tmp/nm2-parse.lua && luajit -bl /tmp/nm2-parse.lua >/dev/null 2>&1 && echo PARSE_OK)",
-      "Bash(cd /home/ilya/artyom-asshole-mining && git diff src/main.lua | head -160)"
+      "Bash(cd /home/ilya/artyom-asshole-mining && git diff src/main.lua | head -160)",
+      "Bash(sed -e 's/+=/=/g' -e 's/-=/=/g' -e 's/\\\\*=/=/g' -e 's|/=/|=|g' src/main.lua > /tmp/chk.lua && luajit -e \"local f,e=loadfile\\('/tmp/chk.lua'\\); print\\(f and 'parsed ok' or \\('ERR: '..tostring\\(e\\)\\)\\)\"; rm -f /tmp/chk.lua)",
+      "Bash(git add src/main.lua && git commit -m \"$\\(cat <<'EOF'\nautoload removes intro and unlocks camera\nEOF\n\\)\")",
+      "Bash(git push && git status)",
+      "Bash(git add src/main.lua && git commit -m \"$\\(cat <<'EOF'\nautoload removes MainMenu and Darkness instead of Intro\nEOF\n\\)\" && git push && git status)",
+      "Bash(git add src/main.lua docs/game/README.md docs/game/instructions/autoload.md docs/game/decompiled/intro-script.lua && git commit -m \"$\\(cat <<'EOF'\nautoload destroys whole Intro to unlock camera, add intro decompile\nEOF\n\\)\" && git push && git status)",
+      "Bash(git diff src/main.lua | head -200 && grep -c \"RenderCover\" src/main.lua)",
+      "Bash(git add src/main.lua docs/game/instructions/autoload.md docs/game/instructions/settings.md && git commit -m \"$\\(cat <<'EOF'\nrender cover, saved farm enabled, hide LoadingScreen frame on bypass\nEOF\n\\)\" && git push && git status)"
     ]
   }
 }
