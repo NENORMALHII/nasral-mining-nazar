@@ -43,8 +43,11 @@ stable across sessions:
 - `Settings.selection(key, legacyKey, names)` returns the index list for a widget;
   `Settings.bindSelection(key, names, widget)` registers the widget and
   `Settings.flushSelections()` (called every 0.5 s from its own timer) stores the current
-  names. The timer is separate from the 2 s stats readout: a failing stat cannot stop the
+  names. The timer is separate from the 3 s stats readout: a failing stat cannot stop the
   options from being saved.
+- The Venyx UI has no multi-select widget, so `Ui.selection(names, indexes)` builds one as a
+  toggle per entry and exposes `getSelected()` / `setSelected()`, the interface `Ores`,
+  `Sell` and `Settings.bindSelection` already use.
 - Names that no longer exist are dropped. If a saved list has entries but none matches, the
   option default wins (`all` for ores, `none` for the sell list). An intentionally empty list
   stays empty.
@@ -58,7 +61,7 @@ stable across sessions:
 | Key | Kind | UI control | Restore hook |
 |---|---|---|---|
 | `mode` | number (1..2) | Category dropdown | — |
-| `farmEnabled` | bool | Main → Enabled | — (Category `setSelected` callback enables the mode) |
+| `farmEnabled` | bool | Main → Mode → Enabled | — (started explicitly by `Ui.create` when the flag is true) |
 | `instantMove` | bool | Instant move (movement method: tween ⇄ teleport) | `Config.instantMove` |
 | `tweenSpeed` | number (20..400) | Tween speed slider | `Config.tweenSpeed` |
 | `oreNames` | names (`all`) | Farm ores selection | — |
@@ -71,8 +74,9 @@ stable across sessions:
 
 Not saved on purpose: `Disable 3D render` (`noRender`). It is a per-session switch that
 starts off on every execution. The Farm/Mushrooms `Enabled` toggle is saved as `farmEnabled`
-and restored through the Category dropdown: uilib `setSelected` fires the dropdown callback,
-which calls `Modes.enable` when the restored `enabled` flag is true.
+and restored at the end of `Ui.create`: Venyx dropdowns do not fire their callback when the
+label is restored, so `Modes.select` and `Modes.enable` are called directly with the saved
+`mode` index.
 
 ## Disable 3D render
 
@@ -89,7 +93,8 @@ reused.
 
 ## Auto rejoin
 
-Auto rejoin tab → Session → `Auto rejoin` (`autoRejoin`). Independent of the Farm Enabled toggle.
+Auto rejoin is on the Session page → `Auto rejoin` section (`autoRejoin`). Independent of
+the Farm Enabled toggle.
 
 - The watcher waits up to `Config.rejoinAttachTries = 60` s for
   `CoreGui.RobloxPromptGui`, then takes `promptOverlay` (or `WaitForChild` up to 10 s).
@@ -107,7 +112,8 @@ Auto rejoin tab → Session → `Auto rejoin` (`autoRejoin`). Independent of the
 
 ## Autoload
 
-Auto load → `Autoload` (`autoloadEnabled`) + `Save slot` (`autoloadSlot`, 1..3). Fires
+Session page → `Auto load` section → `Autoload` (`autoloadEnabled`) + `Save slot`
+(`autoloadSlot`, 1..3). Fires
 `ReplicatedStorage.LoadGameEvent(slot)` every `Config.autoloadDelay = 1` s until the player
 attribute `FullyLoaded` turns true, at most `Config.autoloadTries = 10` times. Arg format and
 the attribute assumptions: `docs/game/instructions/autoload.md`.

@@ -3687,12 +3687,17 @@ end
 
 local Ui = {}
 
+-- Venyx UI: `library.new(title)`, then `page:addSection`, then
+-- `section:addToggle/addButton/addSlider/addDropdown/addTextbox/addKeybind`.
+-- There is no multi-select widget, so `Ui.selection` builds one from toggles.
 function Ui.load()
-    if type(readfile) == "function" and type(isfile) == "function" then
+    if type(readfile) == "function" then
         for _, path in ipairs({ "vendor/uilib/source.lua", "vendor\\uilib\\source.lua" }) do
-            if isfile(path) then
+            local okRead, source = pcall(readfile, path)
+
+            if okRead and type(source) == "string" and source ~= "" then
                 local ok, library = pcall(function()
-                    return loadstring(readfile(path))()
+                    return loadstring(source)()
                 end)
                 if ok and type(library) == "table" then
                     return library
@@ -3700,7 +3705,8 @@ function Ui.load()
             end
         end
     end
-    return loadstring(game:HttpGet("https://raw.githubusercontent.com/cueshut/saves/main/compact"))()
+    return loadstring(game:HttpGet(
+        "https://raw.githubusercontent.com/GreenDeno/Venyx-UI-Library/main/source.lua"))()
 end
 
 function Ui.stats()
@@ -3752,9 +3758,53 @@ function Ui.printStats()
     print("[em2] state: " .. stats.state)
 end
 
+-- Venyx has no Selection widget: a selection is one toggle per entry. The
+-- adapter keeps the `getSelected()`/`setSelected()` interface used by
+-- `Ores`/`Sell` and by `Settings.bindSelection`, with indexes into `names`.
+function Ui.selection(names, indexes)
+    local selected = {}
+    local widget = {}
+
+    function widget.setSelected(index, state)
+        index = math.floor(tonumber(index) or 0)
+
+        if names[index] then
+            selected[index] = state == true or nil
+        end
+    end
+
+    function widget.getSelected()
+        local list = {}
+
+        for index = 1, #names do
+            if selected[index] then
+                table.insert(list, index)
+            end
+        end
+
+        return list
+    end
+
+    -- Toggles are created with the saved state; `addToggle` does not fire its
+    -- callback for the default value, so restoring never writes the file.
+    function widget.build(section)
+        for index, name in ipairs(names) do
+            section:addToggle(name, selected[index] == true, function(state)
+                widget.setSelected(index, state)
+            end)
+        end
+    end
+
+    for _, index in ipairs(indexes or {}) do
+        widget.setSelected(index, true)
+    end
+
+    return widget
+end
+
 function Ui.create()
     local library = Ui.load()
-    local window = library.init("nazar mining 2", "v1.1.0", "NM2_MAIN")
+    local window = library.new("nazar mining 2")
 
     local savedMode = Settings.read("mode")
     local savedEnabled = Settings.read("farmEnabled")
@@ -3766,186 +3816,165 @@ function Ui.create()
     local savedAutoload = Settings.read("autoloadEnabled")
     local savedAutoloadSlot = Settings.read("autoloadSlot")
 
-    -- `noRender` is a session switch: never restored. `enabled` is restored via
-    -- the Category dropdown: setSelected fires its callback, which enables the
-    -- mode when `enabled` is true.
+    local modeNames = {}
+
+    for _, mode in ipairs(Modes.list) do
+        table.insert(modeNames, mode.name)
+    end
+
+    savedMode = math.clamp(math.floor(tonumber(savedMode) or 1), 1, #modeNames)
+
+    -- `noRender` is a session switch: never restored. Venyx dropdowns do not
+    -- fire their callback when the label is restored, so the saved mode is
+    -- started explicitly at the end of this function.
     local enabled = savedEnabled
 
-    local main, _ = window:AddTab("Main", "назар прайм v2")
-
-    local modePanel = main:AddSeperator("Mode")
+    local main = window:addPage("Main")
+    local modeSection = main:addSection("Mode")
 
     local modeDropdown
-    modeDropdown = modePanel:AddDropdown({
-        title = "Category",
-        options = { "Farm", "Mushrooms" },
-        callback = function(index)
-            Settings.write("mode", index)
+    modeDropdown = modeSection:addDropdown("Category", modeNames, function(value)
+        for index, name in ipairs(modeNames) do
+            if name == value then
+                Settings.write("mode", index)
+                Modes.select(Modes.list[index])
 
-            local mode = Modes.list[index]
-            Modes.select(mode)
-            if enabled and mode then
-                Modes.enable(mode)
-            end
-        end,
-    })
-
-    modePanel:AddToggle({
-        title = "Enabled",
-        checked = savedEnabled,
-        callback = function(state)
-            enabled = state
-            Settings.write("farmEnabled", state)
-
-            if state then
-                Modes.enable(Modes.active)
-            else
-                for _, mode in ipairs(Modes.list) do
-                    mode:stop()
+                if enabled then
+                    Modes.enable(Modes.list[index])
                 end
+
+                return
             end
-        end,
-    })
+        end
+    end)
 
-    local movePanel = main:AddSeperator("Movement")
-    movePanel:AddToggle({
-        title = "Instant move",
-        desc = "teleport instead of tween",
-        checked = savedInstant,
-        callback = function(state)
-            Settings.write("instantMove", state)
-        end,
-    })
+    -- The search box doubles as the label of the picked entry.
+    modeDropdown.Search.TextBox.Text = modeNames[savedMode]
 
-    movePanel:AddSlider({
-        title = "Tween speed",
-        values = { min = 20, max = 400, default = savedTween, round = 1 },
-        callback = function(value)
-            Settings.write("tweenSpeed", value)
-        end,
-    })
+    modeSection:addToggle("Enabled", savedEnabled, function(state)
+        enabled = state
+        Settings.write("farmEnabled", state)
 
-    local orePanel = main:AddSeperator("Farm ores")
+        if state then
+            Modes.enable(Modes.active)
+        else
+            for _, mode in ipairs(Modes.list) do
+                mode:stop()
+            end
+        end
+    end)
+
+    local moveSection = main:addSection("Movement")
+
+    moveSection:addToggle("Instant move", savedInstant, function(state)
+        Settings.write("instantMove", state)
+    end)
+
+    moveSection:addSlider("Tween speed", savedTween, 20, 400, function(value)
+        Settings.write("tweenSpeed", value)
+    end)
+
+    local oreSection = main:addSection("Farm ores")
     local names = Ores.names()
-    local savedOres = Settings.selection("oreNames", "ores", names)
-    local selection = orePanel:AddSelection({
-        title = "Ores",
-        options = names,
-        default = savedOres,
-    })
+    local oreWidget = Ui.selection(names, Settings.selection("oreNames", "ores", names))
 
-    selection.setSelected(savedOres)
-    Ores.bindSelection(selection, names)
-    Settings.bindSelection("oreNames", names, selection)
+    oreWidget.build(oreSection)
+    Ores.bindSelection(oreWidget, names)
+    Settings.bindSelection("oreNames", names, oreWidget)
 
-    local sellTab = window:AddTab("Auto sell", "sell resources when the backpack is full")
-    local sellPanel = sellTab:AddSeperator("Auto sell")
+    local uiSection = main:addSection("UI")
 
-    sellPanel:AddToggle({
-        title = "Enabled",
-        desc = "sell selected resources when the backpack is full",
-        checked = savedSellEnabled,
-        callback = function(state)
-            Settings.write("sellEnabled", state)
-            logPrint("autosell toggle " .. (state and "on" or "off"))
-        end,
-    })
+    uiSection:addKeybind("Menu key", Enum.KeyCode.RightControl, function()
+        window:toggle()
+    end)
+
+    local sellPage = window:addPage("Auto sell")
+    local sellSection = sellPage:addSection("Auto sell")
+
+    sellSection:addToggle("Enabled", savedSellEnabled, function(state)
+        Settings.write("sellEnabled", state)
+        logPrint("autosell toggle " .. (state and "on" or "off"))
+    end)
+
+    sellSection:addButton("Sell now", function()
+        task.spawn(function()
+            local ok, sold = pcall(Sell.manual)
+
+            if ok then
+                logPrint("manual sell total " .. tostring(sold))
+            else
+                logWarn("manual sell error: " .. tostring(sold))
+            end
+        end)
+    end)
 
     local sellNames = Sell.names()
-    local savedSell = Settings.selection("sellNames", "sellSelected", sellNames)
-    local sellSelection = sellPanel:AddSelection({
-        title = "Resources to sell",
-        options = sellNames,
-        default = savedSell,
-    })
+    local sellWidget = Ui.selection(
+        sellNames,
+        Settings.selection("sellNames", "sellSelected", sellNames)
+    )
+    local sellListSection = sellPage:addSection("Resources to sell")
 
-    sellSelection.setSelected(savedSell)
-    Sell.bindSelection(sellSelection, sellNames)
-    Settings.bindSelection("sellNames", sellNames, sellSelection)
+    sellWidget.build(sellListSection)
+    Sell.bindSelection(sellWidget, sellNames)
+    Settings.bindSelection("sellNames", sellNames, sellWidget)
 
-    sellPanel:AddButton({
-        title = "Sell now",
-        callback = function()
-            logPrint("manual sell total " .. Sell.manual())
-        end,
-    })
+    local sessionPage = window:addPage("Session")
+    local rejoinSection = sessionPage:addSection("Auto rejoin")
 
-    local rejoinTab = window:AddTab("Auto rejoin", "come back after a disconnect")
-    local rejoinPanel = rejoinTab:AddSeperator("Session")
-    rejoinPanel:AddToggle({
-        title = "Auto rejoin",
-        desc = "teleport back after the disconnect prompt",
-        checked = savedRejoin,
-        callback = function(state)
-            Settings.write("autoRejoin", state)
-            logPrint("auto rejoin " .. (state and "on" or "off"))
-        end,
-    })
+    rejoinSection:addToggle("Auto rejoin", savedRejoin, function(state)
+        Settings.write("autoRejoin", state)
+        logPrint("auto rejoin " .. (state and "on" or "off"))
+    end)
 
-    local loadTab = window:AddTab("Auto load", "load the chosen save slot without clicking")
-    local loadPanel = loadTab:AddSeperator("Auto load")
-
+    local loadSection = sessionPage:addSection("Auto load")
     local slotDropdown
-    slotDropdown = loadPanel:AddDropdown({
-        title = "Save slot",
-        desc = "argument of ReplicatedStorage.LoadGameEvent",
-        options = AutoLoad.slots,
-        callback = function(index)
-            Settings.write("autoloadSlot", index)
-        end,
-    })
+    slotDropdown = loadSection:addDropdown("Save slot", AutoLoad.slots, function(value)
+        Settings.write("autoloadSlot", value)
+    end)
 
-    loadPanel:AddToggle({
-        title = "Autoload",
-        desc = "fire LoadGameEvent with the slot until the save is loaded",
-        checked = savedAutoload,
-        callback = function(state)
-            Settings.write("autoloadEnabled", state)
-            logPrint("autoload " .. (state and "on" or "off"))
-        end,
-    })
+    slotDropdown.Search.TextBox.Text = tostring(savedAutoloadSlot)
 
-    local debugTab = window:AddTab("Debug", "stats and logs")
-    local statsPanel = debugTab:AddSeperator("Stats")
+    loadSection:addToggle("Autoload", savedAutoload, function(state)
+        Settings.write("autoloadEnabled", state)
+        logPrint("autoload " .. (state and "on" or "off"))
+    end)
 
-    local pickaxeInput = statsPanel:AddTextInput({ title = "Pickaxe" })
-    local handleInput = statsPanel:AddTextInput({ title = "Handle" })
-    local playerInput = statsPanel:AddTextInput({ title = "Player" })
-    local stateInput = statsPanel:AddTextInput({ title = "State" })
+    local debugPage = window:addPage("Debug")
+    local statsSection = debugPage:addSection("Stats")
 
-    local logPanel = debugTab:AddSeperator("Logs")
-    logPanel:AddToggle({
-        title = "Verbose logs",
-        desc = "print ore reasons and mining steps",
-        checked = savedVerbose,
-        callback = function(state)
-            Log.enabled = state
-            Settings.write("verboseLogs", state)
-        end,
-    })
+    local pickaxeInput = statsSection:addTextbox("Pickaxe")
+    local handleInput = statsSection:addTextbox("Handle")
+    local playerInput = statsSection:addTextbox("Player")
+    local stateInput = statsSection:addTextbox("State")
 
-    logPanel:AddToggle({
-        title = "Disable 3D render",
-        desc = "RunService:Set3dRenderingEnabled(false)",
-        checked = false,
-        callback = function(state)
-            -- Per-session switch: deliberately not saved.
-            pcall(function()
-                RunService:Set3dRenderingEnabled(not state)
-            end)
-            RenderCover.set(state)
-        end,
-    })
+    -- The library flashes a textbox whenever its text changes; 1% image
+    -- transparency keeps the readout from pulsing on every refresh.
+    for _, input in ipairs({ pickaxeInput, handleInput, playerInput, stateInput }) do
+        input.Button.ImageTransparency = 0.01
+    end
 
-    logPanel:AddButton({
-        title = "Print stats",
-        callback = function()
-            Ui.printStats()
-        end,
-    })
+    local logSection = debugPage:addSection("Logs")
 
-    -- uilib Selection has no change callback, so every registered widget is
-    -- polled. Separate loop from the stats readout: a failing stat must never stop
+    logSection:addToggle("Verbose logs", savedVerbose, function(state)
+        Log.enabled = state
+        Settings.write("verboseLogs", state)
+    end)
+
+    logSection:addToggle("Disable 3D render", false, function(state)
+        -- Per-session switch: deliberately not saved.
+        pcall(function()
+            RunService:Set3dRenderingEnabled(not state)
+        end)
+        RenderCover.set(state)
+    end)
+
+    logSection:addButton("Print stats", function()
+        task.spawn(Ui.printStats)
+    end)
+
+    -- Selection toggles write through `Settings.bindSelection`, which is polled
+    -- here. Separate loop from the stats readout: a failing stat must never stop
     -- the options from being saved. `Settings.persist` skips unchanged JSON.
     task.spawn(function()
         while true do
@@ -3958,14 +3987,14 @@ function Ui.create()
         local failures = 0
 
         while true do
-            task.wait(2)
+            task.wait(3)
 
             local ok = pcall(function()
                 local stats = Ui.stats()
-                pickaxeInput.setText(stats.pickaxe)
-                handleInput.setText(stats.handle)
-                playerInput.setText(stats.player)
-                stateInput.setText(stats.state)
+                statsSection:updateTextbox(pickaxeInput, nil, stats.pickaxe)
+                statsSection:updateTextbox(handleInput, nil, stats.handle)
+                statsSection:updateTextbox(playerInput, nil, stats.player)
+                statsSection:updateTextbox(stateInput, nil, stats.state)
             end)
 
             -- Cosmetic only: keep retrying a few times, then stop spamming.
@@ -3981,8 +4010,22 @@ function Ui.create()
         end
     end)
 
-    modeDropdown.setSelected(savedMode)
-    slotDropdown.setSelected(savedAutoloadSlot)
+    Modes.select(Modes.list[savedMode])
+
+    if enabled then
+        Modes.enable(Modes.list[savedMode])
+    end
+
+    -- Venyx hides every page until one is selected.
+    task.spawn(function()
+        local ok, err = pcall(function()
+            window:SelectPage(window.pages[1], true)
+        end)
+
+        if not ok then
+            logWarn("ui page select failed: " .. tostring(err))
+        end
+    end)
 
     return window
 end
@@ -4049,41 +4092,6 @@ function LogView.create()
 end
 
 ---------------------------------------------------------------------------
--- GUI toggle button
----------------------------------------------------------------------------
-
-function Ui.toggleButton(window)
-    local playerGui = Players.LocalPlayer:WaitForChild("PlayerGui")
-
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "NM2_Toggle"
-    gui.ResetOnSpawn = false
-    gui.Parent = playerGui
-
-    local button = Instance.new("TextButton")
-    button.Size = UDim2.fromOffset(52, 24)
-    button.Position = UDim2.new(0, 10, 0, 36)
-    button.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
-    button.BorderSizePixel = 0
-    button.Font = Enum.Font.GothamBold
-    button.TextSize = 12
-    button.TextColor3 = Color3.fromRGB(230, 230, 230)
-    button.Text = "Hide"
-    button.Parent = gui
-
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 4)
-    corner.Parent = button
-
-    button.Activated:Connect(function()
-        local visible = window:ToggleGUI()
-        button.Text = visible and "Hide" or "Show"
-    end)
-
-    return gui
-end
-
----------------------------------------------------------------------------
 -- Bootstrap
 ---------------------------------------------------------------------------
 
@@ -4095,9 +4103,7 @@ Settings.restore()
 LogView.create()
 
 local ok, window = pcall(Ui.create)
-if ok and window then
-    Ui.toggleButton(window)
-else
+if not ok or not window then
     warn("[main] ui failed: " .. tostring(window))
 end
 
@@ -4175,5 +4181,5 @@ task.spawn(function()
         ))
     end
 
-    print("[main] F1 farm, F2 mushrooms")
+    print("[main] F1 farm, F2 mushrooms, RightControl menu")
 end)
