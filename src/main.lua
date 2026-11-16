@@ -1,8 +1,10 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TeleportService = game:GetService("TeleportService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
 
 ---------------------------------------------------------------------------
 -- Config
@@ -33,21 +35,38 @@ local Config = {
     mineName = "Mine",
     oreRange = 21,
 
+    rejoinDelay = 2,
+    rejoinAttachTries = 60,
+
+    autoloadEvent = "LoadGameEvent",
+    autoloadLoadedAttr = "FullyLoaded",
+    autoloadProfileAttr = "Profile",
+    autoloadDelay = 1,
+    autoloadTries = 10,
+
     mineReachMargin = 4,
     moveCooldown = 0.5,
     maxRejects = 5,
+
+    -- Escape planner (Dijkstra over block cells).
+    planRadius = 7,
+    planClearance = 3,
+    planHop = 0.3,
+    planUpCost = 4,
+    planMaxNodes = 4000,
+    planRetry = 5,
 
     surfaceDepth = 2,
     surfaceScanRadius = 6,
     surfaceMaxDepth = 10,
     surfaceMinDepth = 2,
+    surfaceProbeDepth = 6,
+    surfaceStarMin = 8,
     fieldCenter = Vector3.new(89.5, 7998.5, -21.5),
     fieldRadius = 14,
     emptyMineLift = 20,
     emptyMineWait = 2,
     teleportLift = 3.5,
-    liquidStuckCount = 4,
-    liquidSearchRange = 16,
     moveBuffer = 0.1,
     moveSettleTime = 0.25,
     moveSettleEpsilon = 0.2,
@@ -70,6 +89,395 @@ local Config = {
     pickaxeRemote = "UpdatePickaxe",
     defaultMineTime = 4,
 }
+
+---------------------------------------------------------------------------
+-- Settings (executor standard: writefile/readfile/isfile/makefolder + JSON)
+--
+-- A typed registry: every saved option is one `Settings.define` entry, and the
+-- UI only calls `Settings.read(key)` / `Settings.write(key, value)`. Adding an
+-- option never touches the file format code.
+--
+-- kinds:
+--   bool   - true/false
+--   number - number, clamped to `min`/`max`, optional `round` (1 = integer)
+--   names  - array of resource names (selections); `default = "all"` means every
+--            entry of the current option list
+--
+-- `apply` is the restore hook: `Settings.restore()` calls it once per key before
+-- the UI is built, so no option needs its own bootstrap block.
+---------------------------------------------------------------------------
+
+local Settings = {
+    path = "nm2/settings.json",
+    fallbackPath = "nm2_settings.json",
+    data = {},
+    loaded = false,
+    defs = {},
+    bound = {},
+}
+
+-- `isfile` is optional: many executors only ship `readfile`, which errors on a
+-- missing file, so the read itself is the existence check.
+local function settingsReady()
+    return type(writefile) == "function" and type(readfile) == "function"
+end
+
+local function readText(path)
+    local ok, text = pcall(readfile, path)
+
+    if ok and type(text) == "string" and text ~= "" then
+        return text
+    end
+
+    return nil
+end
+
+local function fileExists(path)
+    if type(isfile) ~= "function" then
+        return true
+    end
+
+    local ok, exists = pcall(isfile, path)
+    return ok and exists
+end
+
+function Settings.load()
+    if Settings.loaded then
+        return Settings.data
+    end
+
+    Settings.loaded = true
+
+    if not settingsReady() then
+        return Settings.data
+    end
+
+    local text
+
+    if fileExists(Settings.path) then
+        text = readText(Settings.path)
+    end
+
+    if not text and fileExists(Settings.fallbackPath) then
+        text = readText(Settings.fallbackPath)
+    end
+
+    if not text then
+        return Settings.data
+    end
+
+    Settings.lastJson = text
+
+    local decodeOk, decoded = pcall(function()
+        return HttpService:JSONDecode(text)
+    end)
+
+    if decodeOk and type(decoded) == "table" then
+        Settings.data = decoded
+    end
+
+    return Settings.data
+end
+
+function Settings.persist()
+    if not settingsReady() then
+        return
+    end
+
+    -- Only registered keys are written: a stale `enabled`/`noRender` from an old
+    -- build is dropped instead of lingering in the file as if it were saved.
+    local snapshot = {}
+
+    for key in pairs(Settings.defs) do
+        local value = Settings.data[key]
+
+        if value ~= nil then
+            snapshot[key] = value
+        end
+    end
+
+    local okEncode, text = pcall(function()
+        return HttpService:JSONEncode(snapshot)
+    end)
+
+    if not okEncode or text == Settings.lastJson then
+        return
+    end
+
+    Settings.lastJson = text
+
+    local okWrite = pcall(function()
+        if type(makefolder) == "function" then
+            pcall(makefolder, "nm2")
+        end
+        writefile(Settings.path, text)
+    end)
+
+    if not okWrite then
+        pcall(writefile, Settings.fallbackPath, text)
+    end
+end
+
+---------------------------------------------------------------------------
+-- Typed registry
+---------------------------------------------------------------------------
+
+local normalizers = {}
+
+function normalizers.bool(spec, value)
+    return value == true
+end
+
+function normalizers.number(spec, value)
+    local number = tonumber(value)
+
+    if not number then
+        return spec.default
+    end
+
+    if spec.min then
+        number = math.max(spec.min, number)
+    end
+
+    if spec.max then
+        number = math.min(spec.max, number)
+    end
+
+    if spec.round then
+        number = math.floor(number * spec.round + 0.5) / spec.round
+    end
+
+    return number
+end
+
+function normalizers.names(spec, value)
+    local out = {}
+
+    if type(value) ~= "table" then
+        return out
+    end
+
+    for _, name in ipairs(value) do
+        if type(name) == "string" then
+            table.insert(out, name)
+        end
+    end
+
+    return out
+end
+
+function Settings.define(key, spec)
+    spec.key = key
+    spec.kind = spec.kind or "bool"
+    Settings.defs[key] = spec
+    return spec
+end
+
+function Settings.normalize(key, value)
+    local spec = Settings.defs[key]
+    if not spec then
+        return value
+    end
+
+    local normalize = normalizers[spec.kind] or normalizers.bool
+    return normalize(spec, value)
+end
+
+-- Value used when the file has no entry. `"all"`/`"none"` selections resolve to
+-- an empty list here: the concrete entries are the current option list, which is
+-- only known by `Settings.selection`.
+function Settings.fallback(key)
+    local spec = Settings.defs[key]
+    if not spec then
+        return nil
+    end
+
+    if spec.kind == "names" then
+        return {}
+    end
+
+    return spec.default
+end
+
+function Settings.read(key)
+    Settings.load()
+
+    local value = Settings.data[key]
+
+    if value == nil then
+        return Settings.fallback(key)
+    end
+
+    return Settings.normalize(key, value)
+end
+
+function Settings.write(key, value)
+    Settings.load()
+
+    local normalized = Settings.normalize(key, value)
+    Settings.data[key] = normalized
+    Settings.persist()
+
+    local spec = Settings.defs[key]
+
+    if spec and spec.apply then
+        pcall(spec.apply, normalized)
+    end
+
+    return normalized
+end
+
+-- Restore every `apply` hook before the UI exists.
+function Settings.restore()
+    for key, spec in pairs(Settings.defs) do
+        if spec.apply then
+            pcall(spec.apply, Settings.read(key))
+        end
+    end
+end
+
+---------------------------------------------------------------------------
+-- Selections (widgets work with indexes, the file stores resource names)
+---------------------------------------------------------------------------
+
+function Settings.indices(key, fallback)
+    local value = Settings.load()[key]
+
+    if type(value) ~= "table" then
+        return fallback
+    end
+
+    local list = {}
+
+    for _, index in ipairs(value) do
+        if type(index) == "number" then
+            table.insert(list, index)
+        end
+    end
+
+    return list
+end
+
+-- Saved indexes were written against an older resource table: drop the ones that
+-- no longer exist instead of restoring a selection that maps to nothing.
+function Settings.clampIndices(list, count)
+    local out = {}
+
+    for _, index in ipairs(list) do
+        index = math.floor(tonumber(index) or 0)
+
+        if index >= 1 and index <= count then
+            table.insert(out, index)
+        end
+    end
+
+    return out
+end
+
+-- Stored names -> indexes in the current option list.
+function Settings.indexList(names, saved)
+    if type(saved) ~= "table" then
+        return {}
+    end
+
+    local positions = {}
+
+    for index, name in ipairs(names) do
+        positions[name] = index
+    end
+
+    local indexes = {}
+
+    for _, name in ipairs(saved) do
+        local index = type(name) == "string" and positions[name]
+
+        if index then
+            table.insert(indexes, index)
+        end
+    end
+
+    return indexes
+end
+
+-- Widget indexes -> names for saving.
+function Settings.nameList(names, indexes)
+    local out = {}
+
+    for _, index in ipairs(indexes or {}) do
+        local name = names[index]
+
+        if name then
+            table.insert(out, name)
+        end
+    end
+
+    return out
+end
+
+function Settings.defaultIndices(key, names)
+    local spec = Settings.defs[key]
+
+    if spec and spec.default == "all" then
+        local all = {}
+
+        for index = 1, #names do
+            table.insert(all, index)
+        end
+
+        return all
+    end
+
+    return {}
+end
+
+-- Index list for a selection widget.
+-- New format: names under `key`. Old format: indexes under `legacyKey`.
+-- If a saved list exists but nothing matches any more, the option default wins.
+function Settings.selection(key, legacyKey, names)
+    local fallback = Settings.defaultIndices(key, names)
+    local saved = Settings.load()[key]
+
+    if type(saved) == "table" then
+        local indexes = Settings.indexList(names, saved)
+
+        if #indexes == 0 and #saved > 0 then
+            return fallback
+        end
+
+        return indexes
+    end
+
+    local legacy = legacyKey and Settings.indices(legacyKey, nil)
+
+    if legacy then
+        local indexes = Settings.clampIndices(legacy, #names)
+
+        if #indexes == 0 and #legacy > 0 then
+            return fallback
+        end
+
+        return indexes
+    end
+
+    return fallback
+end
+
+-- Register a selection widget for the polling writer. uilib has no change
+-- callback, so `Settings.flushSelections` (called from a timer) saves whatever
+-- the widget currently holds; `Settings.persist` skips unchanged JSON.
+function Settings.bindSelection(key, names, widget)
+    table.insert(Settings.bound, { key = key, names = names, widget = widget })
+end
+
+function Settings.flushSelections()
+    for _, entry in ipairs(Settings.bound) do
+        local indexes = entry.widget.getSelected()
+
+        if indexes then
+            Settings.write(entry.key, Settings.nameList(entry.names, indexes))
+        end
+    end
+end
 
 ---------------------------------------------------------------------------
 -- Ping tracker (rolling min for stable safety buffer)
@@ -303,9 +711,14 @@ end
 function Character.get()
     local player = Players.LocalPlayer
     local character = player.Character
-    if not character or not character.PrimaryPart then
-        character = player.CharacterAdded:Wait()
+
+    -- CharacterAdded never fires for a character that already exists, and at
+    -- auto-start the model can be present before its PrimaryPart replicates.
+    while not character or not character.PrimaryPart do
+        task.wait(0.2)
+        character = player.Character
     end
+
     return character
 end
 
@@ -511,7 +924,7 @@ function Movement.to(character, position, speed)
 end
 
 -- Single movement path for every teleport in the script (loot, surface, pits,
--- step aside, auto sell). `Movement.to` decides how to move:
+-- plan steps, auto sell). `Movement.to` decides how to move:
 --   Config.instantMove == true  -> PivotTo immediately;
 --   Config.instantMove == false -> Linear tween at Config.tweenSpeed,
 --                                  then settle.
@@ -612,6 +1025,12 @@ function Blocks.calibrate()
     logPrint(("blocks offset %s"):format(tostring(Blocks.offset)))
 end
 
+-- Centre of an empty cell: the root lands inside the same cell whose floor was
+-- validated, not on a cell boundary that can round to a neighbour.
+function Blocks.standPoint(cell)
+    return Blocks.worldOf(cell) + Vector3.new(0, 0.5, 0)
+end
+
 function Blocks.below(worldPosition)
     local mine = workspace:FindFirstChild(Config.mineName)
     if not mine then
@@ -622,11 +1041,80 @@ function Blocks.below(worldPosition)
     return mine:FindFirstChild(vec3ToString(cell))
 end
 
+-- Cached set of liquid (Oil/Lava) block names, rebuilt on world change or after
+-- a reset. One pass over the mine turns every "is this block beside liquid"
+-- question into a handful of hash lookups instead of `FindFirstChild` calls.
+Blocks.liquids = nil
+Blocks.liquidsWorld = nil
+
+function Blocks.invalidateLiquids()
+    Blocks.liquids = nil
+    Blocks.liquidsWorld = nil
+end
+
+function Blocks.liquidSet()
+    local player = Players.LocalPlayer
+    local world = player and tostring(player:GetAttribute(Game.attrWorldId))
+
+    if Blocks.liquids and Blocks.liquidsWorld == world then
+        return Blocks.liquids
+    end
+
+    local mine = workspace:FindFirstChild(Config.mineName)
+    if not mine then
+        return nil
+    end
+
+    local set = {}
+
+    for index, block in ipairs(mine:GetChildren()) do
+        local position = block:GetAttribute(Game.attrMinePosition)
+        local info = position and resourceInfo(typeOf(block))
+
+        if info and info.LiquidResource then
+            set[vec3ToString(position)] = true
+        end
+
+        if index % 4000 == 0 then
+            task.wait()
+        end
+    end
+
+    Blocks.liquids = set
+    Blocks.liquidsWorld = world
+    return set
+end
+
+-- True when any neighbour of `cell` except the one below is liquid: such a block
+-- cannot be broken. `blockOffsets.DOWN` is `(0, 1, 0)`, i.e. deeper.
+function Blocks.liquidNeighbour(cell)
+    local liquids = Blocks.liquidSet()
+    if not liquids then
+        return false
+    end
+
+    for _, offset in pairs(blockOffsets) do
+        if offset.Y ~= 1 and liquids[vec3ToString(cell + offset)] then
+            return true
+        end
+    end
+
+    return false
+end
+
 ---------------------------------------------------------------------------
 -- Surface pits
 ---------------------------------------------------------------------------
 
 local Surface = {}
+
+-- Eight horizontal directions used to probe the sides of a pit/target cell.
+Surface.dirs = {
+    Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0),
+    Vector3.new(0, 0, 1), Vector3.new(0, 0, -1),
+    Vector3.new(1, 0, 1), Vector3.new(1, 0, -1),
+    Vector3.new(-1, 0, 1), Vector3.new(-1, 0, -1),
+}
 
 -- Depth of an open column: number of empty cells from topY down to the first
 -- solid block. nil means no floor inside surfaceMaxDepth, i.e. outside the mine.
@@ -648,8 +1136,91 @@ function Surface.atField(position)
     return dx * dx + dz * dz <= Config.fieldRadius * Config.fieldRadius
 end
 
--- Deepest valid pit around the player. Returns a block cell on the player's
--- own layer, which is also the cell to stand in before dropping down.
+-- 8 side "star" probes at the floor level: in every direction walk outward up
+-- to surfaceProbeDepth blocks until a solid mine block is met. A cell is inside
+-- the mine only when every one of the 8 rays hits.
+function Surface.star(mine, cell, floorY)
+    local hits = 0
+
+    for _, dir in ipairs(Surface.dirs) do
+        for step = 1, Config.surfaceProbeDepth do
+            local side = Vector3.new(
+                cell.X + dir.X * step,
+                floorY,
+                cell.Z + dir.Z * step
+            )
+
+            if mine:FindFirstChild(vec3ToString(side)) then
+                hits += 1
+                break
+            end
+        end
+    end
+
+    return hits
+end
+
+-- A pit cell is safe only when it is empty, has a solid floor and all 8 star
+-- rays hit mine blocks. This rejects map edges, floating columns and open holes
+-- that are not surrounded by generated terrain.
+function Surface.safe(mine, cell, depth)
+    if mine:FindFirstChild(vec3ToString(cell)) then
+        return false
+    end
+
+    local floorY = cell.Y + depth
+
+    if not mine:FindFirstChild(vec3ToString(Vector3.new(cell.X, floorY, cell.Z))) then
+        return false
+    end
+
+    local hits = Surface.star(mine, cell, floorY)
+    return hits >= Config.surfaceStarMin, hits
+end
+
+-- Deepest safe pit around `center` on layer `topY`. Collects depth candidates
+-- first, then runs the expensive 8-ray star check only until the first valid
+-- one (deepest, then nearest). One implementation for surface entry and reset.
+function Surface.scan(mine, center, topY, minDepth)
+    local candidates = {}
+    local radius = Config.surfaceScanRadius
+
+    for dx = -radius, radius do
+        for dz = -radius, radius do
+            local cell = Vector3.new(center.X + dx, topY, center.Z + dz)
+            local depth = Surface.depth(mine, cell.X, cell.Z, topY)
+
+            if depth and depth >= minDepth then
+                table.insert(candidates, {
+                    cell = cell,
+                    depth = depth,
+                    distance = dx * dx + dz * dz,
+                })
+            end
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        if a.depth ~= b.depth then
+            return a.depth > b.depth
+        end
+        return a.distance < b.distance
+    end)
+
+    for _, candidate in ipairs(candidates) do
+        local ok, hits = Surface.safe(mine, candidate.cell, candidate.depth)
+
+        if ok then
+            logPrint(("pit %s depth=%d star=%d"):format(
+                vec3ToString(candidate.cell), candidate.depth, hits))
+            return candidate.cell
+        end
+    end
+
+    return nil
+end
+
+-- Cell to stand in before dropping down, on the player's own layer.
 function Surface.find(position)
     local mine = workspace:FindFirstChild(Config.mineName)
     if not mine then
@@ -658,88 +1229,24 @@ function Surface.find(position)
 
     Blocks.calibrate()
 
-    local center = Blocks.toBlock(position)
-    local topY = center.Y
-    local best, bestDepth, bestDistance
-    local radius = Config.surfaceScanRadius
-
-    for dx = -radius, radius do
-        for dz = -radius, radius do
-            local x, z = center.X + dx, center.Z + dz
-            local depth = Surface.depth(mine, x, z, topY)
-
-            if depth and depth >= Config.surfaceMinDepth then
-                local distance = dx * dx + dz * dz
-
-                if not bestDepth
-                    or depth > bestDepth
-                    or (depth == bestDepth and distance < bestDistance) then
-                    best = Vector3.new(x, topY, z)
-                    bestDepth = depth
-                    bestDistance = distance
-                end
-            end
-        end
-    end
-
-    if not best then
-        return nil
-    end
-
-    logPrint(("surface pit %s depth=%d"):format(vec3ToString(best), bestDepth))
-    return best
+    local cell = Blocks.toBlock(position)
+    return Surface.scan(mine, cell, cell.Y, Config.surfaceMinDepth)
 end
 
--- Reset target after a rejection streak. Scans the fixed surface layer (y = -1,
--- the empty cell above the ground block) around the field centre only, so it can
--- never land outside the generated mine. Returns a world position whose cell is
--- empty and which has a solid floor below, plus a tiny lift.
+-- Reset target after a rejection streak: the same scan on the fixed surface
+-- layer around the field centre, so it can never leave the generated mine.
 function Surface.resetPoint()
     local mine = workspace:FindFirstChild(Config.mineName)
     if not mine then
         return nil
     end
 
-    local center = Blocks.toBlock(Config.fieldCenter)
-    local topY = -1
-    local best, bestDepth, bestDistance
-    local radius = Config.surfaceScanRadius
-
-    for dx = -radius, radius do
-        for dz = -radius, radius do
-            local x, z = center.X + dx, center.Z + dz
-            local depth = Surface.depth(mine, x, z, topY)
-
-            if depth and depth >= 1 then
-                local distance = dx * dx + dz * dz
-
-                if not bestDepth
-                    or depth > bestDepth
-                    or (depth == bestDepth and distance < bestDistance) then
-                    best = Vector3.new(x, topY, z)
-                    bestDepth = depth
-                    bestDistance = distance
-                end
-            end
-        end
-    end
-
-    if not best then
+    local cell = Surface.scan(mine, Blocks.toBlock(Config.fieldCenter), -1, 1)
+    if not cell then
         return nil
     end
 
-    -- Validate once more right before the teleport: the cell must stay empty and
-    -- the floor below must still be a mine block.
-    if mine:FindFirstChild(vec3ToString(best)) then
-        return nil
-    end
-
-    if not mine:FindFirstChild(vec3ToString(best + Vector3.new(0, 1, 0))) then
-        return nil
-    end
-
-    logPrint(("reset point %s depth=%d"):format(vec3ToString(best), bestDepth))
-    return Blocks.worldOf(best) + Vector3.new(0, Config.teleportLift, 0)
+    return Blocks.worldOf(cell) + Vector3.new(0, Config.teleportLift, 0)
 end
 
 ---------------------------------------------------------------------------
@@ -1128,22 +1635,11 @@ end
 
 function Mining.besideLiquid(block)
     local position = block:GetAttribute(Game.attrMinePosition)
-    local mine = workspace:FindFirstChild(Config.mineName)
-    if not position or not mine then
+    if not position then
         return false
     end
 
-    for _, offset in pairs(blockOffsets) do
-        if offset.Y ~= 1 then
-            local neighbor = mine:FindFirstChild(vec3ToString(position + offset))
-            local info = neighbor and resourceInfo(typeOf(neighbor))
-            if info and info.LiquidResource then
-                return true
-            end
-        end
-    end
-
-    return false
+    return Blocks.liquidNeighbour(position)
 end
 
 function Mining.valid(block)
@@ -1316,8 +1812,16 @@ function Ores.names()
         end
     end
 
+    -- Deterministic order: equal prices fall back to the name, so the catalogue
+    -- index of a resource does not change between sessions.
     table.sort(names, function(a, b)
-        return Ores.price(a) > Ores.price(b)
+        local priceA, priceB = Ores.price(a), Ores.price(b)
+
+        if priceA == priceB then
+            return a < b
+        end
+
+        return priceA > priceB
     end)
 
     namesCache = names
@@ -1395,7 +1899,7 @@ function Ores.nearest(position, radius)
 
     local reach = math.ceil(limit / 7)
     local selected = Ores.selectedSet()
-    local best, bestScore
+    local candidates = {}
 
     for dx = -reach, reach do
         for dy = -reach, reach do
@@ -1411,15 +1915,29 @@ function Ores.nearest(position, radius)
                         local name = typeOf(block)
 
                         if name and (not selected or selected[name]) and Mining.valid(block) == nil then
-                            local score = Ores.price(name) * 1000 - distance
-
-                            if not bestScore or score > bestScore then
-                                best, bestScore = block, score
-                            end
+                            table.insert(candidates, {
+                                block = block,
+                                score = Ores.price(name) * 1000 - distance,
+                            })
                         end
                     end
                 end
             end
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        return a.score > b.score
+    end)
+
+    -- Mining.valid is cheap but does not know about liquids: ask Mining.why
+    -- lazily, and only for the sorted candidates until one really passes.
+    local best
+
+    for _, candidate in ipairs(candidates) do
+        if candidate.block.Parent and Mining.why(candidate.block) == nil then
+            best = candidate.block
+            break
         end
     end
 
@@ -1590,8 +2108,15 @@ function Sell.names()
         end
     end
 
+    -- Same deterministic order as `Ores.names`: price, then name.
     table.sort(names, function(a, b)
-        return Ores.price(a) > Ores.price(b)
+        local priceA, priceB = Ores.price(a), Ores.price(b)
+
+        if priceA == priceB then
+            return a < b
+        end
+
+        return priceA > priceB
     end)
 
     return names
@@ -2053,9 +2578,8 @@ end
 
 -- Loot has priority over mining: teleports straight to every own selected drop,
 -- waits for the touch, then returns. No radius limit, no grouping.
+-- Caller must run Loot.sync(true) first (Farm does it right before).
 function Loot.collectAll(character)
-    Loot.sync(true)
-
     local root = character.PrimaryPart
     if not root then
         return 0
@@ -2138,121 +2662,343 @@ end
 -- Farm mode
 ---------------------------------------------------------------------------
 
--- Number of horizontal neighbours of `cell` that are liquid (Oil/Lava), and the
--- total checked. The block below is skipped, same as IsBlockBesideLiquid.
-local function liquidNeighbours(mine, cell)
-    local liquid, total = 0, 0
+-- Escape planner
+--
+-- The bot can only dig what is in reach, but it can teleport anywhere. Escaping a
+-- liquid pocket therefore is a grid pathfinding problem, not a "find a free cell"
+-- problem: in a one-cell shaft surrounded by solid rock there is no free cell to
+-- teleport to, the bot has to dig one.
+--
+-- Node   = cell the bot stands in.
+-- Edge   = one of the 6 neighbours. An empty cell above is cheap; a solid diggable
+--          block costs its mine time; liquid, bedrock, foreign `Dug`, blocked
+--          types and liquid-adjacent blocks are impassable.
+-- Goal   = cell with `Config.planClearance` diggable blocks in a row below it.
+--
+-- Dijkstra with early exit inside a `planRadius` box. The ore selection is
+-- ignored: escape may use any resource.
 
-    for _, offset in pairs(blockOffsets) do
-        if offset.Y ~= 1 then
-            total += 1
-            local neighbour = mine:FindFirstChild(vec3ToString(cell + offset))
-            local info = neighbour and resourceInfo(typeOf(neighbour))
+local Plan = {
+    current = nil,
+}
 
-            if info and info.LiquidResource then
-                liquid += 1
-            end
+local CELL_UP = Vector3.new(0, -1, 0)
+local CELL_DOWN = Vector3.new(0, 1, 0)
+
+local PLAN_MOVES = {
+    Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0),
+    Vector3.new(0, 0, 1), Vector3.new(0, 0, -1),
+    CELL_UP, CELL_DOWN,
+}
+
+local function heapPush(heap, node)
+    local index = #heap + 1
+    heap[index] = node
+
+    while index > 1 do
+        local parent = math.floor(index / 2)
+
+        if heap[parent].cost <= heap[index].cost then
+            break
         end
+
+        heap[parent], heap[index] = heap[index], heap[parent]
+        index = parent
+    end
+end
+
+local function heapPop(heap)
+    local count = #heap
+    if count == 0 then
+        return nil
     end
 
-    return liquid, total
+    local first = heap[1]
+    heap[1] = heap[count]
+    heap[count] = nil
+    count = count - 1
+
+    local index = 1
+
+    while true do
+        local left, right = index * 2, index * 2 + 1
+        local smallest = index
+
+        if left <= count and heap[left].cost < heap[smallest].cost then
+            smallest = left
+        end
+
+        if right <= count and heap[right].cost < heap[smallest].cost then
+            smallest = right
+        end
+
+        if smallest == index then
+            break
+        end
+
+        heap[smallest], heap[index] = heap[index], heap[smallest]
+        index = smallest
+    end
+
+    return first
 end
 
--- Fully stuck in liquid: almost every horizontal neighbour is Oil/Lava.
-local function stuckInLiquid(mine, cell)
-    local liquid, total = liquidNeighbours(mine, cell)
-    return total > 0 and liquid >= Config.liquidStuckCount
-end
-
--- Liquid escape: the bot cannot dig the block under it and cannot step aside.
--- Look one block above the stuck cell, then walk a random horizontal direction
--- until a mineable block is found. Blocks at the liquid level and below are never
--- mined, only the one above the liquid. Teleport on top of it and let Farm dig
--- that block next tick.
-local function escapeLiquid(character, root)
-    local mine = workspace:FindFirstChild(Config.mineName)
-    if not mine then
+-- Cheapest test first: the cached liquid set, then the attribute checks.
+local function diggable(block)
+    if not block or not block.Parent then
         return false
     end
 
-    local cell = Blocks.toBlock(root.Position)
-    if not stuckInLiquid(mine, cell) then
+    if Mining.besideLiquid(block) then
         return false
     end
 
-    local up = cell + Vector3.new(0, -1, 0)
+    return Mining.valid(block) == nil
+end
 
-    local directions = {
-        Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0),
-        Vector3.new(0, 0, 1), Vector3.new(0, 0, -1),
-        Vector3.new(1, 0, 1), Vector3.new(1, 0, -1),
-        Vector3.new(-1, 0, 1), Vector3.new(-1, 0, -1),
-    }
+-- The column below `cell` must allow a few clean down-digs, otherwise the plan
+-- would stop next to the same liquid pocket. An empty cell is fine, but the first
+-- floor under it has to be there.
+function Plan.clear(mine, cell)
+    for depth = 1, Config.planClearance do
+        local block = mine:FindFirstChild(vec3ToString(cell + CELL_DOWN * depth))
 
-    for index = #directions, 2, -1 do
-        local swap = math.random(index)
-        directions[index], directions[swap] = directions[swap], directions[index]
-    end
+        if not block then
+            return depth > 1
+        end
 
-    for _, direction in ipairs(directions) do
-        for distance = 1, Config.liquidSearchRange do
-            local target = up + direction * distance
-            local block = mine:FindFirstChild(vec3ToString(target))
-
-            if block and Mining.why(block) == nil then
-                logPrint(("liquid escape -> %s (%s)"):format(
-                    vec3ToString(target), tostring(typeOf(block))))
-
-                Movement.jump(character, Blocks.worldOf(target)
-                    + Vector3.new(0, Config.teleportLift, 0))
-                return true
-            end
+        if not diggable(block) then
+            return false
         end
     end
 
-    logWarn("liquid escape: no mineable block above the liquid")
-    return false
+    return true
 end
 
--- Escape for the dig-straight-down case: the block under the bot is one we refuse
--- to dig (liquid neighbour, Oil/Lava/Grass/Void, someone else's Dug). Pick the
--- richest neighbouring column whose own cell is empty and whose floor is diggable,
--- so the next down-dig has a different block under it.
-local function stepAside(character, root)
-    local mine = workspace:FindFirstChild(Config.mineName)
-    if not mine then
-        return
+function Plan.reset()
+    Plan.current = nil
+end
+
+-- No route for the same cell within `planRetry` seconds: do not request a
+-- surface reset every tick. The world may change (other players dig), so retry.
+function Plan.failedRecently(cell)
+    if not Plan.failKey or Plan.failKey ~= vec3ToString(cell) then
+        return false
     end
 
-    local cell = Blocks.toBlock(root.Position)
-    local best, bestPrice
+    return os.clock() - Plan.failTime < Config.planRetry
+end
 
-    for _, offset in pairs(blockOffsets) do
-        if offset.Y == 0 then
-            local side = cell + Vector3.new(offset.X, 0, offset.Z)
-            local floor = mine:FindFirstChild(vec3ToString(side + Vector3.new(0, 1, 0)))
+function Plan.noteFailure(cell)
+    Plan.failKey = vec3ToString(cell)
+    Plan.failTime = os.clock()
+end
 
-            if floor
-                and Mining.why(floor) == nil
-                and not mine:FindFirstChild(vec3ToString(side)) then
-                local price = Ores.price(typeOf(floor) or "")
+function Plan.build(start)
+    local mine = workspace:FindFirstChild(Config.mineName)
+    if not mine then
+        return nil
+    end
 
-                if not best or price > bestPrice then
-                    best, bestPrice = side, price
+    local radius = Config.planRadius
+    local startKey = vec3ToString(start)
+    local cells = { [startKey] = start }
+    local costs = { [startKey] = 0 }
+    local parents = {}
+
+    -- `false` means "cell looked up and empty"; nil means "not looked up yet".
+    local blocks = {}
+    local digs = {}
+    local heap = {}
+
+    heapPush(heap, { cost = 0, key = startKey })
+
+    local pops = 0
+
+    while true do
+        local node = heapPop(heap)
+
+        if not node then
+            return nil
+        end
+
+        pops = pops + 1
+
+        if pops > Config.planMaxNodes then
+            logWarn("plan: node cap reached")
+            return nil
+        end
+
+        if pops % 500 == 0 then
+            task.wait()
+        end
+
+        local key = node.key
+
+        if node.cost <= costs[key] then
+            local cell = cells[key]
+
+            if key ~= startKey and Plan.clear(mine, cell) then
+                -- The path mines its own cells, so a goal sitting right on top of
+                -- the route has no floor left once the route is dug. Reject it.
+                local belowKey = vec3ToString(cell + CELL_DOWN)
+                local chain = {}
+                local walk = key
+                local minedBelow = false
+
+                while walk ~= startKey do
+                    if walk == belowKey then
+                        minedBelow = true
+                    end
+
+                    table.insert(chain, 1, cells[walk])
+                    walk = parents[walk]
+                end
+
+                if not minedBelow then
+                    return chain, node.cost
+                end
+            end
+
+            for _, move in ipairs(PLAN_MOVES) do
+                local nextCell = cell + move
+                local delta = nextCell - start
+
+                if math.abs(delta.X) <= radius
+                    and math.abs(delta.Y) <= radius
+                    and math.abs(delta.Z) <= radius then
+                    local nextKey = vec3ToString(nextCell)
+                    local block = blocks[nextKey]
+
+                    if block == nil then
+                        block = mine:FindFirstChild(nextKey) or false
+                        blocks[nextKey] = block
+                    end
+
+                    local step
+
+                    if block then
+                        -- Dig the block and stand in the freed cell. `diggable`
+                        -- is cached per cell: a node is examined from up to 6
+                        -- parents and it reads attributes.
+                        local dig = digs[nextKey]
+
+                        if dig == nil then
+                            dig = diggable(block)
+                            digs[nextKey] = dig
+                        end
+
+                        if dig then
+                            step = Mining.mineTime(block) + Config.planHop
+                        end
+                    elseif move == CELL_UP then
+                        -- Own shaft: climb, but climbing back costs a down-dig later.
+                        step = Config.planHop + Config.planUpCost
+                    end
+
+                    if step then
+                        local total = node.cost + step
+
+                        if not costs[nextKey] or total < costs[nextKey] then
+                            costs[nextKey] = total
+                            parents[nextKey] = key
+                            cells[nextKey] = nextCell
+                            heapPush(heap, { cost = total, key = nextKey })
+                        end
+                    end
                 end
             end
         end
     end
+end
 
-    if not best then
-        logWarn("down-block undiggable, no side escape")
-        task.wait(1)
-        return
+-- One dig per tick. `mineBlock(block)` is Farm's own mining wrapper; it returns
+-- true only when the block is really gone.
+function Plan.run(character, root, mineBlock)
+    local cell = Blocks.toBlock(root.Position)
+    local plan = Plan.current
+
+    -- Loot, the server or a fall moved the bot: rebuild from the real cell.
+    if plan and plan.expected ~= cell then
+        Plan.reset()
+        plan = nil
     end
 
-    local world = Blocks.worldOf(best)
-    logPrint(("step aside -> %s"):format(vec3ToString(best)))
-    Movement.jump(character, Vector3.new(world.X, root.Position.Y, world.Z))
+    if not plan then
+        local path, cost = Plan.build(cell)
+
+        if not path or #path == 0 then
+            logWarn(("plan: no route from %s"):format(vec3ToString(cell)))
+            return false
+        end
+
+        plan = { path = path, index = 1, expected = cell, fails = 0 }
+        Plan.current = plan
+        Plan.failKey = nil
+
+        logPrint(("plan: %d steps %.1fs -> %s"):format(
+            #path, cost, vec3ToString(path[#path])))
+    end
+
+    local mine = workspace:FindFirstChild(Config.mineName)
+    if not mine then
+        Plan.reset()
+        return false
+    end
+
+    -- Empty steps are the bot's own shaft. It cannot stay there: gravity drops it
+    -- back down a one-cell shaft, so climbing only works as part of the next dig.
+    -- Remember the climb and mine the next solid cell from that height.
+    local climb
+    local target, block
+
+    while plan.index <= #plan.path do
+        target = plan.path[plan.index]
+        block = mine:FindFirstChild(vec3ToString(target))
+
+        if block then
+            break
+        end
+
+        climb = target
+        target, block = nil, nil
+        plan.index = plan.index + 1
+    end
+
+    if not target then
+        Plan.reset()
+        logPrint("plan: nothing left to dig")
+        return true
+    end
+
+    if climb then
+        -- Climb only when the dig needs the height: a teleport in the same tick
+        -- as BlockEvent is what `Config.moveCooldown` normally avoids.
+        if not Mining.inRange(character, block) then
+            Movement.jump(character, Blocks.standPoint(climb))
+        end
+    end
+
+    if not mineBlock(block) then
+        plan.fails = plan.fails + 1
+
+        if plan.fails >= 2 then
+            Plan.reset()
+        end
+
+        return true
+    end
+
+    Movement.jump(character, Blocks.standPoint(target))
+    plan.expected = target
+    plan.index = plan.index + 1
+
+    if plan.index > #plan.path then
+        Plan.reset()
+        logPrint("plan: done")
+    end
+
+    return true
 end
 
 local FarmMode = Mode.new("Farm", function(self)
@@ -2279,6 +3025,8 @@ local FarmMode = Mode.new("Farm", function(self)
         Blocks.calibrated = false
         Blocks.lastCalibrate = 0
         Blocks.offset = Vector3.zero
+        Blocks.invalidateLiquids()
+        Plan.reset()
         Ores.clearCache()
         Blocks.calibrate()
 
@@ -2411,6 +3159,54 @@ local FarmMode = Mode.new("Farm", function(self)
         end
     end
 
+    local below = Blocks.below(root.Position)
+    local belowReason = below and Mining.why(below)
+
+    -- No floor under the feet: the bot is falling. Let physics finish before
+    -- planning, otherwise every fall tick would rebuild a plan.
+    if not below then
+        Plan.reset()
+        Movement.waitLanded(character)
+        return
+    end
+
+    -- Escape planning. A route is built when:
+    --   * a plan is already running,
+    --   * the floor cannot be dug (liquid neighbour, blocked type, foreign Dug),
+    --   * or the next `planClearance` blocks under this column are not clean
+    --     (preventive: move away before sitting in a liquid pocket).
+    -- The planner ignores the ore selection and digs its own tunnel: the bot sits
+    -- in a one-cell shaft, so there is usually no free cell to teleport into.
+    local needPlan = Plan.current ~= nil
+
+    if not needPlan and mineModel then
+        if belowReason ~= nil or not Plan.clear(mineModel, cell) then
+            needPlan = true
+
+            if belowReason then
+                logWarn(("floor blocked (%s), planning route"):format(tostring(belowReason)))
+            end
+        end
+    end
+
+    if needPlan then
+        if Plan.run(character, root, mine) then
+            return
+        end
+
+        if Plan.failedRecently(cell) then
+            logWarn("plan: still no route, waiting")
+            task.wait(1)
+            return
+        end
+
+        Plan.noteFailure(cell)
+        logWarn("plan: no route, requesting surface reset")
+        Plan.reset()
+        Mining.resetRequested = true
+        return
+    end
+
     -- 3. Mine the best selected block already in reach. No movement.
     local ore = Ores.nearest(root.Position, Mining.reach())
 
@@ -2422,31 +3218,20 @@ local FarmMode = Mode.new("Farm", function(self)
     end
 
     -- 4. Nothing reachable: dig straight down, one block at a time.
-    local below = Blocks.below(root.Position)
-
-    if not below then
-        -- Fell into a liquid pocket with no floor: climb out one block up.
-        if escapeLiquid(character, root) then
-            return
-        end
-
-        Movement.waitLanded(character)
-        return
-    end
-
     if mine(below) then
         Movement.waitLanded(character)
         return
     end
 
     if below.Parent and Mining.why(below) then
-        if escapeLiquid(character, root) then
-            return
-        end
-
-        stepAside(character, root)
+        -- Rejected between the plan check and the swing: escalate next tick.
+        Plan.reset()
+        logWarn("down-block undiggable, planning route")
     end
-end, Movement.cancel)
+end, function()
+    Plan.reset()
+    Movement.cancel()
+end)
 
 ---------------------------------------------------------------------------
 -- Mushroom mode
@@ -2533,6 +3318,370 @@ function Modes.enable(mode)
 end
 
 ---------------------------------------------------------------------------
+-- Auto rejoin
+---------------------------------------------------------------------------
+
+-- Roblox shows the disconnect dialog as
+-- `CoreGui.RobloxPromptGui.promptOverlay.ErrorPrompt`. When the option is on the
+-- bot teleports back to the same place instead of sitting on the error screen.
+--
+-- Executors are never expected to be graceful here: the game is already gone, so
+-- the teleport is retried on a timer until the client actually leaves.
+
+local Rejoin = {
+    enabled = false,
+    attached = false,
+    busy = false,
+}
+
+function Rejoin.teleport()
+    local ok = pcall(function()
+        TeleportService:Teleport(game.PlaceId)
+    end)
+
+    if ok then
+        return true
+    end
+
+    -- Client `Teleport` is rate limited and some executors block it;
+    -- `TeleportAsync` with the local player is the fallback.
+    return pcall(function()
+        TeleportService:TeleportAsync(game.PlaceId, { Players.LocalPlayer })
+    end)
+end
+
+function Rejoin.leave(reason)
+    if Rejoin.busy then
+        return
+    end
+
+    Rejoin.busy = true
+    logWarn(("auto rejoin: %s, teleporting to place %d"):format(
+        tostring(reason), game.PlaceId))
+
+    task.spawn(function()
+        -- Same loop as the classic snippet: keep asking for a teleport until the
+        -- client unloads the place.
+        while Rejoin.enabled do
+            Rejoin.teleport()
+            task.wait(Config.rejoinDelay)
+        end
+
+        Rejoin.busy = false
+    end)
+end
+
+function Rejoin.watch()
+    if Rejoin.attached then
+        return
+    end
+
+    Rejoin.attached = true
+
+    task.spawn(function()
+        local okGui, coreGui = pcall(function()
+            return game:GetService("CoreGui")
+        end)
+
+        if not okGui or not coreGui then
+            Rejoin.attached = false
+            logWarn("auto rejoin: CoreGui unavailable")
+            return
+        end
+
+        -- The prompt GUI can appear a little after the script runs, but do not
+        -- wait forever: leave the toggle able to re-arm.
+        local prompt
+
+        for _ = 1, Config.rejoinAttachTries do
+            prompt = coreGui:FindFirstChild("RobloxPromptGui")
+
+            if prompt then
+                break
+            end
+
+            task.wait(1)
+        end
+
+        if not prompt then
+            Rejoin.attached = false
+            logWarn("auto rejoin: RobloxPromptGui not found")
+            return
+        end
+
+        local overlay = prompt:FindFirstChild("promptOverlay") or prompt:WaitForChild("promptOverlay", 10)
+
+        if not overlay then
+            Rejoin.attached = false
+            logWarn("auto rejoin: promptOverlay not found")
+            return
+        end
+
+        local function check(child)
+            if child.Name ~= "ErrorPrompt" then
+                return
+            end
+
+            if not Rejoin.enabled then
+                return
+            end
+
+            Rejoin.leave("disconnect prompt")
+        end
+
+        overlay.ChildAdded:Connect(check)
+
+        -- The prompt can already be on screen when the option is turned on.
+        local existing = overlay:FindFirstChild("ErrorPrompt")
+        if existing then
+            check(existing)
+        end
+    end)
+end
+
+function Rejoin.set(enabled)
+    Rejoin.enabled = enabled == true
+
+    if Rejoin.enabled then
+        Rejoin.watch()
+    end
+end
+
+---------------------------------------------------------------------------
+-- Auto load
+---------------------------------------------------------------------------
+
+-- Before `FullyLoaded` turns true the game waits for a save slot click. With the
+-- option on the bot answers with `LoadGameEvent(slot)` itself, so an auto rejoin
+-- lands in the chosen save instead of the menu.
+--
+-- The tries are capped: if the attribute is missing or renamed, the bot must not
+-- keep reloading a world that is already running.
+
+local AutoLoad = {
+    enabled = false,
+    busy = false,
+    slot = 1,
+    slots = { "1", "2", "3" },
+}
+
+function AutoLoad.state()
+    local ok, loaded, profile = pcall(function()
+        local player = Players.LocalPlayer
+        return player:GetAttribute(Config.autoloadLoadedAttr), player:GetAttribute(Config.autoloadProfileAttr)
+    end)
+
+    if not ok then
+        return nil, nil
+    end
+
+    return loaded, profile
+end
+
+function AutoLoad.fire()
+    return pcall(function()
+        ReplicatedStorage:WaitForChild(Config.autoloadEvent, 5):FireServer(AutoLoad.slot)
+    end)
+end
+
+-- The intro camera loop is a coroutine inside the Intro LocalScript and its
+-- stop flag is a script upvalue, so only destroying the whole Intro ScreenGui
+-- ends it. Camera restore mirrors the game's own PrepareForGame:
+-- subject = Humanoid, type = Custom.
+function AutoLoad.cleanup()
+    return pcall(function()
+        local player = Players.LocalPlayer
+        local playerGui = player:FindFirstChild("PlayerGui")
+
+        if playerGui then
+            local intro = playerGui:FindFirstChild("Intro")
+
+            if intro then
+                intro:Destroy()
+                logPrint("autoload: Intro removed")
+            end
+
+            local darkness = playerGui:FindFirstChild("Darkness")
+
+            if darkness then
+                darkness:Destroy()
+                logPrint("autoload: Darkness removed")
+            end
+
+            local loadingScreen = playerGui:FindFirstChild("LoadingScreen")
+            local frame = loadingScreen and loadingScreen:FindFirstChild("Frame")
+
+            if frame then
+                frame.BackgroundTransparency = 1
+            end
+        end
+
+        local camera = workspace.CurrentCamera
+
+        if camera then
+            camera.CameraType = Enum.CameraType.Custom
+        end
+
+        local deadline = os.clock() + 10
+        local character = player.Character
+
+        while not character and os.clock() < deadline do
+            task.wait(0.2)
+            character = player.Character
+        end
+
+        if character and camera then
+            local humanoid = character:WaitForChild("Humanoid", 5)
+
+            if humanoid then
+                camera.CameraSubject = humanoid
+            end
+        end
+    end)
+end
+
+function AutoLoad.watch()
+    if AutoLoad.busy then
+        return
+    end
+
+    AutoLoad.busy = true
+
+    task.spawn(function()
+        for _ = 1, Config.autoloadTries do
+            if not AutoLoad.enabled then
+                break
+            end
+
+            local loaded, profile = AutoLoad.state()
+
+            if loaded == true then
+                logPrint(("autoload: loaded, slot %s"):format(tostring(profile)))
+                break
+            end
+
+            logPrint(("autoload: firing slot %d (loaded=%s)"):format(AutoLoad.slot, tostring(loaded)))
+
+            if AutoLoad.fire() then
+                AutoLoad.cleanup()
+            end
+
+            task.wait(Config.autoloadDelay)
+        end
+
+        AutoLoad.busy = false
+    end)
+end
+
+function AutoLoad.set(enabled)
+    AutoLoad.enabled = enabled == true
+
+    if AutoLoad.enabled then
+        AutoLoad.watch()
+    end
+end
+
+---------------------------------------------------------------------------
+-- Saved options
+---------------------------------------------------------------------------
+
+-- Everything the bot remembers between executions. One line per option: the
+-- registry handles validation, defaults and the restore hook, the UI only calls
+-- `Settings.read(key)` and `Settings.write(key, value)`.
+--
+-- Deliberately NOT saved: `Disable 3D render`. It is a per-session switch the
+-- user sets by hand.
+
+Settings.define("mode", {
+    kind = "number", min = 1, max = #Modes.list, round = 1, default = 1,
+})
+
+Settings.define("farmEnabled", {
+    kind = "bool", default = false,
+})
+
+Settings.define("instantMove", {
+    kind = "bool", default = Config.instantMove,
+    apply = function(value) Config.instantMove = value end,
+})
+
+Settings.define("tweenSpeed", {
+    kind = "number", min = 20, max = 400, round = 1, default = Config.tweenSpeed,
+    apply = function(value) Config.tweenSpeed = value end,
+})
+
+Settings.define("oreNames", {
+    kind = "names", default = "all",
+})
+
+Settings.define("sellEnabled", {
+    kind = "bool", default = Sell.enabled,
+    apply = function(value) Sell.enabled = value end,
+})
+
+Settings.define("sellNames", {
+    kind = "names", default = "none",
+})
+
+Settings.define("verboseLogs", {
+    kind = "bool", default = Log.enabled,
+    apply = function(value) Log.enabled = value end,
+})
+
+Settings.define("autoRejoin", {
+    kind = "bool", default = false,
+    apply = function(value) Rejoin.set(value) end,
+})
+
+Settings.define("autoloadSlot", {
+    kind = "number", min = 1, max = #AutoLoad.slots, round = 1, default = AutoLoad.slot,
+    apply = function(value) AutoLoad.slot = value end,
+})
+
+Settings.define("autoloadEnabled", {
+    kind = "bool", default = false,
+    apply = function(value) AutoLoad.set(value) end,
+})
+
+---------------------------------------------------------------------------
+-- Render cover
+---------------------------------------------------------------------------
+
+-- Black full-screen frame shown while 3D rendering is off. Max int DisplayOrder
+-- and ZIndex put it above every other ScreenGui. The frame is not Active so
+-- input still reaches the UI toggle underneath.
+local RenderCover = { gui = nil }
+
+function RenderCover.set(visible)
+    if visible then
+        if not RenderCover.gui then
+            local playerGui = Players.LocalPlayer:WaitForChild("PlayerGui")
+
+            local gui = Instance.new("ScreenGui")
+            gui.Name = "NM2_RenderCover"
+            gui.ResetOnSpawn = false
+            gui.IgnoreGuiInset = true
+            gui.DisplayOrder = 2147483647
+            gui.Parent = playerGui
+
+            local frame = Instance.new("Frame")
+            frame.Name = "Cover"
+            frame.Size = UDim2.fromScale(1, 1)
+            frame.BackgroundColor3 = Color3.new(0, 0, 0)
+            frame.BorderSizePixel = 0
+            frame.ZIndex = 2147483647
+            frame.Parent = gui
+
+            RenderCover.gui = gui
+        end
+
+        RenderCover.gui.Enabled = true
+    elseif RenderCover.gui then
+        RenderCover.gui.Enabled = false
+    end
+end
+
+---------------------------------------------------------------------------
 -- UI
 ---------------------------------------------------------------------------
 
@@ -2607,16 +3756,32 @@ function Ui.create()
     local library = Ui.load()
     local window = library.init("nazar mining 2", "v1.1.0", "NM2_MAIN")
 
-    local main, _ = window:AddTab("Main", "артем сын ебланки")
+    local savedMode = Settings.read("mode")
+    local savedEnabled = Settings.read("farmEnabled")
+    local savedInstant = Settings.read("instantMove")
+    local savedTween = Settings.read("tweenSpeed")
+    local savedVerbose = Settings.read("verboseLogs")
+    local savedRejoin = Settings.read("autoRejoin")
+    local savedSellEnabled = Settings.read("sellEnabled")
+    local savedAutoload = Settings.read("autoloadEnabled")
+    local savedAutoloadSlot = Settings.read("autoloadSlot")
+
+    -- `noRender` is a session switch: never restored. `enabled` is restored via
+    -- the Category dropdown: setSelected fires its callback, which enables the
+    -- mode when `enabled` is true.
+    local enabled = savedEnabled
+
+    local main, _ = window:AddTab("Main", "назар прайм v2")
 
     local modePanel = main:AddSeperator("Mode")
-    local enabled = false
 
     local modeDropdown
     modeDropdown = modePanel:AddDropdown({
         title = "Category",
         options = { "Farm", "Mushrooms" },
         callback = function(index)
+            Settings.write("mode", index)
+
             local mode = Modes.list[index]
             Modes.select(mode)
             if enabled and mode then
@@ -2627,8 +3792,11 @@ function Ui.create()
 
     modePanel:AddToggle({
         title = "Enabled",
+        checked = savedEnabled,
         callback = function(state)
             enabled = state
+            Settings.write("farmEnabled", state)
+
             if state then
                 Modes.enable(Modes.active)
             else
@@ -2643,35 +3811,32 @@ function Ui.create()
     movePanel:AddToggle({
         title = "Instant move",
         desc = "teleport instead of tween",
+        checked = savedInstant,
         callback = function(state)
-            Config.instantMove = state
+            Settings.write("instantMove", state)
         end,
     })
 
     movePanel:AddSlider({
         title = "Tween speed",
-        values = { min = 20, max = 400, default = Config.tweenSpeed, round = 1 },
+        values = { min = 20, max = 400, default = savedTween, round = 1 },
         callback = function(value)
-            Config.tweenSpeed = value
+            Settings.write("tweenSpeed", value)
         end,
     })
 
     local orePanel = main:AddSeperator("Farm ores")
     local names = Ores.names()
-    local defaults = {}
-
-    for index, name in ipairs(names) do
-        table.insert(defaults, index)
-    end
-
+    local savedOres = Settings.selection("oreNames", "ores", names)
     local selection = orePanel:AddSelection({
         title = "Ores",
         options = names,
-        default = defaults,
+        default = savedOres,
     })
 
-    selection.setSelected(defaults)
+    selection.setSelected(savedOres)
     Ores.bindSelection(selection, names)
+    Settings.bindSelection("oreNames", names, selection)
 
     local sellTab = window:AddTab("Auto sell", "sell resources when the backpack is full")
     local sellPanel = sellTab:AddSeperator("Auto sell")
@@ -2679,26 +3844,64 @@ function Ui.create()
     sellPanel:AddToggle({
         title = "Enabled",
         desc = "sell selected resources when the backpack is full",
+        checked = savedSellEnabled,
         callback = function(state)
-            Sell.enabled = state
+            Settings.write("sellEnabled", state)
             logPrint("autosell toggle " .. (state and "on" or "off"))
         end,
     })
 
     local sellNames = Sell.names()
+    local savedSell = Settings.selection("sellNames", "sellSelected", sellNames)
     local sellSelection = sellPanel:AddSelection({
         title = "Resources to sell",
         options = sellNames,
-        default = {},
+        default = savedSell,
     })
 
-    sellSelection.setSelected({})
+    sellSelection.setSelected(savedSell)
     Sell.bindSelection(sellSelection, sellNames)
+    Settings.bindSelection("sellNames", sellNames, sellSelection)
 
     sellPanel:AddButton({
         title = "Sell now",
         callback = function()
             logPrint("manual sell total " .. Sell.manual())
+        end,
+    })
+
+    local rejoinTab = window:AddTab("Auto rejoin", "come back after a disconnect")
+    local rejoinPanel = rejoinTab:AddSeperator("Session")
+    rejoinPanel:AddToggle({
+        title = "Auto rejoin",
+        desc = "teleport back after the disconnect prompt",
+        checked = savedRejoin,
+        callback = function(state)
+            Settings.write("autoRejoin", state)
+            logPrint("auto rejoin " .. (state and "on" or "off"))
+        end,
+    })
+
+    local loadTab = window:AddTab("Auto load", "load the chosen save slot without clicking")
+    local loadPanel = loadTab:AddSeperator("Auto load")
+
+    local slotDropdown
+    slotDropdown = loadPanel:AddDropdown({
+        title = "Save slot",
+        desc = "argument of ReplicatedStorage.LoadGameEvent",
+        options = AutoLoad.slots,
+        callback = function(index)
+            Settings.write("autoloadSlot", index)
+        end,
+    })
+
+    loadPanel:AddToggle({
+        title = "Autoload",
+        desc = "fire LoadGameEvent with the slot until the save is loaded",
+        checked = savedAutoload,
+        callback = function(state)
+            Settings.write("autoloadEnabled", state)
+            logPrint("autoload " .. (state and "on" or "off"))
         end,
     })
 
@@ -2714,8 +3917,23 @@ function Ui.create()
     logPanel:AddToggle({
         title = "Verbose logs",
         desc = "print ore reasons and mining steps",
+        checked = savedVerbose,
         callback = function(state)
             Log.enabled = state
+            Settings.write("verboseLogs", state)
+        end,
+    })
+
+    logPanel:AddToggle({
+        title = "Disable 3D render",
+        desc = "RunService:Set3dRenderingEnabled(false)",
+        checked = false,
+        callback = function(state)
+            -- Per-session switch: deliberately not saved.
+            pcall(function()
+                RunService:Set3dRenderingEnabled(not state)
+            end)
+            RenderCover.set(state)
         end,
     })
 
@@ -2726,7 +3944,19 @@ function Ui.create()
         end,
     })
 
+    -- uilib Selection has no change callback, so every registered widget is
+    -- polled. Separate loop from the stats readout: a failing stat must never stop
+    -- the options from being saved. `Settings.persist` skips unchanged JSON.
     task.spawn(function()
+        while true do
+            task.wait(0.5)
+            pcall(Settings.flushSelections)
+        end
+    end)
+
+    task.spawn(function()
+        local failures = 0
+
         while true do
             task.wait(2)
 
@@ -2738,13 +3968,21 @@ function Ui.create()
                 stateInput.setText(stats.state)
             end)
 
-            if not ok then
-                break
+            -- Cosmetic only: keep retrying a few times, then stop spamming.
+            if ok then
+                failures = 0
+            else
+                failures = failures + 1
+
+                if failures >= 5 then
+                    break
+                end
             end
         end
     end)
 
-    modeDropdown.setSelected(1)
+    modeDropdown.setSelected(savedMode)
+    slotDropdown.setSelected(savedAutoloadSlot)
 
     return window
 end
@@ -2848,6 +4086,11 @@ end
 ---------------------------------------------------------------------------
 -- Bootstrap
 ---------------------------------------------------------------------------
+
+-- Apply every saved option (movement method, tween speed, logs, auto sell, auto
+-- rejoin, auto load) before the UI is built. Options with an `apply` hook live in the
+-- registry, so this is the only restore call in the script.
+Settings.restore()
 
 LogView.create()
 

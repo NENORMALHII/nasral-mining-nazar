@@ -32,6 +32,7 @@ docs/game/
 | `fuel-data.lua` | `ReplicatedStorage.Scripts.FuelData` |
 | `inventory-backpack.lua` | `ReplicatedStorage.Modules.Inventory.Backpack` (Delta) |
 | `resourceslist.lua` | `ReplicatedStorage.Modules.Resources` |
+| `intro-script.lua` | `PlayerGui.Intro.Intro` (Delta) |
 
 ## protocol/
 
@@ -47,6 +48,8 @@ docs/game/
 | `sell.md` | `SellResourceFunction:InvokeServer(resource, count)` and resource counts |
 | `forge-remotes.md` | `ForgeUpdateEvent` actions |
 | `getinventory.lua` | `InventoriesClient.GetInventory()` dump, source of resource counts |
+| `settings.md` | saved UI options (`nm2/settings.json`) and render toggle |
+| `autoload.md` | `LoadGameEvent(slot)` save-slot loading, `FullyLoaded`/`Profile` assumptions |
 
 ## data/
 
