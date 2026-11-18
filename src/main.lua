@@ -40,6 +40,7 @@ local Config = {
 
     rejoinDelay = 2,
     rejoinAttachTries = 60,
+    antiAfkInterval = 240,
 
     autoloadEvent = "LoadGameEvent",
     autoloadLoadedAttr = "FullyLoaded",
@@ -4672,6 +4673,120 @@ function AutoLoad.set(enabled)
 end
 
 ---------------------------------------------------------------------------
+-- Anti-AFK
+---------------------------------------------------------------------------
+--
+-- Roblox disconnects the client after 20 minutes without user input; bot
+-- movement does not count, only real input events. `Player.Idled` fires when the
+-- client notices it, and a virtual click resets the idle timer. The timer also
+-- presses every `Config.antiAfkInterval` seconds so the client never reaches the
+-- limit at all.
+--
+-- This only affects the local client input stream. A game-side AFK check that
+-- counts replicated actions cannot be fooled from the client.
+
+local AntiAfk = {
+    bound = false,
+    presses = 0,
+    last = 0,
+}
+
+local function virtualClick()
+    local manager = game:FindService("VirtualUser")
+
+    if manager then
+        local ok = pcall(function()
+            manager:CaptureController()
+            manager:ClickButton2(Vector2.zero)
+        end)
+
+        if ok then
+            return true
+        end
+    end
+
+    -- Hidden service available in Studio and most executors.
+    local ok = pcall(function()
+        local input = game:GetService("VirtualInputManager")
+        input:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
+        task.wait(0.05)
+        input:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+    end)
+
+    if ok then
+        return true
+    end
+
+    -- Executor keyboard helpers.
+    if type(keypress) == "function" then
+        local pressed = pcall(keypress, 0x20)
+
+        if pressed then
+            task.wait(0.05)
+
+            if type(keyrelease) == "function" then
+                pcall(keyrelease, 0x20)
+            end
+
+            return true
+        end
+    end
+
+    return false
+end
+
+function AntiAfk.press(reason)
+    local now = os.clock()
+
+    if now - AntiAfk.last < 1 then
+        return false
+    end
+
+    AntiAfk.last = now
+    local pressed = virtualClick()
+
+    if not pressed then
+        AntiAfk.warned = AntiAfk.warned or false
+
+        if not AntiAfk.warned then
+            AntiAfk.warned = true
+            logWarn("anti-afk: no virtual input available, idle kick still possible")
+        end
+
+        return false
+    end
+
+    AntiAfk.presses = AntiAfk.presses + 1
+
+    if AntiAfk.presses == 1 or AntiAfk.presses % 10 == 0 then
+        logPrint(("anti-afk: input %d (%s)"):format(AntiAfk.presses, tostring(reason)))
+    end
+
+    return true
+end
+
+function AntiAfk.bind()
+    if AntiAfk.bound then
+        return
+    end
+
+    AntiAfk.bound = true
+
+    pcall(function()
+        Players.LocalPlayer.Idled:Connect(function()
+            AntiAfk.press("idled")
+        end)
+    end)
+
+    task.spawn(function()
+        while true do
+            task.wait(Config.antiAfkInterval)
+            AntiAfk.press("timer")
+        end
+    end)
+end
+
+---------------------------------------------------------------------------
 -- Saved options
 ---------------------------------------------------------------------------
 
@@ -5469,6 +5584,7 @@ end
 Settings.restore()
 
 Forge.bind()
+AntiAfk.bind()
 
 LogView.create()
 

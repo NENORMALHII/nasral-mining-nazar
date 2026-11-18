@@ -52,6 +52,7 @@ docs/game/
 | `forge-automation.md` | surface-trip sequence: take result, add input, add fuel, then sell |
 | `getinventory.lua` | `InventoriesClient.GetInventory()` dump, source of resource counts |
 | `settings.md` | saved UI options (`nm2/settings.json`) and render toggle |
+| `anti-afk.md` | `Player.Idled` and virtual-input reset for the 20-minute kick |
 | `autoload.md` | `LoadGameEvent(slot)` save-slot loading, `FullyLoaded`/`Profile` assumptions |
 
 ## data/
