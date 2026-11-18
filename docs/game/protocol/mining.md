@@ -92,11 +92,15 @@ There is no seed hashing and no depth heuristic. `Ores.nearest(position, radius)
 - scans only the `±ceil(radius/7)` cube around the player with
   `mine:FindFirstChild(vec3ToString(cell))`, instead of iterating every child of
   `Workspace.Mine`;
-- skips blocks that are not selected, invalid (world, `Dug`, `MinePosition`) or out of range;
-- collects the cheap candidates, sorts them by `BasePrice * 1000 - distance`, then calls
-  the expensive `Mining.why` lazily only until one candidate passes (liquid checks no
-  longer waste a full tick per rejected ore);
-- `Ores.ignore(block)` skips a failed block for 5 s.
+- keeps the sorted candidate list in `scanCache` for `Config.oreScanTtl = 1` s
+  while the player stays in the same cell. `Ores.nearest` returns the next entry
+  through a cursor (`scanCandidates`), so breaking one ore does not trigger
+  another cube scan; the cursor skips blocks that are gone, no longer selected,
+  out of range, ignored or liquid-blocked;
+- `Ores.ignore(block)` only records a 5 s ignore timer and keeps the list, so the
+  next best candidate is served from the cache;
+- the list is rebuilt only when the cell changes, the TTL expires or the cursor
+  is exhausted.
 
 Radius is `Mining.reach() = Pick.MaxDistance - 4` (21 studs).
 
@@ -250,15 +254,18 @@ Wait time (bot formula, updated for server tolerance):
 
 ```lua
 mineTime   = BaseMineTime * (100 - ToolSpeedModifier) / 100 * MineTimeModifier
-preSwing   = random(0.03 .. 0.10)  -- before BlockEvent (human reaction)
-swing      = random(0.01 .. 0.05)  -- after BlockEvent (animation wind-up)
-jitter     = random(0.03 .. 0.12)  -- per-block variance
-safety     = 0.08 + ping * 1.0     -- ping-dependent buffer
+preSwing   = random(0.02 .. 0.06)  -- before BlockEvent (human reaction)
+jitter     = random(0.02 .. 0.07)  -- per-block variance
+penalty    = 0 .. 0.5              -- +0.12 per reject, -0.02 every 3 good breaks
+safety     = 0.05 + ping * 0.5 + penalty
 ping       = GetNetworkPing()      -- RTT, rolling 8-sample min
 waitTime   = mineTime + safety + jitter
 ```
 
-Total time from `BlockEvent` to `BlockMinedEvent`: `preSwing + swing + waitTime`.
+Total time from `BlockEvent` to `BlockMinedEvent`: `waitTime`. Everything the
+bot waits after `BlockEvent` counts against the server's mine time, so there is
+no extra post-event delay: the human variance lives in `preSwing` before the
+claim.
 
 Characteristic acquisition order:
 
@@ -274,13 +281,14 @@ Why rejections happen and how the new algorithm addresses them:
 | Cause | Fix |
 |---|---|
 | `BlockMinedEvent` too early after `BlockEvent` | `waitTime = mineTime + safety + jitter` always exceeds server-expected time |
-| Network lag spikes | `safety` scales with rolling min ping (`0.08 + ping * 1.0`) |
-| Predictable timing | `preSwing` + `swing` + `jitter` add human-like micro-delays |
+| Network lag spikes | `safety` scales with rolling min ping (`0.05 + ping * 0.5`) |
+| Predictable timing | `preSwing` before the claim + `jitter` add human-like micro-delays |
+| Wrong margin for the actual server | `Mining.penalty` grows on a reject (+0.12), decays after 3 good breaks (-0.02), so the bot self-tunes instead of paying a fixed worst-case buffer |
 | Stale `BaseMineTime` from table | Server value waits on equip, takes priority over table |
 | Stale `ToolSpeedModifier` | Re-read from player attributes every mine |
-| Cancel sent too late | `mineRejectGrace` increased to 0.8 s, poll interval 0.02 s |
+| Cancel sent too late | `mineRejectGrace = 0.6` s, poll interval 0.02 s |
 
-The client fires `BlockEvent`, waits `preSwing + swing + waitTime`, then fires `BlockMinedEvent`.
+The client fires `BlockEvent`, waits `waitTime`, then fires `BlockMinedEvent`.
 Server validates that elapsed time >= expected `mineTime` (with its own tolerance).
 If the bot finishes too early, the server rejects with "server rejected".
 
@@ -338,7 +346,8 @@ the player who broke the block.
 `Loot.collectAll` only picks drops where `DropScript.Player.Value` matches `LocalPlayer`
 (instance, name, user id or string). Drops are cached in `Loot.pending` by `Loot.sync` and stay
 there until picked. The character teleports to the drop, waits for the touch, and repeats for the
-next drop; `lootSpawnWait` (0.3 s) after a block breaks gives the drop time to spawn.
+next drop. Farm does not sleep after a break: the next tick starts with `Loot.sync(true)`, so the
+drop is collected as soon as it replicates.
 
 ## Cross-check: Delta decompile
 
@@ -405,12 +414,16 @@ is received, waits up to 6 heartbeats, and logs
 
 - `Surface.scan` collects depth candidates once, sorts by depth/distance and runs the 8-ray
   star check lazily only until the first valid candidate.
-- `Ores.nearest` collects candidates cheaply, sorts by score and calls `Mining.why` only until
-  the first candidate passes, so liquid-blocked ore no longer wastes a tick and an ignore slot.
-- `Mining.maxDistance()` is re-read per equip; `typeOf` is a plain attribute read.
+- `Ores.nearest` sorts the cube once and keeps the list for `oreScanTtl`; a cursor serves the
+  next candidate, `Mining.why` is only called until one passes, and `Ores.ignore` no longer
+  throws the list away.
+- `Mining.detect` rebuilds the tool signature at most once per second; `Mining.maxDistance()` is
+  re-read per equip; `typeOf` is a plain attribute read.
 - `Blocks.liquidSet` is one pass over the mine per world; after that every liquid question is a
   hash lookup. `Plan` runs at most once per stuck situation, not per tick; `Plan.clear` (3
   lookups) is the only per-tick cost on the normal dig path.
+- Per-block wall clock = `preSwing` + `waitTime` + `loopDelay`, with no post-break loot sleep:
+  the old fixed 0.3 s wait per block was the largest artificial delay.
 - StreamingEnabled caveat: if `workspace.StreamingEnabled` is true, a missing client block does
   not mean the block is missing on the server. `Surface.depth` and `Plan` would treat unloaded
   rock as air and dig into it. The bot assumes streaming is off.

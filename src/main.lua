@@ -11,7 +11,7 @@ local HttpService = game:GetService("HttpService")
 ---------------------------------------------------------------------------
 
 local Config = {
-    loopDelay = 0.08,
+    loopDelay = 0.05,
 
     instantMove = false,
     tweenSpeed = 120,
@@ -19,15 +19,17 @@ local Config = {
 
     mineWaitForServer = 1.5,
 
-    mineSafetyBase = 0.08,
-    mineSafetyPingMult = 1.0,
-    mineJitterMin = 0.03,
-    mineJitterMax = 0.12,
-    minePreSwingMin = 0.03,
-    minePreSwingMax = 0.10,
-    mineSwingMin = 0.01,
-    mineSwingMax = 0.05,
-    mineRejectGrace = 0.8,
+    mineSafetyBase = 0.05,
+    mineSafetyPingMult = 0.5,
+    mineJitterMin = 0.02,
+    mineJitterMax = 0.07,
+    minePreSwingMin = 0.02,
+    minePreSwingMax = 0.06,
+    minePenaltyStep = 0.12,
+    minePenaltyMax = 0.5,
+    minePenaltyDecay = 0.02,
+    minePenaltyDecayEvery = 3,
+    mineRejectGrace = 0.6,
 
     mushroomDelay = 0.35,
     mushroomIgnore = 5,
@@ -72,8 +74,8 @@ local Config = {
     moveSettleEpsilon = 0.2,
 
     lootDwell = 0.12,
-    lootSpawnWait = 0.3,
     lootSyncInterval = 0.4,
+    oreScanTtl = 1,
 
     sellRemote = "SellResourceFunction",
     sellCapacity = 200,
@@ -1266,6 +1268,8 @@ end
 local Mining = {
     baseMineTime = Config.defaultMineTime,
     rejects = 0,
+    successes = 0,
+    penalty = 0,
     resetRequested = false,
 }
 
@@ -1451,10 +1455,20 @@ function Mining.detect(pickaxe)
         return nil
     end
 
-    local sig = signature(pickaxe)
     local cached = detectCache[pickaxe]
+    local now = os.clock()
+
+    -- Tool attribute upgrades land mid-session, but not every block: rebuilding
+    -- the signature on every mine is wasted work. One check per second is enough
+    -- to notice a pickaxe change before it matters.
+    if cached and now - (cached.checkedAt or 0) < 1 then
+        return cached
+    end
+
+    local sig = signature(pickaxe)
 
     if cached and cached.signature == sig then
+        cached.checkedAt = now
         return cached
     end
 
@@ -1463,6 +1477,7 @@ function Mining.detect(pickaxe)
 
     local result = {
         signature = sig,
+        checkedAt = now,
         pickaxeInfo = info,
         pickaxeName = pickaxeName,
         pickaxeSource = pickaxeSource,
@@ -1626,7 +1641,12 @@ function Mining.waitTime(block)
     local baseMine = Mining.mineTime(block)
     local jitter = math.random() * (Config.mineJitterMax - Config.mineJitterMin) + Config.mineJitterMin
 
-    local safety = Config.mineSafetyBase + ping * Config.mineSafetyPingMult
+    -- Adaptive buffer: the base margin is small, `Mining.penalty` grows only
+    -- after a server rejection and decays after successful breaks. A rejected
+    -- block costs `mineRejectGrace` plus a retry, so one reject is more
+    -- expensive than the margin lost across many fast breaks.
+    local safety = Config.mineSafetyBase + ping * Config.mineSafetyPingMult + Mining.penalty
+
     return baseMine + safety + jitter
 end
 
@@ -1634,8 +1654,21 @@ function Mining.preSwingDelay()
     return math.random() * (Config.minePreSwingMax - Config.minePreSwingMin) + Config.minePreSwingMin
 end
 
-function Mining.swingDelay()
-    return math.random() * (Config.mineSwingMax - Config.mineSwingMin) + Config.mineSwingMin
+-- Server accepted the break. Reset the streak and shrink the extra margin.
+function Mining.confirm()
+    Mining.rejects = 0
+    Mining.successes = Mining.successes + 1
+
+    if Mining.penalty > 0 and Mining.successes % Config.minePenaltyDecayEvery == 0 then
+        Mining.penalty = math.max(0, Mining.penalty - Config.minePenaltyDecay)
+    end
+end
+
+-- Server rejected the break (block still there after BlockMinedEvent). Grow the
+-- margin so the retry cannot undershoot the same way again.
+function Mining.punish()
+    Mining.successes = 0
+    Mining.penalty = math.min(Config.minePenaltyMax, Mining.penalty + Config.minePenaltyStep)
 end
 
 function Mining.maxDistance()
@@ -1735,15 +1768,14 @@ function Mining.mine(character, block)
 
     local waitTime = Mining.waitTime(block)
     local preSwing = Mining.preSwingDelay()
-    local swing = Mining.swingDelay()
 
-    logPrint(("mine %s (%s) base=%.2f wait=%.2f pre=%.2f swing=%.2f"):format(
+    logPrint(("mine %s (%s) base=%.2f wait=%.2f pre=%.2f penalty=%.2f"):format(
         block.Name,
         tostring(typeOf(block)),
         Mining.baseMineTime,
         waitTime,
         preSwing,
-        swing
+        Mining.penalty
     ))
 
     task.wait(preSwing)
@@ -1754,11 +1786,13 @@ function Mining.mine(character, block)
 
     blockEvent:FireServer(block.Name, { dug = true })
 
-    task.wait(swing)
+    -- Everything after BlockEvent counts against the server's mine time, so the
+    -- old post-event "swing" delay was pure dead time and is gone: the human
+    -- variance lives in `preSwing` before the claim instead.
     task.wait(waitTime)
 
     if not block.Parent then
-        Mining.rejects = 0
+        Mining.confirm()
         return true
     end
 
@@ -1772,13 +1806,15 @@ function Mining.mine(character, block)
     if block.Parent then
         blockEvent:FireServer(vec3ToString(position), { dug = false })
         Mining.rejects += 1
+        Mining.punish()
 
-        logWarn(("server rejected %s type=%s base=%.2f wait=%.3f streak=%d"):format(
+        logWarn(("server rejected %s type=%s base=%.2f wait=%.3f streak=%d penalty=%.2f"):format(
             block.Name,
             tostring(typeOf(block)),
             Mining.baseMineTime,
             waitTime,
-            Mining.rejects
+            Mining.rejects,
+            Mining.penalty
         ))
 
         if Mining.rejects >= Config.maxRejects then
@@ -1789,7 +1825,7 @@ function Mining.mine(character, block)
         return false
     end
 
-    Mining.rejects = 0
+    Mining.confirm()
     return true
 end
 
@@ -1889,17 +1925,60 @@ function Ores.isSelected(name)
     return set[name] == true
 end
 
-local scanCache = {}
+local scanCache = {
+    time = 0,
+    cell = nil,
+    candidates = nil,
+    index = 1,
+}
 
--- Scans only the block cells around the player instead of every child of Workspace.Mine.
+-- Next usable entry of the cached candidate list: block still exists, still
+-- selected, still in range, still ignored-free and still passes the expensive
+-- `Mining.why`. A cached list is not invalidated by a broken block: the cursor
+-- simply walks past it, so the common "one ore after another" case does no cube
+-- scan at all.
+local function scanCandidates(position, limit, selected)
+    local candidates = scanCache.candidates
+
+    if not candidates then
+        return nil
+    end
+
+    local now = os.clock()
+
+    while scanCache.index <= #candidates do
+        local block = candidates[scanCache.index]
+        scanCache.index = scanCache.index + 1
+
+        if block.Parent then
+            local name = typeOf(block)
+            local untilIgnore = ignored[block]
+
+            if name
+                and (not selected or selected[name])
+                and (not untilIgnore or untilIgnore <= now)
+                and (block.Position - position).Magnitude <= limit
+                and Mining.why(block) == nil then
+                return block
+            end
+        end
+    end
+
+    return nil
+end
+
+-- Scans only the block cells around the player instead of every child of
+-- Workspace.Mine. The sorted list is kept for `Config.oreScanTtl` while the
+-- player stays in the same cell, so target acquisition after a break is a
+-- cursor step, not another 343-cell pass.
 function Ores.nearest(position, radius)
     local limit = radius or Config.oreRange
     local center = Blocks.toBlock(position)
     local now = os.clock()
+    local selected = Ores.selectedSet()
 
-    if scanCache.cell == center and now - scanCache.time < 0.3
-        and (scanCache.best == nil or scanCache.best.Parent) then
-        return scanCache.best
+    if scanCache.cell == center and now - scanCache.time <= Config.oreScanTtl then
+        return scanCandidates(position, limit, selected)
     end
 
     local mine = workspace:FindFirstChild(Config.mineName)
@@ -1908,8 +1987,7 @@ function Ores.nearest(position, radius)
     end
 
     local reach = math.ceil(limit / 7)
-    local selected = Ores.selectedSet()
-    local candidates = {}
+    local found = {}
 
     for dx = -reach, reach do
         for dy = -reach, reach do
@@ -1924,8 +2002,8 @@ function Ores.nearest(position, radius)
                     if distance <= limit and (not untilIgnore or untilIgnore <= now) then
                         local name = typeOf(block)
 
-                        if name and (not selected or selected[name]) and Mining.valid(block) == nil then
-                            table.insert(candidates, {
+                        if name and (not selected or selected[name]) then
+                            table.insert(found, {
                                 block = block,
                                 score = Ores.price(name) * 1000 - distance,
                             })
@@ -1936,38 +2014,38 @@ function Ores.nearest(position, radius)
         end
     end
 
-    table.sort(candidates, function(a, b)
+    table.sort(found, function(a, b)
         return a.score > b.score
     end)
 
-    -- Mining.valid is cheap but does not know about liquids: ask Mining.why
-    -- lazily, and only for the sorted candidates until one really passes.
-    local best
+    local candidates = {}
 
-    for _, candidate in ipairs(candidates) do
-        if candidate.block.Parent and Mining.why(candidate.block) == nil then
-            best = candidate.block
-            break
-        end
+    for _, candidate in ipairs(found) do
+        table.insert(candidates, candidate.block)
     end
 
     scanCache.time = now
     scanCache.cell = center
-    scanCache.best = best
-    return best
+    scanCache.candidates = candidates
+    scanCache.index = 1
+
+    -- Mining.valid is cheap but does not know about liquids: ask Mining.why
+    -- lazily, and only until one candidate really passes.
+    return scanCandidates(position, limit, selected)
 end
 
+-- Do not throw away the sorted list: the ignored block is skipped by
+-- `scanCandidates`, and the next-best ore is already in the cache.
 function Ores.ignore(block)
     ignored[block] = os.clock() + 5
-    scanCache.time = 0
-    scanCache.best = nil
 end
 
--- Drop the cached scan cell/target and all temporary ignore timers.
+-- Drop the cached scan cell/candidates and all temporary ignore timers.
 function Ores.clearCache()
     scanCache.time = 0
     scanCache.cell = nil
-    scanCache.best = nil
+    scanCache.candidates = nil
+    scanCache.index = 1
     ignored = {}
 end
 
@@ -3677,7 +3755,9 @@ local FarmMode = Mode.new("Farm", function(self)
             return false
         end
 
-        task.wait(Config.lootSpawnWait)
+        -- No post-break sleep: the next tick starts with `Loot.sync(true)` and
+        -- picks up the drop as soon as it replicates, so waiting here only
+        -- delayed the next block.
         return true
     end
 
