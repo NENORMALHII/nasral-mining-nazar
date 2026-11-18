@@ -66,7 +66,10 @@ stable across sessions:
 | `tweenSpeed` | number (20..400) | Tween speed slider | `Config.tweenSpeed` |
 | `oreNames` | names (`all`) | Farm ores selection | — |
 | `sellEnabled` | bool | Auto sell Enabled | `Sell.enabled` |
-| `sellNames` | names (`none`) | Resources to sell selection | — |
+| `sellNames` | names (`none`) | Resources to sell selection, three UI sections (Ores, Mushrooms, Smelted) | — |
+| `forgeEnabled` | bool | Forge → Service on surface | `Forge.enabled` |
+| `forgeOres` | names (`none`) | Forge → Ores to smelt selection | — |
+| `forgeFuels` | names (`none`) | Forge → Fuel selection | — |
 | `verboseLogs` | bool | Verbose logs | `Log.enabled` |
 | `autoRejoin` | bool | Auto rejoin → Session → Auto rejoin | `Rejoin.set` |
 | `autoloadEnabled` | bool | Auto load → Autoload | `AutoLoad.set` |

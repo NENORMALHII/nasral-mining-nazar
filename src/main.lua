@@ -84,6 +84,16 @@ local Config = {
     sellHoldBefore = 2,
     sellHoldAfter = 1,
 
+    -- Forge (docs/game/protocol/forge.md). Server checks are unverified: the
+    -- client protocol and the ore table are confirmed, nothing else.
+    forgeName = "Forge",
+    forgeUpdateRemote = "ForgeUpdateEvent",
+    forgeToggleRemote = "ToggleForgeEvent",
+    forgeOpenWait = 1,
+    forgeStateWait = 1,
+    forgeActionWait = 0.35,
+    forgeMaxFuelUnits = 10,
+
     blockEvent = "BlockEvent",
     minedEvent = "BlockMinedEvent",
     pickaxeRemote = "UpdatePickaxe",
@@ -2080,6 +2090,490 @@ function Inventory.usage()
 end
 
 ---------------------------------------------------------------------------
+-- Forge (workspace.Forge)
+---------------------------------------------------------------------------
+--
+-- Surface sequence: take the melted result, put one selected ore into the
+-- input, add enough selected fuel for that ore, then the caller sells.
+-- Protocol: docs/game/protocol/forge.md. Only the client protocol and the ore
+-- table are confirmed; every server-side check is unknown, so each action is a
+-- single remote call with a state wait, never a blind loop.
+
+local Forge = {
+    enabled = false,
+    bound = false,
+    state = nil,
+    source = nil,
+    opened = false,
+    openedByService = false,
+    inputSelection = nil,
+    inputList = nil,
+    fuelSelection = nil,
+    fuelList = nil,
+}
+
+-- Fallbacks when ForgeHelper / FuelData cannot be required. Values from
+-- docs/game/protocol/forge.md.
+Forge.oreList = {
+    "Copper Ore", "Iron Ore", "Silver Ore", "Gold Ore",
+    "Promethium Ore", "Mithril Ore", "Malachite Ore", "Azurite Ore",
+}
+
+Forge.fuelFallback = { "Coal", "Log", "Plank", "Oil Barrel", "Lava Barrel", "Ignis" }
+
+Forge.smeltFallback = {
+    ["Copper Ore"] = 40,
+    ["Iron Ore"] = 60,
+    ["Silver Ore"] = 40,
+    ["Gold Ore"] = 50,
+    ["Promethium Ore"] = 60,
+    ["Mithril Ore"] = 80,
+    ["Malachite Ore"] = 80,
+    ["Azurite Ore"] = 80,
+}
+
+Forge.burnFallback = {
+    Coal = 70,
+    Log = 30,
+    Plank = 30,
+    ["Oil Barrel"] = 100,
+    ["Lava Barrel"] = 130,
+    Ignis = 110,
+}
+
+local function forgePart()
+    return workspace:FindFirstChild(Config.forgeName)
+end
+
+local function requireChild(parent, name)
+    local module = parent and parent:FindFirstChild(name)
+
+    if not module then
+        return nil
+    end
+
+    local ok, value = pcall(require, module)
+    if ok and type(value) == "table" then
+        return value
+    end
+
+    return nil
+end
+
+function Forge.helperModule()
+    if not Forge.helper then
+        Forge.helper = requireChild(forgePart(), "ForgeHelper")
+    end
+
+    return Forge.helper
+end
+
+function Forge.fuelModule()
+    if not Forge.fuelData then
+        local scripts = ReplicatedStorage:FindFirstChild("Scripts")
+        Forge.fuelData = requireChild(scripts, "FuelData")
+    end
+
+    return Forge.fuelData
+end
+
+function Forge.oreNames()
+    return Forge.oreList
+end
+
+function Forge.fuelNames()
+    if Forge.fuelNamesCache then
+        return Forge.fuelNamesCache
+    end
+
+    local names = {}
+    local data = Forge.fuelModule()
+
+    if data and type(data.GetAllFuels) == "function" then
+        local ok, list = pcall(data.GetAllFuels, data)
+
+        if ok and type(list) == "table" then
+            for _, name in ipairs(list) do
+                table.insert(names, name)
+            end
+        end
+    end
+
+    if #names == 0 then
+        for _, name in ipairs(Forge.fuelFallback) do
+            table.insert(names, name)
+        end
+    end
+
+    Forge.fuelNamesCache = names
+    return names
+end
+
+function Forge.smeltTime(name)
+    local helper = Forge.helperModule()
+
+    if helper and type(helper.GetOreData) == "function" then
+        local ok, data = pcall(helper.GetOreData, helper, name)
+
+        if ok and type(data) == "table" and type(data.SmeltTime) == "number" then
+            return data.SmeltTime
+        end
+    end
+
+    return Forge.smeltFallback[name] or 0
+end
+
+function Forge.result(name)
+    local helper = Forge.helperModule()
+
+    if helper and type(helper.GetOreData) == "function" then
+        local ok, data = pcall(helper.GetOreData, helper, name)
+
+        if ok and type(data) == "table" and type(data.Result) == "string" then
+            return data.Result
+        end
+    end
+
+    -- Fallback for the documented ore table: `Copper Ore` -> `Copper Bar`.
+    return (name:gsub("Ore$", "Bar"))
+end
+
+function Forge.burnTime(name)
+    local data = Forge.fuelModule()
+
+    if data and type(data.GetFuelData) == "function" then
+        local ok, fuel = pcall(data.GetFuelData, data, name)
+
+        if ok and type(fuel) == "table" and type(fuel.BurnTime) == "number" then
+            return fuel.BurnTime
+        end
+    end
+
+    return Forge.burnFallback[name] or 30
+end
+
+function Forge.bindInput(selection, names)
+    Forge.inputSelection = selection
+    Forge.inputList = names
+end
+
+function Forge.bindFuel(selection, names)
+    Forge.fuelSelection = selection
+    Forge.fuelList = names
+end
+
+function Forge.selectedNames(selection, list)
+    local names = {}
+
+    if not selection then
+        return names
+    end
+
+    for _, index in ipairs(selection.getSelected() or {}) do
+        local name = list[index]
+
+        if name then
+            table.insert(names, name)
+        end
+    end
+
+    return names
+end
+
+-- One listener for the state the server broadcasts on every change, plus the
+-- open notification the forge GUI receives.
+function Forge.bind()
+    if Forge.bound then
+        return
+    end
+
+    Forge.bound = true
+
+    task.spawn(function()
+        local part = workspace:WaitForChild(Config.forgeName, 30)
+
+        if not part then
+            logWarn("forge: workspace." .. Config.forgeName .. " not found")
+            return
+        end
+
+        local update = part:WaitForChild(Config.forgeUpdateRemote, 30)
+
+        if update then
+            update.OnClientEvent:Connect(function(payload)
+                if type(payload) ~= "table" then
+                    return
+                end
+
+                if type(payload.PlayerForgeData) == "table" then
+                    Forge.state = payload.PlayerForgeData
+                end
+
+                if type(payload.SourceData) == "table" then
+                    Forge.source = payload.SourceData
+                end
+            end)
+        else
+            logWarn("forge: " .. Config.forgeUpdateRemote .. " not found")
+        end
+
+        local toggle = part:WaitForChild(Config.forgeToggleRemote, 30)
+
+        if toggle then
+            toggle.OnClientEvent:Connect(function()
+                Forge.opened = true
+            end)
+        end
+    end)
+end
+
+function Forge.inputAmount()
+    local input = Forge.state and Forge.state.Input
+
+    return (input and input.Amount) or 0, (input and input.Type) or ""
+end
+
+function Forge.outputAmount()
+    local output = Forge.state and Forge.state.Output
+
+    return (output and output.Amount) or 0
+end
+
+function Forge.fuelRemaining()
+    local fuel = Forge.source and Forge.source.Fuel
+
+    return (fuel and fuel.BurnTimeRemaining) or 0
+end
+
+function Forge.waitState(predicate, timeout)
+    local deadline = os.clock() + (timeout or Config.forgeStateWait)
+
+    while os.clock() < deadline do
+        local ok, done = pcall(predicate)
+
+        if ok and done then
+            return true
+        end
+
+        task.wait(0.05)
+    end
+
+    return false
+end
+
+-- Fires `Interact.InteractEvent` like the surface prompt does, and waits for the
+-- server to open the forge. A missing answer is not fatal: the update remotes are
+-- fired anyway and the server decides.
+function Forge.enter(part)
+    if Forge.opened then
+        return false
+    end
+
+    local config = part:FindFirstChild("Interact")
+    local remote = config and config:FindFirstChild("InteractEvent")
+
+    if not remote then
+        logPrint("forge: Interact.InteractEvent not found, firing remotes directly")
+        return false
+    end
+
+    local ok, err = pcall(function()
+        remote:FireServer()
+    end)
+
+    if not ok then
+        logWarn("forge: interact failed: " .. tostring(err))
+        return false
+    end
+
+    if Forge.waitState(function()
+        return Forge.opened
+    end, Config.forgeOpenWait) then
+        Forge.openedByService = true
+        return true
+    end
+
+    logWarn("forge: no open event after interact, continuing")
+    return false
+end
+
+-- Same local cleanup the real CloseButton handler does, so the forge GUI does
+-- not stay on screen after an automated visit.
+function Forge.leave(part)
+    if not Forge.openedByService then
+        return
+    end
+
+    local toggle = part:FindFirstChild(Config.forgeToggleRemote)
+
+    if toggle then
+        pcall(function()
+            toggle:FireServer()
+        end)
+    end
+
+    pcall(function()
+        local player = Players.LocalPlayer
+        local playerGui = player:FindFirstChild("PlayerGui")
+        local gui = playerGui and playerGui:FindFirstChild(Config.forgeName)
+        local container = gui and gui:FindFirstChild("Container")
+
+        if container then
+            container.Visible = false
+        end
+
+        player:SetAttribute("BackpackVisible", true)
+    end)
+
+    Forge.opened = false
+    Forge.openedByService = false
+end
+
+function Forge.takeResult(update)
+    local amount = Forge.outputAmount()
+    local used, capacity = Inventory.usage()
+
+    -- The real client refuses TakeResult when the inventory is full.
+    if used and capacity and used >= capacity then
+        logWarn("forge: inventory full, result not taken")
+        return 0
+    end
+
+    update:FireServer("TakeResult")
+
+    if amount <= 0 then
+        return 0
+    end
+
+    Forge.waitState(function()
+        return Forge.outputAmount() ~= amount
+    end)
+
+    return amount
+end
+
+-- One ore type per visit: the forge input holds a single type while it melts.
+-- Returns the amount in the input and its name, so fuel can be sized for it.
+function Forge.addInput(update)
+    local amount, inputType = Forge.inputAmount()
+
+    if amount > 0 then
+        return amount, inputType
+    end
+
+    for _, name in ipairs(Forge.selectedNames(Forge.inputSelection, Forge.inputList)) do
+        local count = Inventory.count(name) or 0
+
+        if count > 0 then
+            update:FireServer("AddInput", { name, count })
+            Forge.waitState(function()
+                return Forge.inputAmount() > 0
+            end)
+
+            local queued, queuedType = Forge.inputAmount()
+
+            if queued > 0 then
+                return queued, queuedType ~= "" and queuedType or name
+            end
+
+            -- No state at all yet: the server may still have accepted the ore.
+            if Forge.state == nil then
+                return count, name
+            end
+
+            logWarn("forge: input not accepted for " .. name)
+            return 0, nil
+        end
+    end
+
+    return 0, nil
+end
+
+function Forge.addFuel(update, oreName, inputCount)
+    if not oreName or inputCount <= 0 then
+        return 0
+    end
+
+    local needed = Forge.smeltTime(oreName) * inputCount
+    local burn = Forge.fuelRemaining()
+
+    if burn >= needed then
+        return 0
+    end
+
+    for _, name in ipairs(Forge.selectedNames(Forge.fuelSelection, Forge.fuelList)) do
+        local count = Inventory.count(name) or 0
+        local perUnit = Forge.burnTime(name)
+
+        if count > 0 and perUnit > 0 then
+            local units = math.ceil((needed - burn) / perUnit)
+
+            units = math.min(units, count, Config.forgeMaxFuelUnits)
+
+            for _ = 1, units do
+                if Forge.fuelRemaining() >= needed then
+                    break
+                end
+
+                update:FireServer("AddFuel", name)
+                task.wait(Config.forgeActionWait)
+            end
+
+            logPrint(("forge: fuel %s x%d covers %ds of %ds"):format(
+                name, units, units * perUnit, needed))
+            return units
+        end
+    end
+
+    logWarn("forge: no selected fuel in inventory")
+    return 0
+end
+
+-- Take result -> add input -> add fuel. The caller sells after this.
+function Forge.service(origin, force)
+    if not force and not Forge.enabled then
+        return false
+    end
+
+    local part = forgePart()
+
+    if not part then
+        logWarn("forge: workspace." .. Config.forgeName .. " not found")
+        return false
+    end
+
+    local update = part:FindFirstChild(Config.forgeUpdateRemote)
+
+    if not update then
+        logWarn("forge: " .. Config.forgeUpdateRemote .. " not found")
+        return false
+    end
+
+    local opened = Forge.enter(part)
+    local taken, added, oreName, fueled = 0, 0, nil, 0
+
+    local ok, err = pcall(function()
+        taken = Forge.takeResult(update)
+        added, oreName = Forge.addInput(update)
+        fueled = Forge.addFuel(update, oreName, added)
+    end)
+
+    if opened then
+        Forge.leave(part)
+    end
+
+    if not ok then
+        logWarn("forge: " .. tostring(err))
+        return false
+    end
+
+    logPrint(("forge %s: took %d, input %s x%d, fuel %d"):format(
+        tostring(origin), taken, tostring(oreName or "-"), added, fueled))
+
+    return true
+end
+
+---------------------------------------------------------------------------
 -- Auto sell (ReplicatedStorage.SellResourceFunction)
 ---------------------------------------------------------------------------
 
@@ -2091,23 +2585,34 @@ local Sell = {
     lastRun = 0,
 }
 
--- Sellable resources: mined ores (Natural) plus mushrooms (MushroomResource).
--- Mushrooms have BasePrice but neither Natural nor AppearsInShop, so the farm
--- ore list does not contain them; without this they can never be selected.
-function Sell.names()
-    local names = {}
+-- Sellable resources are split into three lists: mined ores (`Natural`),
+-- mushrooms (`MushroomResource`; they have BasePrice but neither Natural nor
+-- AppearsInShop, so the farm ore list does not contain them) and smelted bars.
+--
+-- Smelted bars are the forge results of the known ores (`Copper Ore` ->
+-- `Copper Bar`, ...). `NotPurchasable` alone is not enough: Diamond, Obsidian,
+-- Ignis and Hellstone are NotPurchasable and still mined ores, and
+-- `ChildResources` also covers lumber (`Oak Plank`, `Oak Stick`).
+function Sell.smeltedSet()
+    if Sell.smeltedCache then
+        return Sell.smeltedCache
+    end
 
-    if Game.Resources then
-        for name, info in pairs(Game.Resources) do
-            if type(info) == "table"
-                and (info.Natural or info.MushroomResource)
-                and info.BasePrice
-                and not info.Unobtainable then
-                table.insert(names, name)
-            end
+    local set = {}
+
+    for _, ore in ipairs(Forge.oreNames()) do
+        local result = Forge.result(ore)
+
+        if result and Game.Resources and Game.Resources[result] then
+            set[result] = true
         end
     end
 
+    Sell.smeltedCache = set
+    return set
+end
+
+local function sortByPrice(names)
     -- Same deterministic order as `Ores.names`: price, then name.
     table.sort(names, function(a, b)
         local priceA, priceB = Ores.price(a), Ores.price(b)
@@ -2118,6 +2623,50 @@ function Sell.names()
 
         return priceA > priceB
     end)
+
+    return names
+end
+
+-- Sell list split for the UI: Ores, Mushrooms, Smelted. `Sell.names()` is the
+-- flat version of the same lists, in this order, so the saved `sellNames` key
+-- and every selection index keep working.
+function Sell.groups()
+    local smelted = Sell.smeltedSet()
+    local groups = {
+        { title = "Ores", names = {} },
+        { title = "Mushrooms", names = {} },
+        { title = "Smelted", names = {} },
+    }
+
+    if Game.Resources then
+        for name, info in pairs(Game.Resources) do
+            if type(info) == "table" and not info.Unobtainable then
+                if smelted[name] then
+                    table.insert(groups[3].names, name)
+                elseif info.MushroomResource and info.BasePrice then
+                    table.insert(groups[2].names, name)
+                elseif info.Natural and info.BasePrice then
+                    table.insert(groups[1].names, name)
+                end
+            end
+        end
+    end
+
+    for _, group in ipairs(groups) do
+        sortByPrice(group.names)
+    end
+
+    return groups
+end
+
+function Sell.names()
+    local names = {}
+
+    for _, group in ipairs(Sell.groups()) do
+        for _, name in ipairs(group.names) do
+            table.insert(names, name)
+        end
+    end
 
     return names
 end
@@ -2331,6 +2880,11 @@ function Sell.try(origin)
         end
 
         task.wait(Config.sellHoldBefore)
+
+        -- Forge first, sale second: take bars, refill input and fuel while the
+        -- root is already anchored on the surface.
+        pcall(Forge.service, origin)
+
         local value = Sell.run(false, origin)
         task.wait(Config.sellHoldAfter)
         Movement.releaseHold()
@@ -2434,6 +2988,7 @@ function Sell.manual()
         Sell.toSurface(character)
         Sell.holdForSale(character)
         task.wait(Config.sellHoldBefore)
+        pcall(Forge.service, "manual")
         local value = Sell.run(true, "manual")
         task.wait(Config.sellHoldAfter)
         Movement.releaseHold()
@@ -2448,6 +3003,38 @@ function Sell.manual()
     end
 
     return sold
+end
+
+-- Surface trip for the forge alone ("Service now"): no sale afterwards, used
+-- when auto sell is off or the backpack is not full.
+function Forge.trip(origin)
+    local character = Character.get()
+    Sell.busy = true
+
+    local ok, serviced = pcall(function()
+        if not Sell.toSurface(character) then
+            return false
+        end
+
+        if not Sell.holdForSale(character) then
+            return false
+        end
+
+        task.wait(Config.sellHoldBefore)
+        local value = Forge.service(origin, true)
+        task.wait(Config.sellHoldAfter)
+        Movement.releaseHold()
+        return value
+    end)
+
+    Movement.releaseHold()
+    Sell.busy = false
+
+    if not ok then
+        error(serviced)
+    end
+
+    return serviced
 end
 
 ---------------------------------------------------------------------------
@@ -3623,6 +4210,19 @@ Settings.define("sellNames", {
     kind = "names", default = "none",
 })
 
+Settings.define("forgeEnabled", {
+    kind = "bool", default = false,
+    apply = function(value) Forge.enabled = value end,
+})
+
+Settings.define("forgeOres", {
+    kind = "names", default = "none",
+})
+
+Settings.define("forgeFuels", {
+    kind = "names", default = "none",
+})
+
 Settings.define("verboseLogs", {
     kind = "bool", default = Log.enabled,
     apply = function(value) Log.enabled = value end,
@@ -3787,11 +4387,21 @@ function Ui.selection(names, indexes)
 
     -- Toggles are created with the saved state; `addToggle` does not fire its
     -- callback for the default value, so restoring never writes the file.
+    function widget.add(section, index)
+        local name = names[index]
+
+        if not name then
+            return
+        end
+
+        section:addToggle(name, selected[index] == true, function(state)
+            widget.setSelected(index, state)
+        end)
+    end
+
     function widget.build(section)
-        for index, name in ipairs(names) do
-            section:addToggle(name, selected[index] == true, function(state)
-                widget.setSelected(index, state)
-            end)
+        for index = 1, #names do
+            widget.add(section, index)
         end
     end
 
@@ -3800,6 +4410,193 @@ function Ui.selection(names, indexes)
     end
 
     return widget
+end
+
+---------------------------------------------------------------------------
+-- UI adaptation (mobile size, scrollable tabs, titlebar collapse)
+---------------------------------------------------------------------------
+
+local UI_WIDTH = 511
+local UI_HEIGHT = 428
+local UI_TITLE = 38
+
+local function viewportSize()
+    local camera = workspace.CurrentCamera
+    local size = camera and camera.ViewportSize
+
+    if not size or size.X <= 0 or size.Y <= 0 then
+        return Vector2.new(1280, 720)
+    end
+
+    return size
+end
+
+-- uilib hardcodes a 511x428 window at `(0.25, 0)` (off-screen on a phone),
+-- gives the tab strip a fixed 314 px canvas without a scrollbar, and hides the
+-- window only through a keybind. `Ui.adapt` keeps the widget tree and changes
+-- only layout and the collapse behaviour.
+function Ui.adapt(window)
+    local main = window.container.Main
+    local topbar = main.TopBar
+    local pagesPanel = main.Pages
+    local tabs = pagesPanel.Pages_Container
+    local mobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+
+    -- Tab strip: AutomaticCanvasSize follows the UIListLayout, so every page
+    -- stays reachable and touch-drag scrolls the list.
+    tabs.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    tabs.CanvasSize = UDim2.new(0, 0, 0, 0)
+    tabs.ScrollBarThickness = 3
+    tabs.ScrollBarImageColor3 = Color3.fromRGB(14, 14, 14)
+    tabs.ScrollingEnabled = true
+
+    -- Page content: same automatic canvas, so long sections scroll on a short
+    -- screen instead of being cut at the library's fixed canvas height.
+    for _, page in ipairs(window.pages) do
+        local container = page.container
+
+        container.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        container.CanvasSize = UDim2.new(0, 0, 0, 0)
+        container.ScrollBarThickness = 3
+        container.ScrollBarImageColor3 = Color3.fromRGB(14, 14, 14)
+        container.ScrollingEnabled = true
+
+        local resize = page.Resize
+
+        -- The library sets the bar transparency to `size > height`, i.e. hides
+        -- the bar exactly when the page can scroll.
+        page.Resize = function(self, scroll)
+            resize(self, scroll)
+            self.container.ScrollBarImageTransparency =
+                self.container.AbsoluteCanvasSize.Y > self.container.AbsoluteSize.Y and 0 or 1
+        end
+    end
+
+    topbar.Title.Size = UDim2.new(1, -74, 0, 16)
+
+    local closeButton = Instance.new("TextButton")
+    closeButton.Name = "Collapse"
+    closeButton.AnchorPoint = Vector2.new(1, 0.5)
+    closeButton.Position = UDim2.new(1, -6, 0.5, 0)
+    closeButton.Size = UDim2.fromOffset(28, 28)
+    closeButton.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    closeButton.BorderSizePixel = 0
+    closeButton.AutoButtonColor = true
+    closeButton.Font = Enum.Font.GothamBold
+    closeButton.TextSize = 16
+    closeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    closeButton.Text = "-"
+    closeButton.ZIndex = 6
+    closeButton.Parent = topbar
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 4)
+    corner.Parent = closeButton
+
+    local collapsed = false
+    local placed = false
+    local tabsWidth = 126
+
+    local function layout()
+        local viewport = viewportSize()
+        local height = math.max(220, math.min(UI_HEIGHT, viewport.Y - 16))
+
+        if not mobile then
+            main.Size = UDim2.fromOffset(UI_WIDTH, collapsed and UI_TITLE or UI_HEIGHT)
+            return
+        end
+
+        local width = math.max(240, math.min(UI_WIDTH, viewport.X - 16))
+        tabsWidth = math.clamp(math.floor(width * 0.3), 116, 126)
+
+        pagesPanel.Size = UDim2.new(0, tabsWidth, 1, -UI_TITLE)
+
+        for _, page in ipairs(window.pages) do
+            page.container.Position = UDim2.fromOffset(tabsWidth + 8, UI_TITLE + 8)
+            page.container.Size = UDim2.new(1, -(tabsWidth + 16), 1, -(UI_TITLE + 18))
+        end
+
+        main.Size = UDim2.fromOffset(width, collapsed and UI_TITLE or height)
+
+        if not placed then
+            placed = true
+            main.Position = UDim2.fromOffset(
+                math.floor((viewport.X - width) / 2),
+                math.floor((viewport.Y - height) / 2)
+            )
+        else
+            local current = main.Position
+
+            main.Position = UDim2.fromOffset(
+                math.clamp(current.X.Offset, 0, math.max(0, viewport.X - width)),
+                math.clamp(current.Y.Offset, 0, math.max(0, viewport.Y - (collapsed and UI_TITLE or height)))
+            )
+        end
+    end
+
+    local function setCollapsed(state)
+        collapsed = state == true
+        main.ClipsDescendants = collapsed
+        closeButton.Text = collapsed and "+" or "-"
+
+        for _, page in ipairs(window.pages) do
+            page.container.Visible = not collapsed and window.focusedPage == page
+        end
+
+        layout()
+    end
+
+    -- Replaces `library:toggle` (keybind only): the body collapses to the
+    -- titlebar, and the titlebar button restores it.
+    window.toggle = function()
+        setCollapsed(not collapsed)
+    end
+
+    closeButton.MouseButton1Click:Connect(function()
+        setCollapsed(not collapsed)
+    end)
+
+    if mobile then
+        local dragging, dragStart, dragOrigin
+
+        topbar.InputBegan:Connect(function(input)
+            if input.UserInputType ~= Enum.UserInputType.Touch then
+                return
+            end
+
+            dragging = true
+            dragStart = input.Position
+            dragOrigin = main.Position
+
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end)
+
+        UserInputService.InputChanged:Connect(function(input)
+            if not dragging or input.UserInputType ~= Enum.UserInputType.Touch then
+                return
+            end
+
+            local delta = input.Position - dragStart
+            main.Position = UDim2.fromOffset(
+                dragOrigin.X.Offset + delta.X,
+                dragOrigin.Y.Offset + delta.Y
+            )
+        end)
+    end
+
+    local camera = workspace.CurrentCamera
+
+    if camera then
+        camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+            pcall(layout)
+        end)
+    end
+
+    layout()
 end
 
 function Ui.create()
@@ -3813,6 +4610,7 @@ function Ui.create()
     local savedVerbose = Settings.read("verboseLogs")
     local savedRejoin = Settings.read("autoRejoin")
     local savedSellEnabled = Settings.read("sellEnabled")
+    local savedForge = Settings.read("forgeEnabled")
     local savedAutoload = Settings.read("autoloadEnabled")
     local savedAutoloadSlot = Settings.read("autoloadSlot")
 
@@ -3913,11 +4711,61 @@ function Ui.create()
         sellNames,
         Settings.selection("sellNames", "sellSelected", sellNames)
     )
-    local sellListSection = sellPage:addSection("Resources to sell")
 
-    sellWidget.build(sellListSection)
     Sell.bindSelection(sellWidget, sellNames)
     Settings.bindSelection("sellNames", sellNames, sellWidget)
+
+    -- One section per category: Ores, Mushrooms, Smelted. All of them write the
+    -- same `sellNames` key through the one widget.
+    for _, group in ipairs(Sell.groups()) do
+        if #group.names > 0 then
+            local section = sellPage:addSection(group.title)
+
+            for _, name in ipairs(group.names) do
+                local index = table.find(sellNames, name)
+
+                if index then
+                    sellWidget.add(section, index)
+                end
+            end
+        end
+    end
+
+    local forgePage = window:addPage("Forge")
+    local forgeSection = forgePage:addSection("Forge")
+
+    forgeSection:addToggle("Service on surface", savedForge, function(state)
+        Settings.write("forgeEnabled", state)
+        logPrint("forge service " .. (state and "on" or "off"))
+    end)
+
+    forgeSection:addButton("Service now", function()
+        task.spawn(function()
+            local ok, serviced = pcall(Forge.trip, "manual")
+
+            if ok then
+                logPrint("forge trip " .. tostring(serviced))
+            else
+                logWarn("forge trip error: " .. tostring(serviced))
+            end
+        end)
+    end)
+
+    local forgeOres = Forge.oreNames()
+    local forgeOreWidget = Ui.selection(forgeOres, Settings.selection("forgeOres", nil, forgeOres))
+    local forgeOreSection = forgePage:addSection("Ores to smelt")
+
+    forgeOreWidget.build(forgeOreSection)
+    Forge.bindInput(forgeOreWidget, forgeOres)
+    Settings.bindSelection("forgeOres", forgeOres, forgeOreWidget)
+
+    local forgeFuels = Forge.fuelNames()
+    local forgeFuelWidget = Ui.selection(forgeFuels, Settings.selection("forgeFuels", nil, forgeFuels))
+    local forgeFuelSection = forgePage:addSection("Fuel")
+
+    forgeFuelWidget.build(forgeFuelSection)
+    Forge.bindFuel(forgeFuelWidget, forgeFuels)
+    Settings.bindSelection("forgeFuels", forgeFuels, forgeFuelWidget)
 
     local sessionPage = window:addPage("Session")
     local rejoinSection = sessionPage:addSection("Auto rejoin")
@@ -4027,6 +4875,13 @@ function Ui.create()
         end
     end)
 
+    -- Cosmetic only: a failed adaptation must never remove the window.
+    local adapted, adaptError = pcall(Ui.adapt, window)
+
+    if not adapted then
+        logWarn("ui adapt failed: " .. tostring(adaptError))
+    end
+
     return window
 end
 
@@ -4046,7 +4901,7 @@ function LogView.create()
 
     local frame = Instance.new("Frame")
     frame.Name = "LogFrame"
-    frame.Size = UDim2.fromOffset(520, 150)
+    frame.Size = UDim2.fromOffset(math.min(520, viewportSize().X - 20), 150)
     frame.Position = UDim2.new(0, 10, 1, -160)
     frame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
     frame.BackgroundTransparency = 0.15
@@ -4099,6 +4954,8 @@ end
 -- rejoin, auto load) before the UI is built. Options with an `apply` hook live in the
 -- registry, so this is the only restore call in the script.
 Settings.restore()
+
+Forge.bind()
 
 LogView.create()
 

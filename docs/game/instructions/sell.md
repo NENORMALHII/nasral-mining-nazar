@@ -81,12 +81,20 @@ Diagnostics (throttled to one line per 10 s for repeated states):
 - `autosell: no resources selected` / `autosell: selected resources have zero count`;
 - `inventory: InventoriesClient ready`, or a distinct warning for each load failure.
 
-The Auto sell list is built by `Sell.names()`: every `Resources` entry with a
-`BasePrice` that is either `Natural = true` (mined ores) or
-`MushroomResource = true` (`Red Shroom`, `Brown Shroom`, `Soul Shroom`,
-`Witchcap`, `Magmaspore`). The farm ore list (`Ores.names()`) stays `Natural`
-only. Smelted bars, planks and sticks are still not in the sell list, so a
-backpack full of them keeps `used` at max while every run sells `units=0`.
+The Auto sell list is built by `Sell.names()`, a flat view of `Sell.groups()`:
+three categories, in this order, each sorted by price and then by name.
+
+1. `Ores` — `Resources` entries with `Natural = true` and a `BasePrice`.
+2. `Mushrooms` — `MushroomResource = true` (`Red Shroom`, `Brown Shroom`,
+   `Soul Shroom`, `Witchcap`, `Magmaspore`).
+3. `Smelted` — forge results of the known ores (`Sell.smeltedSet()`,
+   `Forge.result(ore)`: `Copper Ore` -> `Copper Bar`, ...). `NotPurchasable`
+   alone is not enough (Diamond, Obsidian, Ignis and Hellstone are mined ores),
+   and `ChildResources` also covers lumber, so only forge results are listed.
+
+The UI shows one Venyx section per category, all writing the same `sellNames`
+key through one selection widget. The farm ore list (`Ores.names()`) stays
+`Natural` only. Planks and sticks are still not in the sell list.
 
 `Sell.run()` without `force` still requires the Auto sell toggle and respects
 `sellCooldown = 1`.
