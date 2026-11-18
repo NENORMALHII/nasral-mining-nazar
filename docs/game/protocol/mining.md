@@ -90,8 +90,8 @@ There is no seed hashing and no depth heuristic. `Ores.nearest(position, radius)
 
 - converts the player position to block coordinates (`Blocks.toBlock`);
 - scans only the `±ceil(radius/7)` cube around the player with
-  `mine:FindFirstChild(vec3ToString(cell))`, instead of iterating every child of
-  `Workspace.Mine`;
+  `Blocks.at(vec3ToString(cell))`, a hash lookup in the name -> instance index,
+  instead of iterating every child of `Workspace.Mine`;
 - keeps the sorted candidate list in `scanCache` for `Config.oreScanTtl = 1` s
   while the player stays in the same cell. `Ores.nearest` returns the next entry
   through a cursor (`scanCandidates`), so breaking one ore does not trigger
@@ -344,11 +344,11 @@ Inside there is a `BasePart`, a `DropScript`, and under it a `StringValue` named
 the player who broke the block.
 
 `Loot.collectAll` only picks drops where `DropScript.Player.Value` matches `LocalPlayer`
-(instance, name, user id or string). Drops are cached in `Loot.pending` by `Loot.sync` and stay
-there until picked. `Loot.sync` is throttled to `lootSyncInterval = 0.4` s and reuses its `seen`
-table and per-drop name/owner/part caches, so an idle tick with drops in the world allocates
-nothing. The character teleports to the drop, waits for the touch, and repeats for the next drop.
-Farm does not sleep after a break: the next sync picks the drop up as soon as it replicates.
+(instance, name, user id or string). Drops are pushed into `Loot.pending` from
+`TargetFilter.ChildAdded` (`Loot.offer`, one delayed re-check after
+`lootOwnerDelay = 0.2` s because `Player` can replicate after the model) and removed on
+`ChildRemoved`. There is no periodic scan of the drop container any more. The character
+teleports to the drop, waits for the touch, and repeats for the next drop.
 
 ## Cross-check: Delta decompile
 
@@ -421,8 +421,13 @@ is received, waits up to 6 heartbeats, and logs
 - The selected-ore set is rebuilt only when the selection widget version changes
   (`Ui.selection.getVersion`), not on a timer.
 - `Blocks.model()` caches the `Workspace.Mine` instance; the per-tick path no longer repeats the
-  `FindFirstChild("Mine")` name lookup. The empty-field check (`#mine:GetChildren()`) runs at
-  most once per second.
+  `FindFirstChild("Mine")` name lookup. The empty-field check
+  (`FindFirstChildWhichIsA("BasePart")`) runs at most once per second.
+- `Blocks.at(name)` serves every cell lookup from a `Name -> instance` index built once per mine
+  and kept current through `ChildAdded` / `ChildRemoved`. `FindFirstChild` walks the container's
+  children, so one 343-cell scan over a full mine was millions of name comparisons — the frame
+  drop at a break happened when the player's cell changed and the scan re-ran. The index build
+  itself yields every 4000 children.
 - Liquid answers are cached per block until `Blocks.liquidStamp` changes, so `Mining.why` and the
   planner do not rebuild six neighbour names for the same block repeatedly.
 - Log rendering is deferred (`Log.dirty` + `Log.flush` on a 0.25 s timer) with one `os.date` per
@@ -431,12 +436,25 @@ is received, waits up to 6 heartbeats, and logs
   is not followed by another `loopDelay`; only idle ticks sleep.
 - `Mining.detect` rebuilds the tool signature at most once per second; `Mining.prepare` has a fast
   path when the same pickaxe is already equipped; `Mining.maxDistance()` is re-read per equip.
+- `Mining.why` caches its answer per block for 0.3 s and invalidates on
+  `Blocks.liquidStamp`; the Farm floor check, `Mining.mine` and the planner ask about the same
+  block several times in one tick.
+- `Mining.reach` is cached on equip instead of reading `Pick.MaxDistance` through
+  `FindFirstChild` on every range check; range tests use squared distance.
+- Loot is event-driven (`Loot.bind` on `TargetFilter.ChildAdded` / `ChildRemoved`); the old
+  per-tick scan walked every drop in the container, other players' included.
 - `Blocks.liquidSet` is one pass over the mine per world; after that every liquid question is a
   hash lookup. `Blocks.calibrate` yields every 4000 children so the initial field pass does not
   stall a frame. `Plan` runs at most once per stuck situation, not per tick; the preventive
   `Plan.clear` check is cached for 0.25 s per cell.
 - `MushroomNode.nearest` refreshes its `HarvestableNode` list once per second (pruned in place)
   instead of copying `workspace:GetChildren()` on every tick.
+- A full ore scan logs `ore scan ... N ms` when it exceeds `slowScanWarn = 8 ms`, so a remaining
+  frame drop can be attributed instead of guessed.
+- Frame watchdog: `RunService.Heartbeat` compares frame gaps and logs
+  `frame N ms after <label>` above `frameWarn = 0.12` s. Labels are set before the
+  non-yielding phases (`ore scan`, `plan build`, `plan`, `liquid set`, `block index`,
+  `calibrate`, `surface scan`, `loot`, `mine`, `sell`, `forge`).
 - Per-block wall clock = `preSwing` + `waitTime`, with no post-break loot sleep and no fixed
   extra loop delay.
 - StreamingEnabled caveat: if `workspace.StreamingEnabled` is true, a missing client block does
