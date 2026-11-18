@@ -30,6 +30,8 @@ end
 ```
 
 `src/main.lua` uses the same source in `Inventory.count` / `Inventory.usage`.
+`Inventory.get` caches the returned table for 0.25 s, so a sell run that asks for
+one count per selected resource does not rebuild the inventory table each time.
 `Sell.count` falls back to Backpack stacks and `LocalPlayer` attributes only if
 `InventoriesClient` is not loaded yet.
 

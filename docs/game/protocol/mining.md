@@ -345,9 +345,10 @@ the player who broke the block.
 
 `Loot.collectAll` only picks drops where `DropScript.Player.Value` matches `LocalPlayer`
 (instance, name, user id or string). Drops are cached in `Loot.pending` by `Loot.sync` and stay
-there until picked. The character teleports to the drop, waits for the touch, and repeats for the
-next drop. Farm does not sleep after a break: the next tick starts with `Loot.sync(true)`, so the
-drop is collected as soon as it replicates.
+there until picked. `Loot.sync` is throttled to `lootSyncInterval = 0.4` s and reuses its `seen`
+table and per-drop name/owner/part caches, so an idle tick with drops in the world allocates
+nothing. The character teleports to the drop, waits for the touch, and repeats for the next drop.
+Farm does not sleep after a break: the next sync picks the drop up as soon as it replicates.
 
 ## Cross-check: Delta decompile
 
@@ -415,15 +416,29 @@ is received, waits up to 6 heartbeats, and logs
 - `Surface.scan` collects depth candidates once, sorts by depth/distance and runs the 8-ray
   star check lazily only until the first valid candidate.
 - `Ores.nearest` sorts the cube once and keeps the list for `oreScanTtl`; a cursor serves the
-  next candidate, `Mining.why` is only called until one passes, and `Ores.ignore` no longer
-  throws the list away.
-- `Mining.detect` rebuilds the tool signature at most once per second; `Mining.maxDistance()` is
-  re-read per equip; `typeOf` is a plain attribute read.
+  next candidate, `Mining.why` is only called until one passes, `Ores.ignore` no longer throws
+  the list away, and range checks use squared distance (no `Vector3` per block).
+- The selected-ore set is rebuilt only when the selection widget version changes
+  (`Ui.selection.getVersion`), not on a timer.
+- `Blocks.model()` caches the `Workspace.Mine` instance; the per-tick path no longer repeats the
+  `FindFirstChild("Mine")` name lookup. The empty-field check (`#mine:GetChildren()`) runs at
+  most once per second.
+- Liquid answers are cached per block until `Blocks.liquidStamp` changes, so `Mining.why` and the
+  planner do not rebuild six neighbour names for the same block repeatedly.
+- Log rendering is deferred (`Log.dirty` + `Log.flush` on a 0.25 s timer) with one `os.date` per
+  second. Blocks log once (`Mining.mine`), not twice.
+- `Mode:start` measures step time: a step that mined or teleported already spent its budget and
+  is not followed by another `loopDelay`; only idle ticks sleep.
+- `Mining.detect` rebuilds the tool signature at most once per second; `Mining.prepare` has a fast
+  path when the same pickaxe is already equipped; `Mining.maxDistance()` is re-read per equip.
 - `Blocks.liquidSet` is one pass over the mine per world; after that every liquid question is a
-  hash lookup. `Plan` runs at most once per stuck situation, not per tick; `Plan.clear` (3
-  lookups) is the only per-tick cost on the normal dig path.
-- Per-block wall clock = `preSwing` + `waitTime` + `loopDelay`, with no post-break loot sleep:
-  the old fixed 0.3 s wait per block was the largest artificial delay.
+  hash lookup. `Blocks.calibrate` yields every 4000 children so the initial field pass does not
+  stall a frame. `Plan` runs at most once per stuck situation, not per tick; the preventive
+  `Plan.clear` check is cached for 0.25 s per cell.
+- `MushroomNode.nearest` refreshes its `HarvestableNode` list once per second (pruned in place)
+  instead of copying `workspace:GetChildren()` on every tick.
+- Per-block wall clock = `preSwing` + `waitTime`, with no post-break loot sleep and no fixed
+  extra loop delay.
 - StreamingEnabled caveat: if `workspace.StreamingEnabled` is true, a missing client block does
   not mean the block is missing on the server. `Surface.depth` and `Plan` would treat unloaded
   rock as air and dig into it. The bot assumes streaming is off.

@@ -12,6 +12,7 @@ local HttpService = game:GetService("HttpService")
 
 local Config = {
     loopDelay = 0.05,
+    logRenderInterval = 0.25,
 
     instantMove = false,
     tweenSpeed = 120,
@@ -478,15 +479,42 @@ end
 -- callback, so `Settings.flushSelections` (called from a timer) saves whatever
 -- the widget currently holds; `Settings.persist` skips unchanged JSON.
 function Settings.bindSelection(key, names, widget)
-    table.insert(Settings.bound, { key = key, names = names, widget = widget })
+    table.insert(Settings.bound, {
+        key = key,
+        names = names,
+        widget = widget,
+        version = widget.getVersion and widget.getVersion() or nil,
+    })
 end
 
 function Settings.flushSelections()
-    for _, entry in ipairs(Settings.bound) do
-        local indexes = entry.widget.getSelected()
+    Settings.load()
 
-        if indexes then
-            Settings.write(entry.key, Settings.nameList(entry.names, indexes))
+    for _, entry in ipairs(Settings.bound) do
+        local version = entry.widget.getVersion and entry.widget.getVersion() or nil
+
+        -- Nothing toggled since the last flush: skip the widget walk and the
+        -- JSON encode. Four bound lists used to re-save on every timer tick.
+        if version == nil or version ~= entry.version then
+            entry.version = version
+
+            local indexes = entry.widget.getSelected()
+
+            if indexes then
+                local names = Settings.nameList(entry.names, indexes)
+                local saved = Settings.data[entry.key]
+
+                if type(saved) ~= "table" or #saved ~= #names then
+                    Settings.write(entry.key, names)
+                else
+                    for index = 1, #names do
+                        if saved[index] ~= names[index] then
+                            Settings.write(entry.key, names)
+                            break
+                        end
+                    end
+                end
+            end
         end
     end
 end
@@ -536,6 +564,7 @@ local Log = {
     lines = {},
     maxLines = 12,
     render = nil,
+    dirty = false,
 }
 
 local function joinArgs(...)
@@ -548,13 +577,38 @@ local function joinArgs(...)
     return table.concat(parts, " ")
 end
 
+-- `os.date` per line allocates; the log panel only shows seconds, so one
+-- formatting pass per second is enough.
+local function clockText()
+    local second = os.time()
+
+    if Log.clockSecond ~= second then
+        Log.clockSecond = second
+        Log.clockText = os.date("%H:%M:%S", second)
+    end
+
+    return Log.clockText
+end
+
+-- Rendering is deferred: `pushLog` only appends and sets a flag, so a burst of
+-- lines (one per block) cannot force a TextLabel relayout in the mining path.
+-- `Log.flush` runs on its own timer from the bootstrap block.
 local function pushLog(text)
-    local line = ("%s  %s"):format(os.date("%H:%M:%S"), text)
-    table.insert(Log.lines, line)
+    table.insert(Log.lines, clockText() .. "  " .. text)
 
     while #Log.lines > Log.maxLines do
         table.remove(Log.lines, 1)
     end
+
+    Log.dirty = true
+end
+
+function Log.flush()
+    if not Log.dirty then
+        return
+    end
+
+    Log.dirty = false
 
     if Log.render then
         pcall(Log.render, Log.lines)
@@ -669,11 +723,21 @@ function Mode:start()
 
     task.spawn(function()
         while self.enabled and self.token == token do
+            local started = os.clock()
             local ok, err = pcall(self.step, self)
             if not ok then
                 logWarn(self.name .. " error: " .. tostring(err))
             end
-            task.wait(Config.loopDelay)
+
+            -- A step that mined/was teleported already burned its time: do not
+            -- add another full `loopDelay` on top. Only idle ticks sleep.
+            local spent = os.clock() - started
+
+            if spent < Config.loopDelay then
+                task.wait(Config.loopDelay - spent)
+            else
+                task.wait()
+            end
         end
     end)
 end
@@ -765,19 +829,20 @@ end
 
 local Movement = {}
 
+-- Direct assignment: a valid BasePart never errors on `Anchored`, so the old
+-- `pcall(function() ... end)` allocated a closure on every hold/release (twice
+-- per block) for nothing.
 local function safeAnchor(root, state)
     if root and root.Parent then
-        pcall(function()
-            root.Anchored = state
-        end)
+        root.Anchored = state
     end
 end
 
 function Movement.release()
-    if Movement.tween then
-        pcall(function()
-            Movement.tween:Cancel()
-        end)
+    local tween = Movement.tween
+
+    if tween then
+        pcall(tween.Cancel, tween)
         Movement.tween = nil
     end
 
@@ -786,10 +851,8 @@ function Movement.release()
     local root = Movement.root or Movement.holdRoot
 
     if root and root.Parent then
-        pcall(function()
-            root.AssemblyLinearVelocity = Vector3.zero
-            root.AssemblyAngularVelocity = Vector3.zero
-        end)
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
     end
 
     safeAnchor(Movement.holdRoot, false)
@@ -957,6 +1020,23 @@ local BASE_ALTITUDE = 7998.5
 Blocks.offset = Vector3.new(0, 0, 0)
 Blocks.calibrated = false
 Blocks.lastCalibrate = 0
+Blocks.modelCache = nil
+
+-- Single cached handle to `Workspace.Mine`. The mining loop asked for it several
+-- times per tick (calibrate, below, liquid set, ore scan, plan, farm reset);
+-- a cached instance removes those name lookups. Re-resolved only when the
+-- cached instance leaves the DataModel.
+function Blocks.model()
+    local mine = Blocks.modelCache
+
+    if mine and mine.Parent then
+        return mine
+    end
+
+    mine = workspace:FindFirstChild(Config.mineName)
+    Blocks.modelCache = mine
+    return mine
+end
 
 local function rawBlock(position)
     return Vector3.new(
@@ -996,20 +1076,24 @@ function Blocks.calibrate()
 
     Blocks.lastCalibrate = os.clock()
 
-    local mine = workspace:FindFirstChild(Config.mineName)
+    local mine = Blocks.model()
     if not mine then
         return
     end
 
     local firstOffset, firstDistance
     local secondOffset, secondDistance
+    local index = 0
 
     for _, block in ipairs(mine:GetChildren()) do
         local minePosition = block:GetAttribute(Game.attrMinePosition)
 
         if minePosition then
             local offset = minePosition - rawBlock(block.Position)
-            local distance = (block.Position - Config.fieldCenter).Magnitude
+            local px = block.Position.X - Config.fieldCenter.X
+            local py = block.Position.Y - Config.fieldCenter.Y
+            local pz = block.Position.Z - Config.fieldCenter.Z
+            local distance = px * px + py * py + pz * pz
 
             if not firstDistance or distance < firstDistance then
                 secondOffset, secondDistance = firstOffset, firstDistance
@@ -1017,6 +1101,13 @@ function Blocks.calibrate()
             elseif not secondDistance or distance < secondDistance then
                 secondOffset, secondDistance = offset, distance
             end
+        end
+
+        -- Tens of thousands of children: yield in chunks so the field scan does
+        -- not stall the frame for the whole pass.
+        index = index + 1
+        if index % 4000 == 0 then
+            task.wait()
         end
     end
 
@@ -1044,7 +1135,7 @@ function Blocks.standPoint(cell)
 end
 
 function Blocks.below(worldPosition)
-    local mine = workspace:FindFirstChild(Config.mineName)
+    local mine = Blocks.model()
     if not mine then
         return nil
     end
@@ -1058,10 +1149,12 @@ end
 -- question into a handful of hash lookups instead of `FindFirstChild` calls.
 Blocks.liquids = nil
 Blocks.liquidsWorld = nil
+Blocks.liquidStamp = 0
 
 function Blocks.invalidateLiquids()
     Blocks.liquids = nil
     Blocks.liquidsWorld = nil
+    Blocks.liquidStamp = (Blocks.liquidStamp or 0) + 1
 end
 
 function Blocks.liquidSet()
@@ -1072,7 +1165,7 @@ function Blocks.liquidSet()
         return Blocks.liquids
     end
 
-    local mine = workspace:FindFirstChild(Config.mineName)
+    local mine = Blocks.model()
     if not mine then
         return nil
     end
@@ -1094,6 +1187,7 @@ function Blocks.liquidSet()
 
     Blocks.liquids = set
     Blocks.liquidsWorld = world
+    Blocks.liquidStamp = (Blocks.liquidStamp or 0) + 1
     return set
 end
 
@@ -1234,7 +1328,7 @@ end
 
 -- Cell to stand in before dropping down, on the player's own layer.
 function Surface.find(position)
-    local mine = workspace:FindFirstChild(Config.mineName)
+    local mine = Blocks.model()
     if not mine then
         return nil
     end
@@ -1248,7 +1342,7 @@ end
 -- Reset target after a rejection streak: the same scan on the fixed surface
 -- layer around the field centre, so it can never leave the generated mine.
 function Surface.resetPoint()
-    local mine = workspace:FindFirstChild(Config.mineName)
+    local mine = Blocks.model()
     if not mine then
         return nil
     end
@@ -1274,6 +1368,9 @@ local Mining = {
 }
 
 local BLOCKED = { Oil = true, Lava = true, Grass = true, Void = true }
+
+-- Per-block liquid answer, invalidated by `Blocks.liquidStamp`.
+local liquidCache = setmetatable({}, { __mode = "k" })
 
 local function colorOf(value)
     local kind = typeof(value)
@@ -1553,7 +1650,15 @@ function Mining.bind(pickaxe)
 end
 
 function Mining.prepare(character)
-    local pickaxe = Character.getPickaxe(character)
+    -- Fast path: the same pickaxe is already equipped and rebound. Avoids the
+    -- backpack scan, humanoid lookup and signature check on every block.
+    local equipped = character:FindFirstChildWhichIsA("Tool")
+
+    if equipped and equipped == Mining.pickaxe and Mining.rebound and equipped.Parent == character then
+        return equipped
+    end
+
+    local pickaxe = equipped and isPickaxe(equipped) and equipped or Character.getPickaxe(character)
     if not pickaxe then
         return nil
     end
@@ -1682,7 +1787,19 @@ function Mining.besideLiquid(block)
         return false
     end
 
-    return Blocks.liquidNeighbour(position)
+    -- The liquid set is static per world, so the 6 neighbour lookups (each one
+    -- a formatted string) are worth caching per block. The planner asks this
+    -- question thousands of times per plan.
+    local stamp = Blocks.liquidStamp
+    local cached = liquidCache[block]
+
+    if cached and cached.stamp == stamp then
+        return cached.value
+    end
+
+    local value = Blocks.liquidNeighbour(position)
+    liquidCache[block] = { stamp = stamp, value = value }
+    return value
 end
 
 function Mining.valid(block)
@@ -1879,7 +1996,7 @@ function Ores.bindSelection(selection, names)
     Ores.namesList = names
 end
 
-local selectionCache = { time = 0 }
+local selectionCache = { version = -1 }
 
 function Ores.selectedSet()
     local selection = Ores.selection
@@ -1887,23 +2004,19 @@ function Ores.selectedSet()
         return nil
     end
 
-    local indices = selection.getSelected() or {}
-    local keyParts = {}
+    -- The widget counts its own changes, so the name set is rebuilt only when
+    -- the user actually toggles an ore. The old version rebuilt it (and a key
+    -- string) every 0.5 s, once per tick on the mining path.
+    local version = selection.getVersion and selection.getVersion() or -1
 
-    for _, index in ipairs(indices) do
-        table.insert(keyParts, tostring(index))
-    end
-
-    local key = table.concat(keyParts, ",")
-    local now = os.clock()
-
-    if selectionCache.set and selectionCache.key == key and now - selectionCache.time < 0.5 then
+    if selectionCache.set and selectionCache.selection == selection
+        and selectionCache.version == version then
         return selectionCache.set
     end
 
     local set = {}
 
-    for _, index in ipairs(indices) do
+    for _, index in ipairs(selection.getSelected() or {}) do
         local name = Ores.namesList[index]
         if name then
             set[name] = true
@@ -1911,8 +2024,8 @@ function Ores.selectedSet()
     end
 
     selectionCache.set = set
-    selectionCache.key = key
-    selectionCache.time = now
+    selectionCache.selection = selection
+    selectionCache.version = version
     return set
 end
 
@@ -1932,12 +2045,22 @@ local scanCache = {
     index = 1,
 }
 
+-- Squared-distance test: `(a - b).Magnitude` allocates a Vector3 per call, and
+-- the ore scan runs it for every block in the cube.
+local function withinRange(blockPosition, position, limitSq)
+    local dx = blockPosition.X - position.X
+    local dy = blockPosition.Y - position.Y
+    local dz = blockPosition.Z - position.Z
+
+    return dx * dx + dy * dy + dz * dz <= limitSq
+end
+
 -- Next usable entry of the cached candidate list: block still exists, still
 -- selected, still in range, still ignored-free and still passes the expensive
 -- `Mining.why`. A cached list is not invalidated by a broken block: the cursor
 -- simply walks past it, so the common "one ore after another" case does no cube
 -- scan at all.
-local function scanCandidates(position, limit, selected)
+local function scanCandidates(position, limitSq, selected)
     local candidates = scanCache.candidates
 
     if not candidates then
@@ -1957,7 +2080,7 @@ local function scanCandidates(position, limit, selected)
             if name
                 and (not selected or selected[name])
                 and (not untilIgnore or untilIgnore <= now)
-                and (block.Position - position).Magnitude <= limit
+                and withinRange(block.Position, position, limitSq)
                 and Mining.why(block) == nil then
                 return block
             end
@@ -1973,15 +2096,16 @@ end
 -- cursor step, not another 343-cell pass.
 function Ores.nearest(position, radius)
     local limit = radius or Config.oreRange
+    local limitSq = limit * limit
     local center = Blocks.toBlock(position)
     local now = os.clock()
     local selected = Ores.selectedSet()
 
     if scanCache.cell == center and now - scanCache.time <= Config.oreScanTtl then
-        return scanCandidates(position, limit, selected)
+        return scanCandidates(position, limitSq, selected)
     end
 
-    local mine = workspace:FindFirstChild(Config.mineName)
+    local mine = Blocks.model()
     if not mine then
         return nil
     end
@@ -1997,16 +2121,23 @@ function Ores.nearest(position, radius)
 
                 if block then
                     local untilIgnore = ignored[block]
-                    local distance = (block.Position - position).Magnitude
 
-                    if distance <= limit and (not untilIgnore or untilIgnore <= now) then
-                        local name = typeOf(block)
+                    if not untilIgnore or untilIgnore <= now then
+                        local blockPosition = block.Position
+                        local px = blockPosition.X - position.X
+                        local py = blockPosition.Y - position.Y
+                        local pz = blockPosition.Z - position.Z
+                        local distanceSq = px * px + py * py + pz * pz
 
-                        if name and (not selected or selected[name]) then
-                            table.insert(found, {
-                                block = block,
-                                score = Ores.price(name) * 1000 - distance,
-                            })
+                        if distanceSq <= limitSq then
+                            local name = typeOf(block)
+
+                            if name and (not selected or selected[name]) then
+                                table.insert(found, {
+                                    block = block,
+                                    score = Ores.price(name) * 1000 - math.sqrt(distanceSq),
+                                })
+                            end
                         end
                     end
                 end
@@ -2031,7 +2162,7 @@ function Ores.nearest(position, radius)
 
     -- Mining.valid is cheap but does not know about liquids: ask Mining.why
     -- lazily, and only until one candidate really passes.
-    return scanCandidates(position, limit, selected)
+    return scanCandidates(position, limitSq, selected)
 end
 
 -- Do not throw away the sorted list: the ignored block is skipped by
@@ -2075,6 +2206,8 @@ local Inventory = {
     client = nil,
     lastTry = 0,
     lastError = nil,
+    cached = nil,
+    cachedAt = 0,
 }
 
 -- Log each distinct failure once instead of every 5 s retry.
@@ -2134,13 +2267,22 @@ function Inventory.get()
         return nil
     end
 
-    local ok, inventory = pcall(function()
-        return client.GetInventory()
-    end)
+    -- `GetInventory()` builds a new table on every call. The sell run asks for
+    -- one count per selected resource and the watcher once per second, so a
+    -- short cache removes dozens of table builds per sell.
+    local now = os.clock()
+
+    if Inventory.cached and now - Inventory.cachedAt < 0.25 then
+        return Inventory.cached
+    end
+
+    local ok, inventory = pcall(client.GetInventory, client)
     if not ok then
         return nil
     end
 
+    Inventory.cached = inventory
+    Inventory.cachedAt = now
     return inventory
 end
 
@@ -3123,14 +3265,25 @@ local Loot = {
     pending = {},
     pendingSet = {},
     lastSync = 0,
+    containerCache = nil,
+    seen = nil,
 }
 
 function Loot.container()
-    return workspace:FindFirstChild("TargetFilter") or workspace:FindFirstChild("Drops")
+    local container = Loot.containerCache
+
+    if container and container.Parent then
+        return container
+    end
+
+    container = workspace:FindFirstChild("TargetFilter") or workspace:FindFirstChild("Drops")
+    Loot.containerCache = container
+    return container
 end
 
 local partCache = setmetatable({}, { __mode = "k" })
 local ownerCache = setmetatable({}, { __mode = "k" })
+local nameCache = setmetatable({}, { __mode = "k" })
 
 function Loot.part(drop)
     local cached = partCache[drop]
@@ -3188,7 +3341,15 @@ function Loot.mine(drop)
 end
 
 function Loot.name(drop)
-    return (tostring(drop.Name):gsub("_Drop$", ""))
+    local cached = nameCache[drop]
+
+    if cached then
+        return cached
+    end
+
+    cached = (tostring(drop.Name):gsub("_Drop$", ""))
+    nameCache[drop] = cached
+    return cached
 end
 
 function Loot.count()
@@ -3203,12 +3364,21 @@ function Loot.sync(force)
 
     local container = Loot.container()
     if not container then
-        Loot.pending = {}
-        Loot.pendingSet = {}
+        if #Loot.pending > 0 then
+            table.clear(Loot.pending)
+            table.clear(Loot.pendingSet)
+        end
         return
     end
 
-    local seen = {}
+    local seen = Loot.seen
+
+    if seen then
+        table.clear(seen)
+    else
+        seen = {}
+        Loot.seen = seen
+    end
 
     for _, drop in ipairs(container:GetChildren()) do
         if (drop:IsA("Model") or drop:IsA("BasePart")) and Loot.part(drop) and Loot.mine(drop) then
@@ -3243,7 +3413,7 @@ end
 
 -- Loot has priority over mining: teleports straight to every own selected drop,
 -- waits for the touch, then returns. No radius limit, no grouping.
--- Caller must run Loot.sync(true) first (Farm does it right before).
+-- Farm calls `Loot.sync()` once per `lootSyncInterval` before checking the list.
 function Loot.collectAll(character)
     local root = character.PrimaryPart
     if not root then
@@ -3295,21 +3465,58 @@ end
 local MushroomNode = {}
 local mushroomIgnored = {}
 
+-- `workspace:GetChildren()` returns a fresh copy of every child, and it used to
+-- run on every Mushroom tick (20/s). The node list is now refreshed at most
+-- once per second and pruned in place.
+local nodeCache = { time = 0, list = {} }
+local nodeSet = setmetatable({}, { __mode = "k" })
+
+local function harvestables()
+    local now = os.clock()
+    local list = nodeCache.list
+
+    if now - nodeCache.time < 1 then
+        return list
+    end
+
+    nodeCache.time = now
+
+    for index = #list, 1, -1 do
+        local node = list[index]
+
+        if not node.Parent then
+            nodeSet[node] = nil
+            table.remove(list, index)
+        end
+    end
+
+    for _, node in ipairs(workspace:GetChildren()) do
+        if node.Name == "HarvestableNode" and not nodeSet[node] then
+            nodeSet[node] = true
+            table.insert(list, node)
+        end
+    end
+
+    return list
+end
+
 function MushroomNode.nearest(position)
     local best, bestDistance
     local now = os.clock()
 
-    for _, node in ipairs(workspace:GetChildren()) do
-        if node.Name == "HarvestableNode" then
-            local untilIgnore = mushroomIgnored[node]
-            if not untilIgnore or untilIgnore <= now then
-                local model = node:FindFirstChildWhichIsA("Model")
-                local box = model and model:FindFirstChild("BoundingBox")
-                if box and box:FindFirstChild("Interact") then
-                    local distance = (box.Position - position).Magnitude
-                    if not bestDistance or distance < bestDistance then
-                        best, bestDistance = box, distance
-                    end
+    for _, node in ipairs(harvestables()) do
+        local untilIgnore = mushroomIgnored[node]
+        if not untilIgnore or untilIgnore <= now then
+            local model = node:FindFirstChildWhichIsA("Model")
+            local box = model and model:FindFirstChild("BoundingBox")
+            if box and box:FindFirstChild("Interact") then
+                local dx = box.Position.X - position.X
+                local dy = box.Position.Y - position.Y
+                local dz = box.Position.Z - position.Z
+                local distance = dx * dx + dy * dy + dz * dz
+
+                if not bestDistance or distance < bestDistance then
+                    best, bestDistance = box, distance
                 end
             end
         end
@@ -3460,7 +3667,7 @@ function Plan.noteFailure(cell)
 end
 
 function Plan.build(start)
-    local mine = workspace:FindFirstChild(Config.mineName)
+    local mine = Blocks.model()
     if not mine then
         return nil
     end
@@ -3605,7 +3812,7 @@ function Plan.run(character, root, mineBlock)
             #path, cost, vec3ToString(path[#path])))
     end
 
-    local mine = workspace:FindFirstChild(Config.mineName)
+    local mine = Blocks.model()
     if not mine then
         Plan.reset()
         return false
@@ -3666,6 +3873,63 @@ function Plan.run(character, root, mineBlock)
     return true
 end
 
+-- Root hold + pickaxe prepare + timing for one block. Hoisted out of the Farm
+-- step so the old nested `mine` closure is not re-allocated every tick.
+local function mineTarget(character, block)
+    if not block or not block.Parent then
+        return false
+    end
+
+    if not Mining.inRange(character, block) then
+        return false
+    end
+
+    if not Mining.prepare(character) then
+        logWarn("no pickaxe")
+        return false
+    end
+
+    Movement.hold(character)
+    local ok, result = pcall(Mining.mine, character, block)
+    Movement.releaseHold()
+
+    return ok and result == true
+end
+
+-- `#mine:GetChildren()` copies the whole child list (tens of thousands of
+-- blocks). `FindFirstChildWhichIsA` answers "any block at all" without building
+-- a Lua table, and the result is cached for a second anyway.
+local function mineEmpty(mine)
+    local now = os.clock()
+
+    if Blocks.emptyModel == mine and now - (Blocks.emptyCheckedAt or 0) < 1 then
+        return Blocks.emptyValue
+    end
+
+    Blocks.emptyModel = mine
+    Blocks.emptyCheckedAt = now
+    Blocks.emptyValue = mine:FindFirstChildWhichIsA("BasePart") == nil
+    return Blocks.emptyValue
+end
+
+-- Preventive floor check is three `FindFirstChild` lookups plus string builds.
+-- Blocks only change when something mines them, so once per 0.25 s per cell is
+-- enough and keeps the per-tick path allocation-free.
+local clearCheck = { cell = nil, time = 0, value = true }
+
+local function columnClear(mine, cell)
+    local now = os.clock()
+
+    if clearCheck.cell == cell and now - clearCheck.time < 0.25 then
+        return clearCheck.value
+    end
+
+    clearCheck.cell = cell
+    clearCheck.time = now
+    clearCheck.value = Plan.clear(mine, cell)
+    return clearCheck.value
+end
+
 local FarmMode = Mode.new("Farm", function(self)
     local character = Character.get()
     if not self.enabled then
@@ -3710,7 +3974,7 @@ local FarmMode = Mode.new("Farm", function(self)
     end
 
     -- 1. Loot first: teleport to every own drop immediately.
-    Loot.sync(true)
+    Loot.sync()
 
     if Loot.count() > 0 then
         Loot.collectAll(character)
@@ -3731,43 +3995,13 @@ local FarmMode = Mode.new("Farm", function(self)
 
     local root = character.PrimaryPart
 
-    local function mine(block)
-        if not block or not block.Parent then
-            return false
-        end
-
-        if not Mining.inRange(character, block) then
-            return false
-        end
-
-        if not Mining.prepare(character) then
-            logWarn("no pickaxe")
-            return false
-        end
-
-        logPrint(("mine %s (%s)"):format(block.Name, tostring(typeOf(block))))
-
-        Movement.hold(character)
-        local ok, result = pcall(Mining.mine, character, block)
-        Movement.releaseHold()
-
-        if not ok or not result then
-            return false
-        end
-
-        -- No post-break sleep: the next tick starts with `Loot.sync(true)` and
-        -- picks up the drop as soon as it replicates, so waiting here only
-        -- delayed the next block.
-        return true
-    end
-
     Blocks.calibrate()
 
     -- Empty field: nothing to dig and no ground under it. Raise once and anchor,
     -- otherwise every tick teleports up and falls back.
-    local mineModel = workspace:FindFirstChild(Config.mineName)
+    local mineModel = Blocks.model()
 
-    if mineModel and #mineModel:GetChildren() == 0 then
+    if mineModel and mineEmpty(mineModel) then
         local safe = Vector3.new(
             Config.fieldCenter.X,
             Config.fieldCenter.Y + Config.emptyMineLift,
@@ -3800,7 +4034,7 @@ local FarmMode = Mode.new("Farm", function(self)
 
         if pit then
             if cell.X ~= pit.X or cell.Z ~= pit.Z then
-                local mine = workspace:FindFirstChild(Config.mineName)
+                local mine = Blocks.model()
                 local mouth = Vector3.new(pit.X, cell.Y, pit.Z)
 
                 -- Only jump into a mouth that is really empty.
@@ -3812,7 +4046,7 @@ local FarmMode = Mode.new("Farm", function(self)
                 local below = Blocks.below(root.Position)
 
                 if below then
-                    if mine(below) then
+                    if mineTarget(character, below) then
                         Movement.waitLanded(character)
                     else
                         Ores.ignore(below)
@@ -3847,7 +4081,7 @@ local FarmMode = Mode.new("Farm", function(self)
     local needPlan = Plan.current ~= nil
 
     if not needPlan and mineModel then
-        if belowReason ~= nil or not Plan.clear(mineModel, cell) then
+        if belowReason ~= nil or not columnClear(mineModel, cell) then
             needPlan = true
 
             if belowReason then
@@ -3857,7 +4091,9 @@ local FarmMode = Mode.new("Farm", function(self)
     end
 
     if needPlan then
-        if Plan.run(character, root, mine) then
+        if Plan.run(character, root, function(block)
+            return mineTarget(character, block)
+        end) then
             return
         end
 
@@ -3878,14 +4114,14 @@ local FarmMode = Mode.new("Farm", function(self)
     local ore = Ores.nearest(root.Position, Mining.reach())
 
     if ore then
-        if not mine(ore) then
+        if not mineTarget(character, ore) then
             Ores.ignore(ore)
         end
         return
     end
 
     -- 4. Nothing reachable: dig straight down, one block at a time.
-    if mine(below) then
+    if mineTarget(character, below) then
         Movement.waitLanded(character)
         return
     end
@@ -3898,6 +4134,7 @@ local FarmMode = Mode.new("Farm", function(self)
 end, function()
     Plan.reset()
     Movement.cancel()
+    Ores.clearCache()
 end)
 
 ---------------------------------------------------------------------------
@@ -4425,7 +4662,7 @@ function Ui.stats()
             selected,
             Loot.count(),
             tostring(Blocks.toBlock(character.PrimaryPart.Position).Y),
-            workspace:FindFirstChild(Config.mineName) and "ok" or "missing"
+            Blocks.model() and "ok" or "missing"
         ),
     }
 end
@@ -4443,14 +4680,23 @@ end
 -- `Ores`/`Sell` and by `Settings.bindSelection`, with indexes into `names`.
 function Ui.selection(names, indexes)
     local selected = {}
-    local widget = {}
+    local widget = { version = 0 }
 
     function widget.setSelected(index, state)
         index = math.floor(tonumber(index) or 0)
 
         if names[index] then
-            selected[index] = state == true or nil
+            local value = state == true or nil
+
+            if selected[index] ~= value then
+                selected[index] = value
+                widget.version = widget.version + 1
+            end
         end
+    end
+
+    function widget.getVersion()
+        return widget.version
     end
 
     function widget.getSelected()
@@ -5021,6 +5267,7 @@ function LogView.create()
     end
 
     Log.render = render
+    Log.dirty = false
     render(Log.lines)
 
     return gui
@@ -5038,6 +5285,15 @@ Settings.restore()
 Forge.bind()
 
 LogView.create()
+
+-- Deferred log rendering: one TextLabel write per interval, not per line. Runs
+-- outside `Ui.create` so the panel still updates if the window fails to build.
+task.spawn(function()
+    while true do
+        task.wait(Config.logRenderInterval)
+        pcall(Log.flush)
+    end
+end)
 
 local ok, window = pcall(Ui.create)
 if not ok or not window then
@@ -5079,7 +5335,7 @@ end)
 task.spawn(function()
     local character = Character.get()
     local pickaxe = Character.getPickaxe(character)
-    local mine = workspace:FindFirstChild(Config.mineName)
+    local mine = Blocks.model()
     local blocks = mine and mine:GetChildren() or {}
     local sample = blocks[1]
 
