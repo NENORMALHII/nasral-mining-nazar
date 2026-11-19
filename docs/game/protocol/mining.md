@@ -250,22 +250,28 @@ From `docs/game/data/player-stats.txt` (LocalPlayer attributes):
 - `WorldId` — must match the block's `WorldId` or the server rejects the block.
 - `Luck`, `DoubleDropChance`, `WalkSpeed` — not used by the bot.
 
-Wait time (bot formula, updated for server tolerance):
+Wait time (bot formula, matched to the official client):
 
 ```lua
 mineTime   = BaseMineTime * (100 - ToolSpeedModifier) / 100 * MineTimeModifier
-preSwing   = random(0.02 .. 0.06)  -- before BlockEvent (human reaction)
-jitter     = random(0.02 .. 0.07)  -- per-block variance
-penalty    = 0 .. 0.5              -- +0.12 per reject, -0.02 every 3 good breaks
-safety     = 0.05 + ping * 0.5 + penalty
-ping       = GetNetworkPing()      -- RTT, rolling 8-sample min
+preSwing   = 0                        -- official client fires BlockEvent on click
+jitter     = random(0.005 .. 0.015)   -- per-block variance
+penalty    = 0 .. 0.4                 -- +0.08 per reject, -0.01 every 2 good breaks
+safety     = 0.03 + min(ping * 0.1, 0.02) + penalty
+ping       = GetNetworkPing()         -- RTT, rolling 8-sample min
 waitTime   = mineTime + safety + jitter
 ```
 
+The official client (`decompiled/minescript.lua`) fires `BlockMinedEvent` from
+`ToolStatusGui.Completed`, i.e. when a progress bar of exactly `mineTime` seconds
+finishes, and adds **no ping margin**. Both remotes travel the same path, so the
+server measures the same `BlockEvent` → `BlockMinedEvent` delta; the small base and
+the capped ping term only cover packet-order jitter and the frame quantization of
+`task.wait`.
+
 Total time from `BlockEvent` to `BlockMinedEvent`: `waitTime`. Everything the
 bot waits after `BlockEvent` counts against the server's mine time, so there is
-no extra post-event delay: the human variance lives in `preSwing` before the
-claim.
+no extra post-event delay.
 
 Characteristic acquisition order:
 
@@ -276,17 +282,17 @@ Characteristic acquisition order:
 3. `MineTimeModifier` — from `Resources[typeOf(block)]`.
 4. Handle buffs are NOT added to mine time — the server already folds them into `ToolSpeedModifier`.
 
-Why rejections happen and how the new algorithm addresses them:
+Why rejections happen and how the algorithm addresses them:
 
 | Cause | Fix |
 |---|---|
-| `BlockMinedEvent` too early after `BlockEvent` | `waitTime = mineTime + safety + jitter` always exceeds server-expected time |
-| Network lag spikes | `safety` scales with rolling min ping (`0.05 + ping * 0.5`) |
-| Predictable timing | `preSwing` before the claim + `jitter` add human-like micro-delays |
-| Wrong margin for the actual server | `Mining.penalty` grows on a reject (+0.12), decays after 3 good breaks (-0.02), so the bot self-tunes instead of paying a fixed worst-case buffer |
+| `BlockMinedEvent` too early after `BlockEvent` | `waitTime = mineTime + safety + jitter` exceeds server-expected time by at least one frame |
+| Network lag spikes | capped ping cushion (`min(ping * 0.1, 0.02)`) plus the adaptive `penalty` |
+| Predictable timing | `jitter` adds 5–15 ms; no pre-swing delay (the official client has none either) |
+| Wrong margin for the actual server | `Mining.penalty` grows on a reject (+0.08), decays after 2 good breaks (-0.01), so the bot self-tunes instead of paying a fixed worst-case buffer |
 | Stale `BaseMineTime` from table | Server value waits on equip, takes priority over table |
 | Stale `ToolSpeedModifier` | Re-read from player attributes every mine |
-| Cancel sent too late | `mineRejectGrace = 0.6` s, poll interval 0.02 s |
+| Cancel sent too late | `mineRejectGrace = 0.6` s, removal polled once per frame |
 
 The client fires `BlockEvent`, waits `waitTime`, then fires `BlockMinedEvent`.
 Server validates that elapsed time >= expected `mineTime` (with its own tolerance).
@@ -455,8 +461,9 @@ is received, waits up to 6 heartbeats, and logs
   `frame N ms after <label>` above `frameWarn = 0.12` s. Labels are set before the
   non-yielding phases (`ore scan`, `plan build`, `plan`, `liquid set`, `block index`,
   `calibrate`, `surface scan`, `loot`, `mine`, `sell`, `forge`).
-- Per-block wall clock = `preSwing` + `waitTime`, with no post-break loot sleep and no fixed
-  extra loop delay.
+- Per-block wall clock = `waitTime` + the block-removal round trip: the next `BlockEvent` waits
+  until the server removes the previous block (the official client's target raycast does the
+  same), and removal is detected once per frame instead of on a 0.02–0.05 s poll.
 - StreamingEnabled caveat: if `workspace.StreamingEnabled` is true, a missing client block does
   not mean the block is missing on the server. `Surface.depth` and `Plan` would treat unloaded
   rock as air and dig into it. The bot assumes streaming is off.

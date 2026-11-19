@@ -73,6 +73,7 @@ stable across sessions:
 | `verboseLogs` | bool | Verbose logs | `Log.enabled` |
 | `logsWindow` | bool | Debug → Logs → Logs window (show/hide) | — (applied by `LogView.create`; the toggle calls `LogView.setEnabled`) |
 | `antiAfk` | bool | Session → Anti AFK | `AntiAfk.set` |
+| `experimentalMultiMine` | bool | Experimental → Multi mine → Mine 5 blocks (3x3) | `Experimental.setMultiMine` |
 | `autoRejoin` | bool | Auto rejoin → Session → Auto rejoin | `Rejoin.set` |
 | `autoloadEnabled` | bool | Auto load → Autoload | `AutoLoad.set` |
 | `autoloadSlot` | number (1..3) | Auto load → Save slot dropdown | `AutoLoad.slot` |

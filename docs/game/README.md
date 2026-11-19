@@ -47,6 +47,7 @@ docs/game/
 |---|---|
 | `block-drops.md` | `workspace.TargetFilter`, `{BlockName}_Drop`, `DropScript.Player` |
 | `sell.md` | `SellResourceFunction:InvokeServer(resource, count)` and resource counts |
+| `experimental.md` | Experimental "mine 5 blocks (3x3)" batch claim and its protocol |
 | `forge-remotes.md` | `ForgeUpdateEvent` actions and payloads |
 | `forge-instruction.md` | raw live-inspection paste for the forge, folded into `protocol/forge.md` |
 | `forge-automation.md` | surface-trip sequence: take result, add input, add fuel, then sell |

@@ -20,16 +20,22 @@ local Config = {
 
     mineWaitForServer = 1.5,
 
-    mineSafetyBase = 0.05,
-    mineSafetyPingMult = 0.5,
-    mineJitterMin = 0.02,
-    mineJitterMax = 0.07,
-    minePreSwingMin = 0.02,
-    minePreSwingMax = 0.06,
-    minePenaltyStep = 0.12,
-    minePenaltyMax = 0.5,
-    minePenaltyDecay = 0.02,
-    minePenaltyDecayEvery = 3,
+    -- The official client fires `BlockMinedEvent` when a progress bar of
+    -- exactly `mineTime` seconds completes (`ToolStatusGui.Completed`), with no
+    -- ping margin: both remotes travel the same path, so the server measures
+    -- the same delta. The remaining margin covers packet jitter and the
+    -- frame quantization of `task.wait`.
+    mineSafetyBase = 0.03,
+    mineSafetyPingMult = 0.1,
+    mineSafetyPingMax = 0.02,
+    mineJitterMin = 0.005,
+    mineJitterMax = 0.015,
+    minePreSwingMin = 0,
+    minePreSwingMax = 0,
+    minePenaltyStep = 0.08,
+    minePenaltyMax = 0.4,
+    minePenaltyDecay = 0.01,
+    minePenaltyDecayEvery = 2,
     mineRejectGrace = 0.6,
 
     mushroomDelay = 0.35,
@@ -2071,11 +2077,12 @@ function Mining.waitTime(block)
     local baseMine = Mining.mineTime(block)
     local jitter = math.random() * (Config.mineJitterMax - Config.mineJitterMin) + Config.mineJitterMin
 
-    -- Adaptive buffer: the base margin is small, `Mining.penalty` grows only
-    -- after a server rejection and decays after successful breaks. A rejected
-    -- block costs `mineRejectGrace` plus a retry, so one reject is more
-    -- expensive than the margin lost across many fast breaks.
-    local safety = Config.mineSafetyBase + ping * Config.mineSafetyPingMult + Mining.penalty
+    -- The official client waits exactly `mineTime`; the ping term here is only
+    -- a small cushion for packet-order jitter and is capped at one frame. The
+    -- adaptive `Mining.penalty` grows on a rejection and decays after good
+    -- breaks, so a bad link self-corrects instead of paying a fixed buffer.
+    local pingMargin = math.min(ping * Config.mineSafetyPingMult, Config.mineSafetyPingMax)
+    local safety = Config.mineSafetyBase + pingMargin + Mining.penalty
 
     return baseMine + safety + jitter
 end
@@ -2260,7 +2267,11 @@ function Mining.mine(character, block)
         Mining.penalty
     ))
 
-    task.wait(preSwing)
+    -- The official client fires `BlockEvent` immediately on click. Zero by
+    -- default: `task.wait(0)` would still burn a whole frame.
+    if preSwing > 0 then
+        task.wait(preSwing)
+    end
 
     if not block.Parent then
         return false
@@ -2269,8 +2280,7 @@ function Mining.mine(character, block)
     blockEvent:FireServer(block.Name, { dug = true })
 
     -- Everything after BlockEvent counts against the server's mine time, so the
-    -- old post-event "swing" delay was pure dead time and is gone: the human
-    -- variance lives in `preSwing` before the claim instead.
+    -- old post-event "swing" delay was pure dead time and is gone.
     task.wait(waitTime)
 
     if not block.Parent then
@@ -2280,9 +2290,12 @@ function Mining.mine(character, block)
 
     minedEvent:FireServer({ blockName = vec3ToString(position) })
 
+    -- Frame granularity instead of a fixed 0.05 s poll: the removal is the only
+    -- thing the next `BlockEvent` waits for, so a 3-frame poll added up to
+    -- ~50 ms per block.
     local deadline = os.clock() + Config.mineRejectGrace
     while block.Parent and os.clock() < deadline do
-        task.wait(0.05)
+        task.wait()
     end
 
     if block.Parent then
@@ -4174,6 +4187,154 @@ function MushroomNode.ignore(box)
 end
 
 ---------------------------------------------------------------------------
+-- Experimental
+---------------------------------------------------------------------------
+--
+-- Opt-in features that may be refused by the server. They stay behind a saved
+-- toggle and never run in the normal mining path until they prove safe.
+
+local Experimental = {
+    multiMine = false,
+}
+
+-- A plus inside the 3x3 cell layer around the target: the target itself plus
+-- its four horizontal neighbours (5 blocks).
+Experimental.multiOffsets = {
+    Vector3.new(1, 0, 0),
+    Vector3.new(-1, 0, 0),
+    Vector3.new(0, 0, 1),
+    Vector3.new(0, 0, -1),
+}
+
+function Experimental.setMultiMine(enabled)
+    Experimental.multiMine = enabled == true
+end
+
+-- Claim the target and up to four horizontal neighbours in one mine window.
+-- Each block still gets its own `BlockEvent` / `BlockMinedEvent`, and the
+-- server may accept or reject each claim independently, so a partial result is
+-- normal. One batch counts as one rejection for the adaptive penalty.
+function Experimental.mineMany(character, center)
+    Watchdog.mark("mine")
+    local blockEvent, minedEvent = Mining.remotes()
+
+    if not blockEvent or not minedEvent then
+        logWarn("remotes not found")
+        return false
+    end
+
+    local cell = Blocks.toBlock(center.Position)
+    local targets = {}
+
+    local function add(block)
+        if not block or not block.Parent then
+            return
+        end
+
+        if Mining.why(block) ~= nil then
+            return
+        end
+
+        if not Mining.inRange(character, block) then
+            return
+        end
+
+        local position = block:GetAttribute(Game.attrMinePosition)
+        if not position then
+            return
+        end
+
+        table.insert(targets, {
+            block = block,
+            name = vec3ToString(position),
+        })
+    end
+
+    add(center)
+
+    for _, offset in ipairs(Experimental.multiOffsets) do
+        add(Blocks.at(xyzToString(cell.X + offset.X, cell.Y + offset.Y, cell.Z + offset.Z)))
+    end
+
+    if #targets == 0 then
+        return false
+    end
+
+    for _, target in ipairs(targets) do
+        blockEvent:FireServer(target.block.Name, { dug = true })
+    end
+
+    local longest = 0
+
+    for _, target in ipairs(targets) do
+        longest = math.max(longest, Mining.mineTime(target.block))
+    end
+
+    -- One ping sample and one jitter for the whole batch; the longest mine time
+    -- keeps every claim at or above its own server requirement.
+    local margin = Mining.waitTime(center) - Mining.mineTime(center)
+    local waitTime = longest + margin
+
+    logPrint(("experimental multi-mine %d/%d wait=%.2f"):format(
+        #targets, #Experimental.multiOffsets + 1, waitTime))
+
+    task.wait(waitTime)
+
+    local pending = {}
+    local removed = 0
+
+    for _, target in ipairs(targets) do
+        if target.block.Parent then
+            minedEvent:FireServer({ blockName = target.name })
+            pending[#pending + 1] = target
+        else
+            Mining.confirm()
+            removed += 1
+        end
+    end
+
+    local deadline = os.clock() + Config.mineRejectGrace
+
+    while #pending > 0 and os.clock() < deadline do
+        task.wait()
+
+        for index = #pending, 1, -1 do
+            if not pending[index].block.Parent then
+                table.remove(pending, index)
+                Mining.confirm()
+                removed += 1
+            end
+        end
+    end
+
+    if #pending > 0 then
+        for _, target in ipairs(pending) do
+            blockEvent:FireServer(target.name, { dug = false })
+        end
+
+        -- A partial batch means the server refused some concurrent claims, not
+        -- that the timing was early: keep the single-block margin untouched and
+        -- only punish a batch where nothing was mined.
+        if removed == 0 then
+            Mining.rejects += 1
+            Mining.punish()
+
+            logWarn(("experimental multi-mine: 0/%d mined, streak=%d penalty=%.2f"):format(
+                #targets, Mining.rejects, Mining.penalty))
+
+            if Mining.rejects >= Config.maxRejects then
+                Mining.resetRequested = true
+            end
+        else
+            logWarn(("experimental multi-mine: %d/%d mined, %d refused"):format(
+                removed, #targets, #pending))
+        end
+    end
+
+    return removed > 0
+end
+
+---------------------------------------------------------------------------
 -- Farm mode
 ---------------------------------------------------------------------------
 
@@ -4576,7 +4737,9 @@ end
 
 -- Root hold + pickaxe prepare + timing for one block. Hoisted out of the Farm
 -- step so the old nested `mine` closure is not re-allocated every tick.
-local function mineTarget(character, block)
+-- `useExperimental` is only set by the ore-target call site; plan and down digs
+-- keep the single-block path.
+local function mineTarget(character, block, useExperimental)
     if not block or not block.Parent then
         return false
     end
@@ -4591,7 +4754,15 @@ local function mineTarget(character, block)
     end
 
     Movement.hold(character)
-    local ok, result = pcall(Mining.mine, character, block)
+
+    local ok, result
+
+    if useExperimental and Experimental.multiMine then
+        ok, result = pcall(Experimental.mineMany, character, block)
+    else
+        ok, result = pcall(Mining.mine, character, block)
+    end
+
     Movement.releaseHold()
 
     return ok and result == true
@@ -4640,6 +4811,11 @@ local FarmMode = Mode.new("Farm", function(self)
     if Mining.resetRequested then
         Mining.resetRequested = false
         Mining.rejects = 0
+
+        -- A reset is a fresh start: keep at most one penalty step as a cushion
+        -- instead of carrying a 0.4 s buffer through the next ~80 blocks.
+        Mining.penalty = math.min(Mining.penalty, Config.minePenaltyStep)
+        Mining.successes = 0
 
         -- Clear cached block mapping and ore scan state before choosing a target.
         Blocks.calibrated = false
@@ -4812,7 +4988,7 @@ local FarmMode = Mode.new("Farm", function(self)
     local ore = Ores.nearest(root.Position, Mining.reach())
 
     if ore then
-        if not mineTarget(character, ore) then
+        if not mineTarget(character, ore, true) then
             Ores.ignore(ore)
         end
         return
@@ -5453,6 +5629,11 @@ Settings.define("antiAfk", {
     apply = function(value) AntiAfk.set(value) end,
 })
 
+Settings.define("experimentalMultiMine", {
+    kind = "bool", default = false,
+    apply = function(value) Experimental.setMultiMine(value) end,
+})
+
 ---------------------------------------------------------------------------
 -- Render cover
 ---------------------------------------------------------------------------
@@ -6013,6 +6194,14 @@ function Ui.create()
     forgeFuelWidget.build(forgeFuelSection)
     Forge.bindFuel(forgeFuelWidget, forgeFuels)
     Settings.bindSelection("forgeFuels", forgeFuels, forgeFuelWidget)
+
+    local experimentalPage = window:addPage("Experimental")
+    local multiMineSection = experimentalPage:addSection("Multi mine")
+
+    multiMineSection:addToggle("Mine 5 blocks (3x3)", Settings.read("experimentalMultiMine"), function(state)
+        Settings.write("experimentalMultiMine", state)
+        logPrint("experimental multi-mine " .. (state and "on" or "off"))
+    end)
 
     local sessionPage = window:addPage("Session")
     local rejoinSection = sessionPage:addSection("Auto rejoin")
