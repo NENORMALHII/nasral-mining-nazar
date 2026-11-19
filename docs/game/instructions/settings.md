@@ -42,8 +42,8 @@ stable across sessions:
 
 - `Settings.selection(key, legacyKey, names)` returns the index list for a widget;
   `Settings.bindSelection(key, names, widget)` registers the widget and
-  `Settings.flushSelections()` (called every 0.5 s from its own timer) stores the current
-  names. The timer is separate from the 3 s stats readout: a failing stat cannot stop the
+  `Settings.flushSelections()` (a 0.5 s job on the shared scheduler) stores the current
+  names. The job is separate from the 3 s stats readout: a failing stat cannot stop the
   options from being saved.
 - The Venyx UI has no multi-select widget, so `Ui.selection(names, indexes)` builds one as a
   toggle per entry and exposes `getSelected()` / `setSelected()`, the interface `Ores`,
@@ -71,6 +71,8 @@ stable across sessions:
 | `forgeOres` | names (`none`) | Forge → Ores to smelt selection | — |
 | `forgeFuels` | names (`none`) | Forge → Fuel selection | — |
 | `verboseLogs` | bool | Verbose logs | `Log.enabled` |
+| `logsWindow` | bool | Debug → Logs → Logs window (show/hide) | — (applied by `LogView.create`; the toggle calls `LogView.setEnabled`) |
+| `antiAfk` | bool | Session → Anti AFK | `AntiAfk.set` |
 | `autoRejoin` | bool | Auto rejoin → Session → Auto rejoin | `Rejoin.set` |
 | `autoloadEnabled` | bool | Auto load → Autoload | `AutoLoad.set` |
 | `autoloadSlot` | number (1..3) | Auto load → Save slot dropdown | `AutoLoad.slot` |
@@ -93,6 +95,35 @@ full-screen `Frame` (`IgnoreGuiInset`, `Size = UDim2.fromScale(1, 1)`) with `Dis
 `Active`, so clicks still reach the bot UI underneath and the toggle can be turned back off.
 Turning the toggle off hides the cover (`Enabled = false`); the ScreenGui is created once and
 reused.
+
+## Logs window
+
+Debug → Logs → `Logs window` (`logsWindow`, default on) shows or hides the whole log
+window. Hiding sets `ScreenGui.Enabled = false` and skips `LogView.render`, so a hidden
+panel costs no text layout; re-enabling re-renders `Log.lines` immediately.
+
+The window is a second Venyx window (`Ui.load().new("nm2 logs")`) built before the main
+window. Each `Ui.load()` execution has its own `utility` keybind table, so the second
+window cannot reset or double-fire the main window's menu keybind. The library's tab
+column is hidden; the body is a `ScrollingFrame` with a `TextLabel` that auto-scrolls to
+the newest of the `Log.maxLines = 12` lines.
+
+- Titlebar `-`/`+` button collapses the body to `UI_TITLE` (38 px), like the main window.
+- Mouse drag is the library's `DraggingEnabled`; touch drag is `Ui.enableTouchDrag`
+  (drag origin in offsets, same translation as the main window on mobile).
+- The window starts bottom-left above the hotbar and keeps its dragged position for the
+  session (position is not saved).
+
+## Anti AFK
+
+Session → `Anti AFK` section (`antiAfk`, default on).
+
+- On: `AntiAfk.bind()` drops the client's `Idled` handlers (when `getconnections` is
+  available), re-runs the drop 3 s later, and keeps the `Idled` + 240 s timer presses.
+- Off: `AntiAfk.press` returns immediately and the timer skips; no synthetic input is
+  sent. The `Idled` handlers already removed by `silence` stay removed — an executor
+  cannot restore them, so turning the option off does not re-arm the game's own idle
+  disconnect. See `anti-afk.md`.
 
 ## Auto rejoin
 

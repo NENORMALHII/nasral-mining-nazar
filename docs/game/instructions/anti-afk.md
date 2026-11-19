@@ -1,6 +1,10 @@
 # Anti-AFK
 
-`src/main.lua`, module `AntiAfk`, bound at bootstrap.
+`src/main.lua`, module `AntiAfk`, saved toggle `antiAfk` (Session → Anti AFK, default on).
+`AntiAfk.set` is the registry restore hook: enabling binds the handlers, disabling stops
+the synthetic input (`AntiAfk.press` returns immediately, the 240 s timer skips). Turning
+the option off does not restore the `Idled` handlers that `silence` removed; an executor
+cannot re-add them.
 
 Roblox disconnects a client after 20 minutes without **user input**. Bot actions
 (teleports, `FireServer`, mining, movement) do not reset that timer. Two layers

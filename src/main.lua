@@ -640,6 +640,26 @@ local function logWarn(...)
 end
 
 ---------------------------------------------------------------------------
+-- Log view state
+---------------------------------------------------------------------------
+--
+-- Declared early so `Ui.create`'s "Logs window" toggle can reference it; the
+-- window itself is built in `LogView.create` once the UI helpers exist.
+
+local LogView = {
+    enabled = true,
+    window = nil,
+    gui = nil,
+    main = nil,
+    scroll = nil,
+    label = nil,
+    button = nil,
+    collapsed = false,
+    width = 420,
+    height = 176,
+}
+
+---------------------------------------------------------------------------
 -- Scheduler (one timer thread for periodic jobs)
 ---------------------------------------------------------------------------
 
@@ -5178,6 +5198,7 @@ end
 -- actions cannot be fooled from the client.
 
 local AntiAfk = {
+    enabled = true,
     bound = false,
     presses = 0,
     last = 0,
@@ -5273,6 +5294,10 @@ function AntiAfk.silence()
 end
 
 function AntiAfk.press(reason)
+    if not AntiAfk.enabled then
+        return false
+    end
+
     local now = os.clock()
 
     if now - AntiAfk.last < 1 then
@@ -5324,9 +5349,24 @@ function AntiAfk.bind()
     task.spawn(function()
         while true do
             task.wait(Config.antiAfkInterval)
-            AntiAfk.press("timer")
+
+            if AntiAfk.enabled then
+                AntiAfk.press("timer")
+            end
         end
     end)
+end
+
+-- Saved toggle. Enabling binds the handlers once; disabling only stops the
+-- synthetic input and the timer press. The `Idled` handlers removed by
+-- `silence` stay removed (an executor cannot restore them) — see
+-- `docs/game/instructions/anti-afk.md`.
+function AntiAfk.set(enabled)
+    AntiAfk.enabled = enabled == true
+
+    if AntiAfk.enabled then
+        AntiAfk.bind()
+    end
 end
 
 ---------------------------------------------------------------------------
@@ -5402,6 +5442,15 @@ Settings.define("autoloadSlot", {
 Settings.define("autoloadEnabled", {
     kind = "bool", default = false,
     apply = function(value) AutoLoad.set(value) end,
+})
+
+Settings.define("logsWindow", {
+    kind = "bool", default = true,
+})
+
+Settings.define("antiAfk", {
+    kind = "bool", default = true,
+    apply = function(value) AntiAfk.set(value) end,
 })
 
 ---------------------------------------------------------------------------
@@ -5607,6 +5656,42 @@ local function viewportSize()
     return size
 end
 
+-- uilib's `DraggingEnabled` is mouse-only. Touch needs the same translation
+-- (drag origin + delta in offsets), used by both the main window and the log
+-- window. The main window keeps its mobile-only call: on PC its position is
+-- still scale-based until `layout()` runs.
+function Ui.enableTouchDrag(main, topbar)
+    local dragging, dragStart, dragOrigin
+
+    topbar.InputBegan:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.Touch then
+            return
+        end
+
+        dragging = true
+        dragStart = input.Position
+        dragOrigin = main.Position
+
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if not dragging or input.UserInputType ~= Enum.UserInputType.Touch then
+            return
+        end
+
+        local delta = input.Position - dragStart
+        main.Position = UDim2.fromOffset(
+            dragOrigin.X.Offset + delta.X,
+            dragOrigin.Y.Offset + delta.Y
+        )
+    end)
+end
+
 -- uilib hardcodes a 511x428 window at `(0.25, 0)` (off-screen on a phone),
 -- gives the tab strip a fixed 314 px canvas without a scrollbar, and hides the
 -- window only through a keybind. `Ui.adapt` keeps the widget tree and changes
@@ -5733,35 +5818,7 @@ function Ui.adapt(window)
     end)
 
     if mobile then
-        local dragging, dragStart, dragOrigin
-
-        topbar.InputBegan:Connect(function(input)
-            if input.UserInputType ~= Enum.UserInputType.Touch then
-                return
-            end
-
-            dragging = true
-            dragStart = input.Position
-            dragOrigin = main.Position
-
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                end
-            end)
-        end)
-
-        UserInputService.InputChanged:Connect(function(input)
-            if not dragging or input.UserInputType ~= Enum.UserInputType.Touch then
-                return
-            end
-
-            local delta = input.Position - dragStart
-            main.Position = UDim2.fromOffset(
-                dragOrigin.X.Offset + delta.X,
-                dragOrigin.Y.Offset + delta.Y
-            )
-        end)
+        Ui.enableTouchDrag(main, topbar)
     end
 
     local camera = workspace.CurrentCamera
@@ -5978,6 +6035,13 @@ function Ui.create()
         logPrint("autoload " .. (state and "on" or "off"))
     end)
 
+    local afkSection = sessionPage:addSection("Anti AFK")
+
+    afkSection:addToggle("Anti AFK", Settings.read("antiAfk"), function(state)
+        Settings.write("antiAfk", state)
+        logPrint("anti-afk " .. (state and "on" or "off"))
+    end)
+
     local debugPage = window:addPage("Debug")
     local statsSection = debugPage:addSection("Stats")
 
@@ -5993,6 +6057,11 @@ function Ui.create()
     end
 
     local logSection = debugPage:addSection("Logs")
+
+    logSection:addToggle("Logs window", Settings.read("logsWindow"), function(state)
+        LogView.setEnabled(state)
+        Settings.write("logsWindow", state)
+    end)
 
     logSection:addToggle("Verbose logs", savedVerbose, function(state)
         Log.enabled = state
@@ -6073,65 +6142,150 @@ function Ui.create()
 end
 
 ---------------------------------------------------------------------------
--- Log view
+-- Log view (uilib window)
 ---------------------------------------------------------------------------
+--
+-- Same library instance shape as the main window, but a separate `Ui.load()`
+-- execution: each library instance owns its own `utility` keybind table, so the
+-- second window cannot reset or double-fire the main window's menu keybind.
 
-local LogView = {}
+function LogView.render(lines)
+    if not LogView.enabled or not LogView.label then
+        return
+    end
+
+    LogView.label.Text = table.concat(lines, "\n")
+
+    -- `CanvasPosition` is clamped to the canvas, so a huge Y means "bottom".
+    if LogView.scroll then
+        LogView.scroll.CanvasPosition = Vector2.new(0, 1e6)
+    end
+end
+
+function LogView.setEnabled(enabled)
+    LogView.enabled = enabled == true
+
+    if LogView.gui then
+        LogView.gui.Enabled = LogView.enabled
+    end
+
+    if LogView.enabled then
+        LogView.render(Log.lines)
+    end
+end
+
+function LogView.setCollapsed(state)
+    local main = LogView.main
+    if not main then
+        return
+    end
+
+    LogView.collapsed = state == true
+    main.ClipsDescendants = LogView.collapsed
+    main.Size = UDim2.fromOffset(
+        LogView.width,
+        LogView.collapsed and UI_TITLE or LogView.height
+    )
+
+    if LogView.scroll then
+        LogView.scroll.Visible = not LogView.collapsed
+    end
+
+    if LogView.button then
+        LogView.button.Text = LogView.collapsed and "+" or "-"
+    end
+end
 
 function LogView.create()
-    local playerGui = Players.LocalPlayer:WaitForChild("PlayerGui")
+    if LogView.window then
+        return LogView.gui
+    end
 
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "NM2_Logs"
-    gui.ResetOnSpawn = false
-    gui.Parent = playerGui
+    local library = Ui.load()
+    local window = library.new("nm2 logs")
+    local main = window.container.Main
+    local topbar = main.TopBar
+    local viewport = viewportSize()
+    local width = math.max(240, math.min(520, viewport.X - 20))
 
-    local frame = Instance.new("Frame")
-    frame.Name = "LogFrame"
-    frame.Size = UDim2.fromOffset(math.min(520, viewportSize().X - 20), 150)
-    frame.Position = UDim2.new(0, 10, 1, -160)
-    frame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
-    frame.BackgroundTransparency = 0.15
-    frame.BorderSizePixel = 0
-    frame.Parent = gui
+    -- No pages: the window body is the log itself, so the library's tab column
+    -- is removed instead of leaving an empty sidebar.
+    main.Pages.Visible = false
+    main.Size = UDim2.fromOffset(width, LogView.height)
+    main.Position = UDim2.fromOffset(10, math.max(10, viewport.Y - LogView.height - 10))
+    main.ClipsDescendants = false
+
+    topbar.Title.Size = UDim2.new(1, -74, 0, 16)
+
+    local button = Instance.new("TextButton")
+    button.Name = "Collapse"
+    button.AnchorPoint = Vector2.new(1, 0.5)
+    button.Position = UDim2.new(1, -6, 0.5, 0)
+    button.Size = UDim2.fromOffset(28, 28)
+    button.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    button.BorderSizePixel = 0
+    button.AutoButtonColor = true
+    button.Font = Enum.Font.GothamBold
+    button.TextSize = 16
+    button.TextColor3 = Color3.fromRGB(255, 255, 255)
+    button.Text = "-"
+    button.ZIndex = 6
+    button.Parent = topbar
 
     local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 6)
-    corner.Parent = frame
+    corner.CornerRadius = UDim.new(0, 4)
+    corner.Parent = button
 
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -12, 0, 16)
-    title.Position = UDim2.fromOffset(6, 4)
-    title.BackgroundTransparency = 1
-    title.Font = Enum.Font.GothamBold
-    title.TextSize = 11
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.TextColor3 = Color3.fromRGB(150, 200, 150)
-    title.Text = "NM2 logs"
-    title.Parent = frame
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Name = "LogScroll"
+    scroll.Parent = main
+    scroll.Position = UDim2.fromOffset(8, UI_TITLE + 8)
+    scroll.Size = UDim2.new(1, -16, 1, -(UI_TITLE + 14))
+    scroll.BackgroundTransparency = 1
+    scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 3
+    scroll.ScrollBarImageColor3 = Color3.fromRGB(14, 14, 14)
+    scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroll.ScrollingEnabled = true
+    scroll.ZIndex = 2
 
     local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(1, -12, 1, -26)
-    label.Position = UDim2.fromOffset(6, 20)
+    label.Name = "LogText"
+    label.Parent = scroll
     label.BackgroundTransparency = 1
+    label.Size = UDim2.new(1, -6, 0, 0)
+    label.AutomaticSize = Enum.AutomaticSize.Y
     label.Font = Enum.Font.Code
     label.TextSize = 12
     label.TextWrapped = true
     label.TextXAlignment = Enum.TextXAlignment.Left
-    label.TextYAlignment = Enum.TextYAlignment.Bottom
+    label.TextYAlignment = Enum.TextYAlignment.Top
     label.TextColor3 = Color3.fromRGB(220, 220, 220)
     label.Text = ""
-    label.Parent = frame
+    label.ZIndex = 2
 
-    local function render(lines)
-        label.Text = table.concat(lines, "\n")
-    end
+    LogView.window = window
+    LogView.gui = window.container
+    LogView.main = main
+    LogView.scroll = scroll
+    LogView.label = label
+    LogView.button = button
+    LogView.width = width
 
-    Log.render = render
+    button.MouseButton1Click:Connect(function()
+        LogView.setCollapsed(not LogView.collapsed)
+    end)
+
+    -- Mouse drag comes from `library.new`; touch needs the same translation.
+    Ui.enableTouchDrag(main, topbar)
+
+    Log.render = LogView.render
     Log.dirty = false
-    render(Log.lines)
+    LogView.render(Log.lines)
+    LogView.setEnabled(Settings.read("logsWindow"))
 
-    return gui
+    return LogView.gui
 end
 
 ---------------------------------------------------------------------------
@@ -6144,9 +6298,11 @@ end
 Settings.restore()
 
 Forge.bind()
-AntiAfk.bind()
 
-LogView.create()
+local logOk, logErr = pcall(LogView.create)
+if not logOk then
+    warn("[main] logs failed: " .. tostring(logErr))
+end
 
 -- Deferred log rendering: one TextLabel write per interval, not per line. Runs
 -- outside `Ui.create` so the panel still updates if the window fails to build.
