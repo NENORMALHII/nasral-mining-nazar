@@ -4676,14 +4676,15 @@ end
 -- Anti-AFK
 ---------------------------------------------------------------------------
 --
--- Roblox disconnects the client after 20 minutes without user input; bot
--- movement does not count, only real input events. `Player.Idled` fires when the
--- client notices it, and a virtual click resets the idle timer. The timer also
--- presses every `Config.antiAfkInterval` seconds so the client never reaches the
--- limit at all.
+-- Roblox disconnects a client after 20 minutes without user input; bot
+-- movement and FireServer calls do not count. Two layers, the same shape as
+-- Infinite Yield's `antiafk`:
+--   1. drop the client's own `Player.Idled` handlers through the executor
+--      `getconnections` API, so the inactivity prompt never starts;
+--   2. feed a real virtual input event on `Idled` and on a 4-minute timer.
 --
--- This only affects the local client input stream. A game-side AFK check that
--- counts replicated actions cannot be fooled from the client.
+-- Layer 1 is local-client only: a game-side AFK check that counts replicated
+-- actions cannot be fooled from the client.
 
 local AntiAfk = {
     bound = false,
@@ -4691,13 +4692,30 @@ local AntiAfk = {
     last = 0,
 }
 
-local function virtualClick()
-    local manager = game:FindService("VirtualUser")
+-- `VirtualInputManager` is not a published service, but executors let scripts
+-- create it; Infinite Yield uses `Instance.new("VirtualInputManager")` and
+-- `SendMouseButtonEvent` for the same reset. A real mouse event at (0, 0) is the
+-- strongest reset because it goes through the input pipeline.
+local function virtualMouse()
+    return pcall(function()
+        local manager = Instance.new("VirtualInputManager")
+        manager:SendMouseButtonEvent(0, 0, 0, true, game, 0)
+        manager:SendMouseButtonEvent(0, 0, 0, false, game, 0)
+        manager:Destroy()
+    end)
+end
 
-    if manager then
+local function virtualClick()
+    if virtualMouse() then
+        return true
+    end
+
+    local virtualUser = game:FindService("VirtualUser")
+
+    if virtualUser then
         local ok = pcall(function()
-            manager:CaptureController()
-            manager:ClickButton2(Vector2.zero)
+            virtualUser:CaptureController()
+            virtualUser:ClickButton2(Vector2.zero)
         end)
 
         if ok then
@@ -4705,7 +4723,6 @@ local function virtualClick()
         end
     end
 
-    -- Hidden service available in Studio and most executors.
     local ok = pcall(function()
         local input = game:GetService("VirtualInputManager")
         input:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
@@ -4717,7 +4734,6 @@ local function virtualClick()
         return true
     end
 
-    -- Executor keyboard helpers.
     if type(keypress) == "function" then
         local pressed = pcall(keypress, 0x20)
 
@@ -4735,6 +4751,36 @@ local function virtualClick()
     return false
 end
 
+-- Disconnect the handlers the client installed on `Idled`. This is what
+-- actually removes the 20-minute disconnect instead of only resetting the
+-- timer; the synthetic input below is the fallback when `getconnections` is
+-- unavailable or a handler is attached again later.
+function AntiAfk.silence()
+    if type(getconnections) ~= "function" then
+        return 0
+    end
+
+    local ok, connections = pcall(getconnections, Players.LocalPlayer.Idled)
+
+    if not ok or type(connections) ~= "table" then
+        return 0
+    end
+
+    local removed = 0
+
+    for _, connection in ipairs(connections) do
+        pcall(function() connection:Disable() end)
+        pcall(function() connection:Disconnect() end)
+        removed = removed + 1
+    end
+
+    if removed > 0 then
+        logPrint(("anti-afk: disabled %d Idled handler(s)"):format(removed))
+    end
+
+    return removed
+end
+
 function AntiAfk.press(reason)
     local now = os.clock()
 
@@ -4746,8 +4792,6 @@ function AntiAfk.press(reason)
     local pressed = virtualClick()
 
     if not pressed then
-        AntiAfk.warned = AntiAfk.warned or false
-
         if not AntiAfk.warned then
             AntiAfk.warned = true
             logWarn("anti-afk: no virtual input available, idle kick still possible")
@@ -4771,10 +4815,18 @@ function AntiAfk.bind()
     end
 
     AntiAfk.bound = true
+    AntiAfk.silence()
 
-    pcall(function()
-        Players.LocalPlayer.Idled:Connect(function()
-            AntiAfk.press("idled")
+    task.spawn(function()
+        -- CoreScripts can install their `Idled` handler a few seconds after the
+        -- first script runs: silence once more, then keep our own handler.
+        task.wait(3)
+        AntiAfk.silence()
+
+        pcall(function()
+            AntiAfk.connection = Players.LocalPlayer.Idled:Connect(function()
+                AntiAfk.press("idled")
+            end)
         end)
     end)
 
