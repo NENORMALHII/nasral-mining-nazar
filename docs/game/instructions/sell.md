@@ -49,9 +49,11 @@ independent from the farming modes:
 Selling MUST call `ReplicatedStorage.TeleportToSurfaceFunction` (RemoteFunction,
 `InvokeServer()`); the server teleports the player to the surface and only then
 accepts the sale. `Sell.toSurface` calls it on every sale (auto and manual), logs
-`autosell: called TeleportToSurfaceFunction`, waits `surfaceTeleportWait = 0.5` s
-for the landing and falls back to a client-side `Movement.jump` only when the
-remote is missing.
+`autosell: called TeleportToSurfaceFunction`, waits `surfaceTeleportWait = 0.5` s,
+then waits up to `sellSurfaceWait = 2` s for the character to actually be on the
+surface layer (`Sell.waitSurfaced` checks `Blocks.toBlock(...).Y < surfaceDepth`,
+the same convention `FarmMode` uses), then `Movement.waitLanded` for the landing.
+It falls back to a client-side `Movement.jump` only when the remote is missing.
 
 The server itself places the player at the accepted sell point
 (`Config.sellAnchor = (78, 8013, -219)` is kept only for the fallback jump when
@@ -63,10 +65,13 @@ deferred to the next watcher tick instead of interrupting it.
 `TeleportToSurfaceFunction` is the only supported way to reach the surface for a
 sale; do not rely on the client-side jump.
 
-Timeline: `Config.sellHoldBefore = 2` s on the anchor, then all `InvokeServer` calls,
-then `Config.sellHoldAfter = 1` s on the anchor after the last remote, and only then
-`Movement.releaseHold`. Without the anchor the character falls from the sell point
-and the server rejects part of the sale.
+Timeline: `Config.sellHoldBefore = 2` s on the anchor, then all `InvokeServer` calls
+with `Config.sellItemDelay = 0.1` s between them, then `Config.sellHoldAfter = 1` s
+on the anchor after the last remote, and only then `Movement.releaseHold`. Without
+the anchor the character falls from the sell point and the server rejects part of
+the sale. `Inventory.invalidate()` runs before the counts are collected, so bars
+taken from the forge seconds earlier are not read from the stale 0.25 s snapshot.
+The per-item gap keeps the server's inventory update from racing the next call.
 `Sell.busy` is set for the whole
 surface trip, and `FarmMode`/`MushroomMode` return immediately while it is set,
 so they cannot move the character or clear the anchor mid-sale.
@@ -81,6 +86,8 @@ Diagnostics (throttled to one line per 10 s for repeated states):
 - `sell run (<origin>) names=N selected=S with=C units=U used=U/M src=<source>`;
 - `sell: inventory source=<src>, per-resource counts may be 0`;
 - `autosell: no resources selected` / `autosell: selected resources have zero count`;
+- `autosell: still below the surface after TeleportToSurfaceFunction` — the
+  teleport did not reach the surface layer inside `sellSurfaceWait`;
 - `inventory: InventoriesClient ready`, or a distinct warning for each load failure.
 
 The Auto sell list is built by `Sell.names()`, a flat view of `Sell.groups()`:

@@ -88,6 +88,8 @@ local Config = {
     sellAnchor = Vector3.new(78, 8013, -219),
     surfaceRemote = "TeleportToSurfaceFunction",
     surfaceTeleportWait = 0.5,
+    sellSurfaceWait = 2,
+    sellItemDelay = 0.1,
     sellHoldBefore = 2,
     sellHoldAfter = 1,
 
@@ -97,8 +99,10 @@ local Config = {
     forgeUpdateRemote = "ForgeUpdateEvent",
     forgeToggleRemote = "ToggleForgeEvent",
     forgeOpenWait = 1,
-    forgeStateWait = 1,
+    forgeStateWait = 1.5,
     forgeActionWait = 0.35,
+    forgeOpenBuffer = 0.2,
+    forgeSettle = 0.3,
     forgeMaxFuelUnits = 10,
 
     blockEvent = "BlockEvent",
@@ -2660,6 +2664,14 @@ function Inventory.get()
     return inventory
 end
 
+-- Drop the snapshot after anything that changes the inventory (a forge action,
+-- a sale). Without this, a count read within 0.25 s of the change still sees the
+-- old table and the sell can skip freshly taken bars.
+function Inventory.invalidate()
+    Inventory.cached = nil
+    Inventory.cachedAt = 0
+end
+
 -- nil when the inventory module is not loaded yet, so callers can fall back.
 function Inventory.count(name)
     local inventory = Inventory.get()
@@ -2771,8 +2783,44 @@ function Forge.fuelModule()
     return Forge.fuelData
 end
 
+-- Sale value of one smelted bar. Bars carry `Multiplier` but no `BasePrice`,
+-- so it is the ore price times the bar multiplier. Falls back to the ore price
+-- when the result is not in the catalogue.
+function Forge.oreValue(name)
+    local result = Forge.result(name)
+    local bar = result and resourceInfo(result)
+    local multiplier = bar and bar.Multiplier or 1
+
+    return Ores.price(name) * multiplier
+end
+
+-- Highest-value ore first: the forge input takes one ore type and the UI order
+-- is the priority order, so the list is sorted by bar value (ties by name, for a
+-- stable order between sessions). Cached: the UI maps saved names to indexes
+-- against this table, and it must not change after the widget is built.
 function Forge.oreNames()
-    return Forge.oreList
+    if Forge.oreNamesCache then
+        return Forge.oreNamesCache
+    end
+
+    local names = {}
+
+    for _, name in ipairs(Forge.oreList) do
+        table.insert(names, name)
+    end
+
+    table.sort(names, function(a, b)
+        local valueA, valueB = Forge.oreValue(a), Forge.oreValue(b)
+
+        if valueA == valueB then
+            return a < b
+        end
+
+        return valueA > valueB
+    end)
+
+    Forge.oreNamesCache = names
+    return names
 end
 
 function Forge.fuelNames()
@@ -2980,9 +3028,16 @@ function Forge.enter(part)
         return false
     end
 
-    if Forge.waitState(function()
+    local opened = Forge.waitState(function()
         return Forge.opened
-    end, Config.forgeOpenWait) then
+    end, Config.forgeOpenWait)
+
+    -- The update remotes are fired immediately after this returns: give the
+    -- server a moment to register the open state even when the client event was
+    -- missed or arrived late.
+    task.wait(Config.forgeOpenBuffer)
+
+    if opened then
         Forge.openedByService = true
         return true
     end
@@ -3035,13 +3090,20 @@ function Forge.takeResult(update)
 
     update:FireServer("TakeResult")
 
-    if amount <= 0 then
-        return 0
+    -- The remote is fire-and-forget: wait one step before reading state, and
+    -- always give the server time to move the result even when the client
+    -- believes the output is empty.
+    task.wait(Config.forgeActionWait)
+
+    if amount > 0 then
+        Forge.waitState(function()
+            return Forge.outputAmount() ~= amount
+        end)
     end
 
-    Forge.waitState(function()
-        return Forge.outputAmount() ~= amount
-    end)
+    -- The inventory changed (or may have): the next count must not come from
+    -- the pre-take snapshot.
+    Inventory.invalidate()
 
     return amount
 end
@@ -3060,9 +3122,16 @@ function Forge.addInput(update)
 
         if count > 0 then
             update:FireServer("AddInput", { name, count })
+
+            -- Fire-and-forget remote: one step before reading state, then wait
+            -- for the server to report the queued amount.
+            task.wait(Config.forgeActionWait)
+
             Forge.waitState(function()
                 return Forge.inputAmount() > 0
             end)
+
+            Inventory.invalidate()
 
             local queued, queuedType = Forge.inputAmount()
 
@@ -3113,6 +3182,9 @@ function Forge.addFuel(update, oreName, inputCount)
                 task.wait(Config.forgeActionWait)
             end
 
+            -- Fuel came out of the inventory: the next count must be fresh.
+            Inventory.invalidate()
+
             logPrint(("forge: fuel %s x%d covers %ds of %ds"):format(
                 name, units, units * perUnit, needed))
             return units
@@ -3152,6 +3224,11 @@ function Forge.service(origin, force)
         added, oreName = Forge.addInput(update)
         fueled = Forge.addFuel(update, oreName, added)
     end)
+
+    -- Let the last remote land before the forge is closed and the caller sells.
+    if ok then
+        task.wait(Config.forgeSettle)
+    end
 
     if opened then
         Forge.leave(part)
@@ -3403,6 +3480,29 @@ function Sell.diag(key, text)
     logPrint(text)
 end
 
+-- The surface teleport is a server-side move: `InvokeServer` returning does not
+-- mean the character is already up. Wait for the block layer to be at surface
+-- level before the caller anchors the root, otherwise the anchor can freeze the
+-- character mid-fall or still inside the mine.
+function Sell.waitSurfaced(character)
+    local root = character and character.PrimaryPart
+    if not root then
+        return false
+    end
+
+    local deadline = os.clock() + Config.sellSurfaceWait
+
+    while os.clock() < deadline do
+        if Blocks.toBlock(root.Position).Y < Config.surfaceDepth then
+            return true
+        end
+
+        task.wait(0.05)
+    end
+
+    return false
+end
+
 -- Selling must go through ReplicatedStorage.TeleportToSurfaceFunction: the server
 -- moves the player to the surface and only then accepts the sale. Client-side
 -- movement is kept as a fallback when the remote is missing.
@@ -3426,6 +3526,11 @@ function Sell.toSurface(character)
         end
 
         task.wait(Config.surfaceTeleportWait)
+
+        if not Sell.waitSurfaced(character) then
+            Sell.diag("surface", "autosell: still below the surface after " .. Config.surfaceRemote)
+        end
+
         Movement.waitLanded(character, Config.surfaceTeleportWait)
         return true
     end
@@ -3488,8 +3593,11 @@ function Sell.try(origin)
         return Sell.run(false, origin)
     end
 
-    local character = Character.get()
+    -- Take the busy flag before `Character.get()`: that call can yield on a
+    -- respawn, and a second watcher tick must not start another surface trip.
     Sell.busy = true
+
+    local character = Character.get()
 
     local ok, sold = pcall(function()
         if not Sell.toSurface(character) then
@@ -3548,6 +3656,10 @@ function Sell.run(force, origin)
         return 0
     end
 
+    -- Forge actions and the surface teleport run right before this: read counts
+    -- from a fresh inventory, not from a snapshot taken before they finished.
+    Inventory.invalidate()
+
     local selected = Sell.selectedSet()
     local sold = 0
     local used, capacity, source = Sell.usage()
@@ -3598,6 +3710,10 @@ function Sell.run(force, origin)
             sold += count
             logPrint(("sold %s x%d -> %s"):format(name, count, tostring(result)))
         end
+
+        -- One remote per resource: a small gap keeps the server's inventory
+        -- update from racing the next call.
+        task.wait(Config.sellItemDelay)
     end
 
     return sold
@@ -3617,8 +3733,10 @@ function Sell.manual()
         return 0
     end
 
-    local character = Character.get()
+    -- See `Sell.try`: take the flag before the (possibly yielding) lookup.
     Sell.busy = true
+
+    local character = Character.get()
 
     local ok, sold = pcall(function()
         Sell.toSurface(character)
@@ -3648,8 +3766,10 @@ function Forge.trip(origin)
         return false
     end
 
-    local character = Character.get()
+    -- See `Sell.try`: take the flag before the (possibly yielding) lookup.
     Sell.busy = true
+
+    local character = Character.get()
 
     local ok, serviced = pcall(function()
         if not Sell.toSurface(character) then
