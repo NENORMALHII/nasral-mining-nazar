@@ -2105,7 +2105,8 @@ function Mining.preSwingDelay()
     return math.random() * (Config.minePreSwingMax - Config.minePreSwingMin) + Config.minePreSwingMin
 end
 
--- Server accepted the break. A clean streak means no extra margin is needed.
+-- Server accepted the break: drop the whole reject streak and the extra delay
+-- with it, so the next block is mined at the plain `mineTime` margin again.
 function Mining.confirm()
     Mining.rejects = 0
     Mining.penalty = 0
@@ -4822,9 +4823,9 @@ local FarmMode = Mode.new("Farm", function(self)
         Mining.resetRequested = false
         Mining.rejects = 0
 
-        -- A reset is a fresh start: keep only the first (2%) step as a cushion
-        -- instead of carrying the old streak's margin into the next shaft.
-        Mining.penalty = Mining.streakPenalty(1)
+        -- A reset is a fresh start: no reject streak, no extra margin. The next
+        -- successful break keeps it at zero anyway.
+        Mining.penalty = 0
 
         -- Clear cached block mapping and ore scan state before choosing a target.
         Blocks.calibrated = false
