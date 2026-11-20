@@ -55,11 +55,10 @@ Server side is not in the place dump, so server checks below are inferred.
 
 - `BLOCK_SIZE = 7`, `MAX_MINING_RANGE = 30`, `ATTRIBUTE_RESOURCE_ID = "Resource"`, `ATTRIBUTE_MINE_POSITION = "MinePosition"`.
 - `IsBlockBesideLiquid` checks 6 offsets, skipping the one with `offset.Y == 1` (below the block).
-  The bot instead runs `Mining.spill`: if any of the 6 neighbours is a `LiquidResource`, it fires
-  `BlockEvent` → waits `Config.liquidMineTime = 0.5` s → fires `BlockMinedEvent`, which triggers
-  server-side block generation, then `:Destroy()`s the liquid block and the target block locally
-  and skips the target. Client-only Destroy; the server keeps its copies and the request never
-  mentions liquid.
+  The bot instead runs `Mining.clearLiquid`: if any of the 6 neighbours is a `LiquidResource`, it
+  `:Destroy()`s that liquid block locally and then mines the target normally. Nothing else is
+  sent or changed. Client-only Destroy; the server keeps its copy and the request never mentions
+  liquid.
 - `ConvertWorldPosToBlock` uses `Mine.WorldspaceOffset = (-31, -16, -98.5)`, which differs from `Util.GetWorldCoords`; in the live game `block.Position` is authoritative.
 
 ## Block coordinates
