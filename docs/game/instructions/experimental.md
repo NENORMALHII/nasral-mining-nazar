@@ -23,16 +23,17 @@ Per batch:
 
 1. `BlockEvent(block.Name, { dug = true })` for every valid block. A block is
    included when `Mining.why` returns nil and it is inside `Mining.reach()`.
-2. Wait `max(mineTime of the batch)` + the normal safety margin (one ping sample,
-   one jitter).
+2. Wait `max(mineTime of the batch) * (1 + penalty)` + the normal safety margin
+   (one ping sample, one jitter).
 3. `BlockMinedEvent({ blockName })` for every block still present.
 4. Poll the removal once per frame, up to `mineRejectGrace = 0.6` s.
 5. Any block still present gets `BlockEvent(name, { dug = false })`.
 
-Counting: each removed block calls `Mining.confirm()`. A partial batch (some
-blocks refused, at least one mined) is logged but does **not** touch the adaptive
-penalty — the server refused concurrent claims, not the timing. A batch where
-nothing was mined counts as one rejection (`Mining.punish()` + `Mining.rejects`),
+Counting: each removed block calls `Mining.confirm()`, which clears the reject
+streak and the proportional penalty. A partial batch (some blocks refused, at
+least one mined) is logged but is **not** counted as a rejection — the server
+refused concurrent claims, not the timing. A batch where nothing was mined
+counts as one rejection (`Mining.punish()` + `Mining.rejects`),
 and at `maxRejects` the normal surface reset runs. The batch returns true when at
 least one block was mined; otherwise Farm calls `Ores.ignore` on the target (5 s).
 

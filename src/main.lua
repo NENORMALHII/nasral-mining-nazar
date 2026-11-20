@@ -32,10 +32,13 @@ local Config = {
     mineJitterMax = 0.015,
     minePreSwingMin = 0,
     minePreSwingMax = 0,
-    minePenaltyStep = 0.08,
-    minePenaltyMax = 0.4,
-    minePenaltyDecay = 0.01,
-    minePenaltyDecayEvery = 2,
+    -- Reject penalty is a share of the raw mine time, not a fixed number of
+    -- seconds: a long block needs a wider margin than a 0.1 s block for the
+    -- same relative timing error. 2% on the first reject, x1.5 per further
+    -- reject in the streak, capped at 10%.
+    mineStreakFirst = 0.02,
+    mineStreakGrowth = 1.5,
+    mineStreakMax = 0.10,
     mineRejectGrace = 0.6,
 
     mushroomDelay = 0.35,
@@ -1667,7 +1670,7 @@ end
 local Mining = {
     baseMineTime = Config.defaultMineTime,
     rejects = 0,
-    successes = 0,
+    -- Share of the raw mine time added on top, derived from `rejects`.
     penalty = 0,
     resetRequested = false,
 }
@@ -2079,33 +2082,39 @@ function Mining.waitTime(block)
 
     -- The official client waits exactly `mineTime`; the ping term here is only
     -- a small cushion for packet-order jitter and is capped at one frame. The
-    -- adaptive `Mining.penalty` grows on a rejection and decays after good
-    -- breaks, so a bad link self-corrects instead of paying a fixed buffer.
+    -- adaptive `Mining.penalty` is a fraction of `baseMine`, so a rejected
+    -- break widens the margin in proportion to the block's own mine time.
     local pingMargin = math.min(ping * Config.mineSafetyPingMult, Config.mineSafetyPingMax)
-    local safety = Config.mineSafetyBase + pingMargin + Mining.penalty
+    local safety = Config.mineSafetyBase + pingMargin
 
-    return baseMine + safety + jitter
+    return baseMine * (1 + Mining.penalty) + safety + jitter
+end
+
+-- Fraction of `baseMine` added after `streak` rejections in a row:
+-- 0, 2%, 3%, 4.5%, 6.8%, 10% (capped). Deliberately small at the start.
+function Mining.streakPenalty(streak)
+    if streak <= 0 then
+        return 0
+    end
+
+    local penalty = Config.mineStreakFirst * Config.mineStreakGrowth ^ (streak - 1)
+    return math.min(Config.mineStreakMax, penalty)
 end
 
 function Mining.preSwingDelay()
     return math.random() * (Config.minePreSwingMax - Config.minePreSwingMin) + Config.minePreSwingMin
 end
 
--- Server accepted the break. Reset the streak and shrink the extra margin.
+-- Server accepted the break. A clean streak means no extra margin is needed.
 function Mining.confirm()
     Mining.rejects = 0
-    Mining.successes = Mining.successes + 1
-
-    if Mining.penalty > 0 and Mining.successes % Config.minePenaltyDecayEvery == 0 then
-        Mining.penalty = math.max(0, Mining.penalty - Config.minePenaltyDecay)
-    end
+    Mining.penalty = 0
 end
 
--- Server rejected the break (block still there after BlockMinedEvent). Grow the
--- margin so the retry cannot undershoot the same way again.
+-- Server rejected the break (block still there after BlockMinedEvent). Scale
+-- the margin with the streak so the retry cannot undershoot the same way again.
 function Mining.punish()
-    Mining.successes = 0
-    Mining.penalty = math.min(Config.minePenaltyMax, Mining.penalty + Config.minePenaltyStep)
+    Mining.penalty = Mining.streakPenalty(Mining.rejects)
 end
 
 function Mining.maxDistance()
@@ -2258,13 +2267,13 @@ function Mining.mine(character, block)
     local waitTime = Mining.waitTime(block)
     local preSwing = Mining.preSwingDelay()
 
-    logPrint(("mine %s (%s) base=%.2f wait=%.2f pre=%.2f penalty=%.2f"):format(
+    logPrint(("mine %s (%s) base=%.2f wait=%.2f pre=%.2f penalty=%.1f%%"):format(
         block.Name,
         tostring(typeOf(block)),
         Mining.baseMineTime,
         waitTime,
         preSwing,
-        Mining.penalty
+        Mining.penalty * 100
     ))
 
     -- The official client fires `BlockEvent` immediately on click. Zero by
@@ -2303,13 +2312,13 @@ function Mining.mine(character, block)
         Mining.rejects += 1
         Mining.punish()
 
-        logWarn(("server rejected %s type=%s base=%.2f wait=%.3f streak=%d penalty=%.2f"):format(
+        logWarn(("server rejected %s type=%s base=%.2f wait=%.3f streak=%d penalty=%.1f%%"):format(
             block.Name,
             tostring(typeOf(block)),
             Mining.baseMineTime,
             waitTime,
             Mining.rejects,
-            Mining.penalty
+            Mining.penalty * 100
         ))
 
         if Mining.rejects >= Config.maxRejects then
@@ -4271,9 +4280,10 @@ function Experimental.mineMany(character, center)
     end
 
     -- One ping sample and one jitter for the whole batch; the longest mine time
-    -- keeps every claim at or above its own server requirement.
-    local margin = Mining.waitTime(center) - Mining.mineTime(center)
-    local waitTime = longest + margin
+    -- keeps every claim at or above its own server requirement, and each one
+    -- carries the same reject penalty (a share of its own mine time).
+    local margin = Mining.waitTime(center) - Mining.mineTime(center) * (1 + Mining.penalty)
+    local waitTime = longest * (1 + Mining.penalty) + margin
 
     logPrint(("experimental multi-mine %d/%d wait=%.2f"):format(
         #targets, #Experimental.multiOffsets + 1, waitTime))
@@ -4319,8 +4329,8 @@ function Experimental.mineMany(character, center)
             Mining.rejects += 1
             Mining.punish()
 
-            logWarn(("experimental multi-mine: 0/%d mined, streak=%d penalty=%.2f"):format(
-                #targets, Mining.rejects, Mining.penalty))
+            logWarn(("experimental multi-mine: 0/%d mined, streak=%d penalty=%.1f%%"):format(
+                #targets, Mining.rejects, Mining.penalty * 100))
 
             if Mining.rejects >= Config.maxRejects then
                 Mining.resetRequested = true
@@ -4812,10 +4822,9 @@ local FarmMode = Mode.new("Farm", function(self)
         Mining.resetRequested = false
         Mining.rejects = 0
 
-        -- A reset is a fresh start: keep at most one penalty step as a cushion
-        -- instead of carrying a 0.4 s buffer through the next ~80 blocks.
-        Mining.penalty = math.min(Mining.penalty, Config.minePenaltyStep)
-        Mining.successes = 0
+        -- A reset is a fresh start: keep only the first (2%) step as a cushion
+        -- instead of carrying the old streak's margin into the next shaft.
+        Mining.penalty = Mining.streakPenalty(1)
 
         -- Clear cached block mapping and ore scan state before choosing a target.
         Blocks.calibrated = false

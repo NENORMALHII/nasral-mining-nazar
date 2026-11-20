@@ -256,11 +256,16 @@ Wait time (bot formula, matched to the official client):
 mineTime   = BaseMineTime * (100 - ToolSpeedModifier) / 100 * MineTimeModifier
 preSwing   = 0                        -- official client fires BlockEvent on click
 jitter     = random(0.005 .. 0.015)   -- per-block variance
-penalty    = 0 .. 0.4                 -- +0.08 per reject, -0.01 every 2 good breaks
-safety     = 0.03 + min(ping * 0.1, 0.02) + penalty
+penalty    = 0, 0.02, 0.03, 0.045, 0.068, 0.10   -- share of mineTime, by reject streak
+safety     = 0.03 + min(ping * 0.1, 0.02)
 ping       = GetNetworkPing()         -- RTT, rolling 8-sample min
-waitTime   = mineTime + safety + jitter
+waitTime   = mineTime * (1 + penalty) + safety + jitter
 ```
+
+The penalty is a fraction, not seconds: `min(0.10, 0.02 * 1.5 ^ (streak - 1))`.
+The first rejection adds 2% of that block's own mine time (80 ms on a 4 s
+block), the next one 3%, then 4.5%, 6.8%, and 10% at streak 5. Any accepted
+break zeroes the streak and the penalty with it.
 
 The official client (`decompiled/minescript.lua`) fires `BlockMinedEvent` from
 `ToolStatusGui.Completed`, i.e. when a progress bar of exactly `mineTime` seconds
@@ -286,10 +291,10 @@ Why rejections happen and how the algorithm addresses them:
 
 | Cause | Fix |
 |---|---|
-| `BlockMinedEvent` too early after `BlockEvent` | `waitTime = mineTime + safety + jitter` exceeds server-expected time by at least one frame |
-| Network lag spikes | capped ping cushion (`min(ping * 0.1, 0.02)`) plus the adaptive `penalty` |
+| `BlockMinedEvent` too early after `BlockEvent` | `waitTime = mineTime * (1 + penalty) + safety + jitter` exceeds server-expected time by at least one frame |
+| Network lag spikes | capped ping cushion (`min(ping * 0.1, 0.02)`) plus the proportional `penalty` |
 | Predictable timing | `jitter` adds 5–15 ms; no pre-swing delay (the official client has none either) |
-| Wrong margin for the actual server | `Mining.penalty` grows on a reject (+0.08), decays after 2 good breaks (-0.01), so the bot self-tunes instead of paying a fixed worst-case buffer |
+| Wrong margin for the actual server | `Mining.penalty` is `min(10%, 2% * 1.5 ^ (streak - 1))` of the block's own mine time: a few frames after the first reject, never a fixed second-sized buffer |
 | Stale `BaseMineTime` from table | Server value waits on equip, takes priority over table |
 | Stale `ToolSpeedModifier` | Re-read from player attributes every mine |
 | Cancel sent too late | `mineRejectGrace = 0.6` s, removal polled once per frame |
@@ -299,7 +304,8 @@ Server validates that elapsed time >= expected `mineTime` (with its own toleranc
 If the bot finishes too early, the server rejects with "server rejected".
 
 Rejection streak: `Mining.rejects` counts consecutive `server rejected` results and is
-zeroed by any successful break. The log line carries `streak=N`. At
+zeroed by any successful break, which also zeroes `Mining.penalty`. The log line
+carries `streak=N` and `penalty=<percent>`. At
 `Config.maxRejects = 5` the bot sets `Mining.resetRequested`; on the next Farm tick it:
 
 1. clears cached mapping and scan state: `Blocks.calibrated = false`,
