@@ -1614,7 +1614,7 @@ local function liquidBlockAt(mine, cell)
     return nil
 end
 
--- Destroy the first liquid neighbour locally and report its type name.
+-- Destroy the first liquid neighbour locally and report its type name and cell.
 function Mining.clearLiquid(block)
     local position = block:GetAttribute(Game.attrMinePosition)
     local mine = Blocks.model()
@@ -1624,11 +1624,12 @@ function Mining.clearLiquid(block)
     end
 
     for _, offset in ipairs(LIQUID_OFFSETS) do
-        local liquid, name = liquidBlockAt(mine, position + offset)
+        local cell = position + offset
+        local liquid, name = liquidBlockAt(mine, cell)
 
         if liquid then
             liquid:Destroy()
-            return name
+            return name, cell
         end
     end
 
@@ -2194,9 +2195,11 @@ function Mining.mine(character, block)
         return false
     end
 
-    local liquid = Mining.clearLiquid(block)
+    local liquid, liquidCell = Mining.clearLiquid(block)
     if liquid then
-        logWarn(("liquid %s beside %s: destroyed locally"):format(liquid, block.Name))
+        logWarn(("liquid %s beside %s: destroyed locally, teleport to its centre"):format(
+            liquid, block.Name))
+        Movement.jump(character, Blocks.standPoint(liquidCell))
     end
 
     local waitTime = Mining.waitTime(block)
@@ -4188,9 +4191,11 @@ function Experimental.mineMany(character, center)
             return
         end
 
-        local liquid = Mining.clearLiquid(block)
+        local liquid, liquidCell = Mining.clearLiquid(block)
         if liquid then
-            logWarn(("liquid %s beside %s: destroyed locally"):format(liquid, block.Name))
+            logWarn(("liquid %s beside %s: destroyed locally, teleport to its centre"):format(
+                liquid, block.Name))
+            Movement.jump(character, Blocks.standPoint(liquidCell))
         end
 
         table.insert(targets, {
