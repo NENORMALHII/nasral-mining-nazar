@@ -55,6 +55,9 @@ Server side is not in the place dump, so server checks below are inferred.
 
 - `BLOCK_SIZE = 7`, `MAX_MINING_RANGE = 30`, `ATTRIBUTE_RESOURCE_ID = "Resource"`, `ATTRIBUTE_MINE_POSITION = "MinePosition"`.
 - `IsBlockBesideLiquid` checks 6 offsets, skipping the one with `offset.Y == 1` (below the block).
+  The bot instead runs `Mining.purgeLiquid`: if any of the 6 neighbours is a `LiquidResource`, it
+  `:Destroy()`s the liquid block and the target block locally, then skips the target. Client-only;
+  the server keeps its copies and the request never mentions liquid.
 - `ConvertWorldPosToBlock` uses `Mine.WorldspaceOffset = (-31, -16, -98.5)`, which differs from `Util.GetWorldCoords`; in the live game `block.Position` is authoritative.
 
 ## Block coordinates
@@ -67,11 +70,6 @@ Server side is not in the place dump, so server checks below are inferred.
   otherwise the offset is kept at zero and the measurement is retried after the 5 s gate.
 - `Blocks.standPoint(cell) = worldOf(cell) + (0, 0.5, 0)` — cell centre, so a teleport
   never lands on a half-cell boundary where `rawBlock` could round to a neighbour.
-- `Blocks.liquidSet()` builds a name -> true set of every `LiquidResource` (Oil/Lava) block
-  once per world (also after a reset) and `Blocks.liquidNeighbour(cell)` answers the
-  `IsBlockBesideLiquid` question with 5 hash lookups instead of 5 `FindFirstChild` calls.
-  `Mining.besideLiquid(block)` delegates to it, so the rule lives in one place and the
-  planner can call it thousands of times per plan without touching the instance tree.
 
 `ReplicatedStorage.Modules.Constants`:
 
@@ -96,7 +94,7 @@ There is no seed hashing and no depth heuristic. `Ores.nearest(position, radius)
   while the player stays in the same cell. `Ores.nearest` returns the next entry
   through a cursor (`scanCandidates`), so breaking one ore does not trigger
   another cube scan; the cursor skips blocks that are gone, no longer selected,
-  out of range, ignored or liquid-blocked;
+  out of range or ignored;
 - `Ores.ignore(block)` only records a 5 s ignore timer and keeps the list, so the
   next best candidate is served from the cache;
 - the list is rebuilt only when the cell changes, the TTL expires or the cursor
@@ -134,8 +132,8 @@ so teleporting to the block centre was unnecessary and caused `BlockMinedEvent` 
   the character anchored, and re-checks every `Config.emptyMineWait` seconds. The jump only fires
   again when the character is more than 4 studs from that point, so the loop no longer teleports
   and falls every tick. `Movement.releaseHold()` runs on the first tick that sees blocks again.
-- Liquid / blocked floor: Farm looks at the block under the feet before mining anything.
-  If `Mining.why(below)` is non-nil (`liquid`, `blocked`, `dug`, `bedrock`, ...), digging
+- Blocked floor: Farm looks at the block under the feet before mining anything.
+  If `Mining.why(below)` is non-nil (`blocked`, `dug`, `bedrock`, ...), digging
   straight down can only fail. Farm logs `floor blocked (<reason>), planning route` and hands
   over to the escape planner. If there is no block at all the bot is falling; it logs nothing,
   resets the plan and waits for the landing before deciding anything.
@@ -145,10 +143,10 @@ so teleporting to the block centre was unnecessary and caused `BlockMinedEvent` 
   - node = a cell the bot stands in;
   - edge = one of the 6 neighbours. An empty cell above (own shaft) costs
     `planHop + planUpCost`; a solid block costs `Mining.mineTime(block) + planHop`.
-    Anything not `Mining.valid` or beside liquid is impassable, and so is an empty cell
+    Anything not `Mining.valid` is impassable, and so is an empty cell
     reached sideways or downwards (that would be a fall);
   - goal = a cell with `Config.planClearance = 3` diggable blocks in a row below it, so the
-    bot does not stop next to the same liquid pocket;
+    bot does not stop on a column it cannot continue;
   - Dijkstra (binary heap) with early exit inside a `planRadius = 7` cell box,
     `planMaxNodes = 4000` cap and a `task.wait()` every 500 pops.
 - The planner ignores the ore selection: escape may use any resource. The plan is built once
@@ -160,15 +158,14 @@ so teleporting to the block centre was unnecessary and caused `BlockMinedEvent` 
   down a one-cell shaft — the climb is used only as launch height for the next dig in the
   same tick.
 - Preventive trigger: even when the floor is diggable, Farm plans a route as soon as the next
-  `planClearance` blocks under the column are not all diggable (`Plan.clear`), so the bot
-  leaves before sitting in a liquid pocket.
+  `planClearance` blocks under the column are not all diggable (`Plan.clear`).
 - Goal validity: the path mines its own cells, so a goal that sits directly on top of the
   route would lose its floor. Such a goal is rejected (the ancestor chain is compared with
   `goal + (0, 1, 0)`), which is why the planner digs sideways instead of mining a staircase
   straight up in the same column.
 - No route (capped search or every cell impassable): logs `plan: no route, requesting
-  surface reset` and sets `Mining.resetRequested`, which clears `Plan` and the liquid cache
-  and teleports to the surface reset point. The same cell is not reset-spammed: within
+  surface reset` and sets `Mining.resetRequested`, which clears `Plan` and the cached
+  mapping and teleports to the surface reset point. The same cell is not reset-spammed: within
   `Config.planRetry = 5` s a repeated failure only logs `plan: still no route, waiting` and
   waits 1 s, since other players can change the block layout.
 
@@ -373,7 +370,7 @@ teleports to the drop, waits for the touch, and repeats for the next drop.
 - mine time `base * (100 - ToolSpeedModifier)/100 * MineTimeModifier`, with client fallback base `10`
   until the first `UpdatePickaxe`;
 - `MaxDistance` is read once on equip;
-- no extra validation beyond type, range, `MinePosition`, world id, `Dug`, liquid.
+- no extra validation beyond type, range, `MinePosition`, world id, `Dug`.
 
 The bot sends the cancel with `MinePosition` and compares `WorldId` strictly (`tostring` both sides).
 
@@ -440,23 +437,19 @@ is received, waits up to 6 heartbeats, and logs
   children, so one 343-cell scan over a full mine was millions of name comparisons — the frame
   drop at a break happened when the player's cell changed and the scan re-ran. The index build
   itself yields every 4000 children.
-- Liquid answers are cached per block until `Blocks.liquidStamp` changes, so `Mining.why` and the
-  planner do not rebuild six neighbour names for the same block repeatedly.
 - Log rendering is deferred (`Log.dirty` + `Log.flush` on a 0.25 s timer) with one `os.date` per
   second. Blocks log once (`Mining.mine`), not twice.
 - `Mode:start` measures step time: a step that mined or teleported already spent its budget and
   is not followed by another `loopDelay`; only idle ticks sleep.
 - `Mining.detect` rebuilds the tool signature at most once per second; `Mining.prepare` has a fast
   path when the same pickaxe is already equipped; `Mining.maxDistance()` is re-read per equip.
-- `Mining.why` caches its answer per block for 0.3 s and invalidates on
-  `Blocks.liquidStamp`; the Farm floor check, `Mining.mine` and the planner ask about the same
-  block several times in one tick.
+- `Mining.why` caches its answer per block for 0.3 s; the Farm floor check, `Mining.mine` and
+  the planner ask about the same block several times in one tick.
 - `Mining.reach` is cached on equip instead of reading `Pick.MaxDistance` through
   `FindFirstChild` on every range check; range tests use squared distance.
 - Loot is event-driven (`Loot.bind` on `TargetFilter.ChildAdded` / `ChildRemoved`); the old
   per-tick scan walked every drop in the container, other players' included.
-- `Blocks.liquidSet` is one pass over the mine per world; after that every liquid question is a
-  hash lookup. `Blocks.calibrate` yields every 4000 children so the initial field pass does not
+- `Blocks.calibrate` yields every 4000 children so the initial field pass does not
   stall a frame. `Plan` runs at most once per stuck situation, not per tick; the preventive
   `Plan.clear` check is cached for 0.25 s per cell.
 - `MushroomNode.nearest` refreshes its `HarvestableNode` list once per second (pruned in place)
@@ -465,7 +458,7 @@ is received, waits up to 6 heartbeats, and logs
   frame drop can be attributed instead of guessed.
 - Frame watchdog: `RunService.Heartbeat` compares frame gaps and logs
   `frame N ms after <label>` above `frameWarn = 0.12` s. Labels are set before the
-  non-yielding phases (`ore scan`, `plan build`, `plan`, `liquid set`, `block index`,
+  non-yielding phases (`ore scan`, `plan build`, `plan`, `block index`,
   `calibrate`, `surface scan`, `loot`, `mine`, `sell`, `forge`).
 - Per-block wall clock = `waitTime` + the block-removal round trip: the next `BlockEvent` waits
   until the server removes the previous block (the official client's target raycast does the

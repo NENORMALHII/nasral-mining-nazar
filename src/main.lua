@@ -722,9 +722,9 @@ end
 ---------------------------------------------------------------------------
 --
 -- A stall is visible as a long gap between Heartbeats. `Watchdog.mark` is set by
--- the expensive non-yielding operations (ore scan, plan build, liquid set,
--- block index); the next slow frame reports which one preceded it, so a frame
--- drop can be attributed instead of guessed.
+-- the expensive non-yielding operations (ore scan, plan build, block index); the
+-- next slow frame reports which one preceded it, so a frame drop can be
+-- attributed instead of guessed.
 
 local Watchdog = { label = "startup", last = os.clock() }
 
@@ -774,24 +774,6 @@ Game.Handles = loadModule("Modules", "Tools", "ToolHandles")
 Game.attrMinePosition = (Game.Constants and Game.Constants.ATTR_MINE_POSITION) or "MinePosition"
 Game.attrWorldId = (Game.Constants and Game.Constants.ATTR_WORLD_ID) or "WorldId"
 
-local blockOffsets = (Game.Mine and Game.Mine.OFFSETS) or {
-    LEFT = Vector3.new(-1, 0, 0),
-    RIGHT = Vector3.new(1, 0, 0),
-    UP = Vector3.new(0, -1, 0),
-    DOWN = Vector3.new(0, 1, 0),
-    FRONT = Vector3.new(0, 0, 1),
-    BACK = Vector3.new(0, 0, -1),
-}
-
--- Liquid neighbours: every block offset except the one deeper (`DOWN` is
--- `(0, 1, 0)`). A fixed array keeps the per-block check off `pairs`.
-local liquidOffsets = {}
-
-for _, offset in pairs(blockOffsets) do
-    if offset.Y ~= 1 then
-        table.insert(liquidOffsets, offset)
-    end
-end
 
 ---------------------------------------------------------------------------
 -- Helpers
@@ -824,8 +806,8 @@ local function typeOf(block)
     return name
 end
 
--- The player's world id is read by every validity check and by the liquid
--- rebuild. One cached string, refreshed only when the attribute changes.
+-- The player's world id is read by every validity check. One cached string,
+-- refreshed only when the attribute changes.
 local playerWorldValue
 
 local function playerWorld()
@@ -1202,7 +1184,7 @@ Blocks.lastCalibrate = 0
 Blocks.modelCache = nil
 
 -- Single cached handle to `Workspace.Mine`. The mining loop asked for it several
--- times per tick (calibrate, below, liquid set, ore scan, plan, farm reset);
+-- times per tick (calibrate, below, ore scan, plan, farm reset);
 -- a cached instance removes those name lookups. Re-resolved only when the
 -- cached instance leaves the DataModel.
 function Blocks.model()
@@ -1407,78 +1389,6 @@ function Blocks.below(worldPosition)
     return Blocks.at(xyzToString(cell.X, cell.Y + 1, cell.Z))
 end
 
--- Cached set of liquid (Oil/Lava) block names, rebuilt on world change or after
--- a reset. One pass over the mine turns every "is this block beside liquid"
--- question into a handful of hash lookups instead of `FindFirstChild` calls.
-Blocks.liquids = nil
-Blocks.liquidsWorld = nil
-Blocks.liquidStamp = 0
-
-function Blocks.invalidateLiquids()
-    Blocks.liquids = nil
-    Blocks.liquidsWorld = nil
-    Blocks.liquidStamp = (Blocks.liquidStamp or 0) + 1
-end
-
-function Blocks.liquidSet()
-    Watchdog.mark("liquid set")
-    local world = playerWorld()
-
-    if Blocks.liquids and Blocks.liquidsWorld == world then
-        return Blocks.liquids
-    end
-
-    local mine = Blocks.model()
-    if not mine then
-        return nil
-    end
-
-    local set = {}
-
-    for index, block in ipairs(mine:GetChildren()) do
-        local position = block:GetAttribute(Game.attrMinePosition)
-        local info = position and resourceInfo(typeOf(block))
-
-        if info and info.LiquidResource then
-            set[vec3ToString(position)] = true
-        end
-
-        if index % 4000 == 0 then
-            task.wait()
-        end
-    end
-
-    Blocks.liquids = set
-    Blocks.liquidsWorld = world
-    Blocks.liquidStamp = (Blocks.liquidStamp or 0) + 1
-    return set
-end
-
--- True when any neighbour of `cell` except the one below is liquid: such a block
--- cannot be broken. `blockOffsets.DOWN` is `(0, 1, 0)`, i.e. deeper.
--- `liquids` lets the planner resolve the set once per build instead of once per
--- candidate block.
-function Blocks.liquidNeighbour(cell, liquids)
-    liquids = liquids or Blocks.liquidSet()
-    if not liquids then
-        return false
-    end
-
-    for _, offset in ipairs(liquidOffsets) do
-        local key = xyzToString(
-            cell.X + offset.X,
-            cell.Y + offset.Y,
-            cell.Z + offset.Z
-        )
-
-        if liquids[key] then
-            return true
-        end
-    end
-
-    return false
-end
-
 ---------------------------------------------------------------------------
 -- Surface pits
 ---------------------------------------------------------------------------
@@ -1677,8 +1587,59 @@ local Mining = {
 
 local BLOCKED = { Oil = true, Lava = true, Grass = true, Void = true }
 
--- Per-block liquid answer, invalidated by `Blocks.liquidStamp`.
-local liquidCache = setmetatable({}, { __mode = "k" })
+-- Liquid hack. The official client refuses to mine a block with an Oil/Lava
+-- neighbour ("You can't let the %s spill!"), but the rule is client-side only.
+-- Wiping the liquid instance and the block touching it from this client's
+-- DataModel removes them from every local check; the server keeps its copies.
+-- All 6 neighbours are checked, including the one below.
+local LIQUID_OFFSETS = {
+    Vector3.new(-1, 0, 0), Vector3.new(1, 0, 0),
+    Vector3.new(0, -1, 0), Vector3.new(0, 1, 0),
+    Vector3.new(0, 0, 1), Vector3.new(0, 0, -1),
+}
+
+local function liquidBlockAt(mine, cell)
+    local other = mine:FindFirstChild(xyzToString(cell.X, cell.Y, cell.Z))
+    if not other then
+        return nil
+    end
+
+    local name = typeOf(other)
+    local info = name and resourceInfo(name)
+
+    if info and info.LiquidResource then
+        return other, name
+    end
+
+    return nil
+end
+
+-- Destroy the liquid block and `block` locally, then report the liquid name so
+-- the caller can move on instead of mining there.
+function Mining.purgeLiquid(block)
+    local position = block:GetAttribute(Game.attrMinePosition)
+    local mine = Blocks.model()
+
+    if not position or not mine then
+        return nil
+    end
+
+    for _, offset in ipairs(LIQUID_OFFSETS) do
+        local liquid, name = liquidBlockAt(mine, position + offset)
+
+        if liquid then
+            liquid:Destroy()
+
+            if block.Parent then
+                block:Destroy()
+            end
+
+            return name
+        end
+    end
+
+    return nil
+end
 
 local function colorOf(value)
     local kind = typeof(value)
@@ -2123,27 +2084,6 @@ function Mining.maxDistance()
     return maxDistance and maxDistance.Value or 25
 end
 
-function Mining.besideLiquid(block, liquids)
-    local position = block:GetAttribute(Game.attrMinePosition)
-    if not position then
-        return false
-    end
-
-    -- The liquid set is static per world, so the 6 neighbour lookups (each one
-    -- a formatted string) are worth caching per block. The planner asks this
-    -- question thousands of times per plan and passes its resolved set in.
-    local stamp = Blocks.liquidStamp
-    local cached = liquidCache[block]
-
-    if cached and cached.stamp == stamp then
-        return cached.value
-    end
-
-    local value = Blocks.liquidNeighbour(position, liquids)
-    liquidCache[block] = { stamp = stamp, value = value }
-    return value
-end
-
 function Mining.valid(block)
     if not block.Parent then
         return "parent"
@@ -2180,27 +2120,22 @@ function Mining.valid(block)
 end
 
 -- Same block is asked repeatedly per tick (`FarmMode` floor check, `Mining.mine`,
--- the planner). Valid reasons only change when the world/liquid set changes or
--- another player claims the block, so a short per-block cache removes the
--- repeated attribute reads.
+-- the planner). Valid reasons only change when the world changes or another
+-- player claims the block, so a short per-block cache removes the repeated
+-- attribute reads.
 local whyCache = setmetatable({}, { __mode = "k" })
 
 function Mining.why(block)
-    local stamp = Blocks.liquidStamp
     local cached = whyCache[block]
     local now = os.clock()
 
-    if cached and cached.stamp == stamp and now - cached.at < 0.3 then
+    if cached and now - cached.at < 0.3 then
         return cached.reason
     end
 
     local reason = Mining.valid(block)
 
-    if not reason and Mining.besideLiquid(block) then
-        reason = "liquid"
-    end
-
-    whyCache[block] = { stamp = stamp, at = now, reason = reason }
+    whyCache[block] = { at = now, reason = reason }
     return reason
 end
 
@@ -2251,6 +2186,12 @@ function Mining.mine(character, block)
     if reason then
         logWarn(("skip %s: %s"):format(block.Name, reason))
         return false
+    end
+
+    local liquid = Mining.purgeLiquid(block)
+    if liquid then
+        logWarn(("liquid %s beside %s: purged locally, moving on"):format(liquid, block.Name))
+        return true
     end
 
     if not Mining.inRange(character, block) then
@@ -2580,8 +2521,8 @@ function Ores.nearest(position, radius)
             #found, (reach * 2 + 1) ^ 3, spent * 1000))
     end
 
-    -- Mining.valid is cheap but does not know about liquids: ask Mining.why
-    -- lazily, and only until one candidate really passes.
+    -- Mining.valid leaves out some planner-only states: ask Mining.why lazily,
+    -- and only until one candidate really passes.
     return scanCandidates(position, limitSq, selected)
 end
 
@@ -4245,6 +4186,12 @@ function Experimental.mineMany(character, center)
             return
         end
 
+        local liquid = Mining.purgeLiquid(block)
+        if liquid then
+            logWarn(("liquid %s beside %s: purged locally"):format(liquid, block.Name))
+            return
+        end
+
         if not Mining.inRange(character, block) then
             return
         end
@@ -4352,14 +4299,14 @@ end
 -- Escape planner
 --
 -- The bot can only dig what is in reach, but it can teleport anywhere. Escaping a
--- liquid pocket therefore is a grid pathfinding problem, not a "find a free cell"
+-- dead-end shaft therefore is a grid pathfinding problem, not a "find a free cell"
 -- problem: in a one-cell shaft surrounded by solid rock there is no free cell to
 -- teleport to, the bot has to dig one.
 --
 -- Node   = cell the bot stands in.
 -- Edge   = one of the 6 neighbours. An empty cell above is cheap; a solid diggable
---          block costs its mine time; liquid, bedrock, foreign `Dug`, blocked
---          types and liquid-adjacent blocks are impassable.
+--          block costs its mine time; bedrock, foreign `Dug` and blocked types
+--          are impassable.
 -- Goal   = cell with `Config.planClearance` diggable blocks in a row below it.
 --
 -- Dijkstra with early exit inside a `planRadius` box. The ore selection is
@@ -4444,22 +4391,17 @@ local function heapPop(heap)
     return first
 end
 
--- Cheapest test first: the cached liquid set, then the attribute checks.
-local function diggable(block, liquids)
+-- Cheapest test first: the parent check, then the attribute checks.
+local function diggable(block)
     if not block or not block.Parent then
-        return false
-    end
-
-    if Mining.besideLiquid(block, liquids) then
         return false
     end
 
     return Mining.valid(block) == nil
 end
 
--- The column below `cell` must allow a few clean down-digs, otherwise the plan
--- would stop next to the same liquid pocket. An empty cell is fine, but the first
--- floor under it has to be there.
+-- The column below `cell` must allow a few clean down-digs. An empty cell is
+-- fine, but the first floor under it has to be there.
 function Plan.clear(mine, cell)
     for depth = 1, Config.planClearance do
         local block = Blocks.at(vec3ToString(cell + CELL_DOWN * depth))
@@ -4513,9 +4455,6 @@ function Plan.build(start)
     local digs = {}
     local heap = {}
 
-    -- Resolved once for the whole build instead of once per candidate block.
-    local liquids = Blocks.liquidSet()
-
     -- Same check as `Plan.clear`, but it shares the `blocks` / `digs` caches:
     -- a cell inspected as a goal and as an edge is read once per build. The
     -- cell below `key` is `key + KEY_Y` (Y is the middle stride).
@@ -4536,7 +4475,7 @@ function Plan.build(start)
             local dig = digs[blockKey]
 
             if dig == nil then
-                dig = diggable(block, liquids)
+                dig = diggable(block)
                 digs[blockKey] = dig
             end
 
@@ -4628,7 +4567,7 @@ function Plan.build(start)
                         local dig = digs[nextKey]
 
                         if dig == nil then
-                            dig = diggable(block, liquids)
+                            dig = diggable(block)
                             digs[nextKey] = dig
                         end
 
@@ -4831,7 +4770,6 @@ local FarmMode = Mode.new("Farm", function(self)
         Blocks.calibrated = false
         Blocks.lastCalibrate = 0
         Blocks.offset = Vector3.zero
-        Blocks.invalidateLiquids()
         Plan.reset()
         Ores.clearCache()
         Blocks.calibrate()
@@ -4959,9 +4897,8 @@ local FarmMode = Mode.new("Farm", function(self)
 
     -- Escape planning. A route is built when:
     --   * a plan is already running,
-    --   * the floor cannot be dug (liquid neighbour, blocked type, foreign Dug),
-    --   * or the next `planClearance` blocks under this column are not clean
-    --     (preventive: move away before sitting in a liquid pocket).
+    --   * the floor cannot be dug (blocked type, foreign Dug, bedrock),
+    --   * or the next `planClearance` blocks under this column are not clean.
     -- The planner ignores the ore selection and digs its own tunnel: the bot sits
     -- in a one-cell shaft, so there is usually no free cell to teleport into.
     local needPlan = Plan.current ~= nil
