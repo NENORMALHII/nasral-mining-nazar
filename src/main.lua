@@ -41,6 +41,11 @@ local Config = {
     mineStreakMax = 0.10,
     mineRejectGrace = 0.6,
 
+    -- Liquid-adjacent bypass: a real start/end mining cycle of this length
+    -- triggers server-side block generation; after it the liquid block and the
+    -- mined block are wiped locally.
+    liquidMineTime = 0.5,
+
     mushroomDelay = 0.35,
     mushroomIgnore = 5,
 
@@ -1589,8 +1594,9 @@ local BLOCKED = { Oil = true, Lava = true, Grass = true, Void = true }
 
 -- Liquid hack. The official client refuses to mine a block with an Oil/Lava
 -- neighbour ("You can't let the %s spill!"), but the rule is client-side only.
--- Wiping the liquid instance and the block touching it from this client's
--- DataModel removes them from every local check; the server keeps its copies.
+-- The server still runs a real start/end cycle: firing one for `liquidMineTime`
+-- triggers block generation. Afterwards the liquid instance and the block that
+-- touches it are destroyed locally (this client only) and the bot moves on.
 -- All 6 neighbours are checked, including the one below.
 local LIQUID_OFFSETS = {
     Vector3.new(-1, 0, 0), Vector3.new(1, 0, 0),
@@ -1614,31 +1620,63 @@ local function liquidBlockAt(mine, cell)
     return nil
 end
 
--- Destroy the liquid block and `block` locally, then report the liquid name so
--- the caller can move on instead of mining there.
-function Mining.purgeLiquid(block)
+local function liquidNeighbour(block)
     local position = block:GetAttribute(Game.attrMinePosition)
     local mine = Blocks.model()
 
     if not position or not mine then
-        return nil
+        return nil, nil
     end
 
     for _, offset in ipairs(LIQUID_OFFSETS) do
         local liquid, name = liquidBlockAt(mine, position + offset)
 
         if liquid then
-            liquid:Destroy()
-
-            if block.Parent then
-                block:Destroy()
-            end
-
-            return name
+            return liquid, name
         end
     end
 
-    return nil
+    return nil, nil
+end
+
+-- Type name of a liquid neighbour, or nil.
+function Mining.liquidBeside(block)
+    local _, name = liquidNeighbour(block)
+    return name
+end
+
+-- Destroy the liquid block and the block touching it locally.
+function Mining.purgeLiquid(block)
+    local liquid, name = liquidNeighbour(block)
+
+    if not liquid then
+        return nil
+    end
+
+    liquid:Destroy()
+
+    if block.Parent then
+        block:Destroy()
+    end
+
+    return name
+end
+
+-- Real start/end mining cycle, short enough to be cheap and long enough to
+-- trigger server-side generation, then local purge and move on.
+function Mining.spill(block)
+    local position = block:GetAttribute(Game.attrMinePosition)
+    local blockEvent, minedEvent = Mining.remotes()
+
+    if not position or not blockEvent or not minedEvent then
+        return false
+    end
+
+    blockEvent:FireServer(block.Name, { dug = true })
+    task.wait(Config.liquidMineTime)
+    minedEvent:FireServer({ blockName = vec3ToString(position) })
+    Mining.purgeLiquid(block)
+    return true
 end
 
 local function colorOf(value)
@@ -2188,12 +2226,6 @@ function Mining.mine(character, block)
         return false
     end
 
-    local liquid = Mining.purgeLiquid(block)
-    if liquid then
-        logWarn(("liquid %s beside %s: purged locally, moving on"):format(liquid, block.Name))
-        return true
-    end
-
     if not Mining.inRange(character, block) then
         logWarn("out of range " .. block.Name)
         return false
@@ -2203,6 +2235,17 @@ function Mining.mine(character, block)
     local blockEvent, minedEvent = Mining.remotes()
     if not position or not blockEvent or not minedEvent then
         logWarn("remotes not found")
+        return false
+    end
+
+    local liquid = Mining.liquidBeside(block)
+    if liquid then
+        if Mining.spill(block) then
+            logWarn(("liquid %s beside %s: %.2f s start/end, purged locally"):format(
+                liquid, block.Name, Config.liquidMineTime))
+            return true
+        end
+
         return false
     end
 
@@ -4186,9 +4229,11 @@ function Experimental.mineMany(character, center)
             return
         end
 
-        local liquid = Mining.purgeLiquid(block)
+        local liquid = Mining.liquidBeside(block)
         if liquid then
-            logWarn(("liquid %s beside %s: purged locally"):format(liquid, block.Name))
+            Mining.spill(block)
+            logWarn(("liquid %s beside %s: %.2f s start/end, purged locally"):format(
+                liquid, block.Name, Config.liquidMineTime))
             return
         end
 
